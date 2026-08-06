@@ -16,13 +16,35 @@ const stockSchema = new mongoose.Schema({
         type: Boolean,
         default: false,
     },
+    variantId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Variant'
+    },
     variantName: {
         type: String,
         required: true,
     },
     purchasePrice: {
         type: Number,
-        // required: true,
+        min: 0,
+        set: v => parseFloat(Number(v).toFixed(3)),
+        validate: {
+            validator: function (v) {
+                return /^\d+(\.\d{3})?$/.test(v.toFixed(3));
+            },
+            message: props => `${props.value} is not valid. Must have exactly 3 decimal places.`
+        }
+    },
+    sellingPrice: {
+        type: Number,
+        min: 0,
+        set: v => parseFloat(Number(v).toFixed(3)),
+        validate: {
+            validator: function (v) {
+                return /^\d+(\.\d{3})?$/.test(v.toFixed(3));
+            },
+            message: props => `${props.value} is not valid. Must have exactly 3 decimal places.`
+        }
     },
     quantity: {
         type: Number,

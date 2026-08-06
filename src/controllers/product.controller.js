@@ -1,6 +1,8 @@
 import mongoose from "mongoose";
 import { Product } from "../models/product.model.js";
+import { Variant } from "../models/variant.model.js";
 import { Stock } from "../models/stock.model.js";
+import { Inventory } from "../models/inventory.model.js";
 import { SubCategory } from "../models/sub_category.model.js";
 import { Order } from "../models/order.model.js";
 import { ApiError } from "../utils/ApiError.js";
@@ -9,6 +11,12 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import { Brand } from "../models/brand.model.js";
 import { createStockEntry } from "../services/stock.service.js";
 import { STOCK_TYPES } from "../constants.js";
+
+const parseOptionalNumber = (val) => {
+    if (val === "" || val === null || val === undefined) return null;
+    const parsed = parseFloat(val);
+    return isNaN(parsed) ? null : parsed;
+};
 
 const createProduct = asyncHandler(async (req, res) => {
     let {
@@ -20,18 +28,19 @@ const createProduct = asyncHandler(async (req, res) => {
         keyInformation,
         basePrice, regularPrice,
         sku, hsn, gst,
-        rating, reviewCount
+        rating, reviewCount,
+        sellingPrice,
+        discount, moq,
+        webVisibility, appVisibility
     } = req.body;
-
-    //TODO: Add Images to it
 
     //Validate details
     if (
         !slug ||
         !fullName || !description ||
-        !price || !categoryId
+        !categoryId
     ) {
-        throw new ApiError(400, "Details not found");
+        throw new ApiError(400, "Details not found or missing category");
     }
 
     name = name?.trim()
@@ -54,41 +63,72 @@ const createProduct = asyncHandler(async (req, res) => {
         }
     }
 
-    //create selling price
-    const sellingPrice = [{ price }]
+    //create selling price and calculate min/max prices
+    let sellingPriceObj;
+    if (sellingPrice) {
+        sellingPriceObj = typeof sellingPrice === "string" ? JSON.parse(sellingPrice) : sellingPrice;
+    } else {
+        sellingPriceObj = {
+            type: "fixed",
+            slabs: [{ quantity: 1, price: parseFloat(price) || 0 }]
+        };
+    }
 
-    // let images = [];
+    let minPrice = 0;
+    let maxPrice = 0;
+    if (sellingPriceObj.slabs && sellingPriceObj.slabs.length > 0) {
+        const prices = sellingPriceObj.slabs.map(slab => slab.price);
+        minPrice = Math.min(...prices);
+        maxPrice = Math.max(...prices);
+    }
 
-    // if (Array.isArray(req.files?.images) && req.files.images.length > 0) {
-    //     const uploadPromises = req.files.images.map(async (fl) => {
-    //         const filePath = fl?.path;
-    //         const image = await uploadOnCloudinary(filePath);
-    //         return image;
-    //     });
-
-    //     images = await Promise.all(uploadPromises); // ✅ Wait for all uploads
-    //     images = images?.map(ph => ph?.secure_url);
-    // }
+    const ratingVal = parseOptionalNumber(rating);
+    const reviewCountVal = parseOptionalNumber(reviewCount);
+    const regularPriceVal = parseOptionalNumber(regularPrice);
+    const basePriceVal = parseOptionalNumber(basePrice);
+    const gstVal = parseOptionalNumber(gst);
+    const discountVal = parseOptionalNumber(discount);
+    const moqVal = parseOptionalNumber(moq);
 
     //create new product
     const newProduct = await Product.create({
         name, fullName, description,
-        brand: brandId,
+        brand: brandId || null,
         tags: tags || [],
-        slug, active,
-        sellingPrice,
+        slug,
+        active: active !== undefined ? active : true,
+        webVisibility: webVisibility !== undefined ? webVisibility : true,
+        appVisibility: appVisibility !== undefined ? appVisibility : true,
+        sellingPrice: sellingPriceObj,
+        minPrice,
+        maxPrice,
         category: categoryId,
         images: images ? images : [],
         keyInformation,
         descriptionPoints,
-        sku, hsn, gst,
-        basePrice: basePrice || 0,
-        regularPrice: regularPrice || 0,
-        rating, reviewCount
+        sku: sku || null,
+        hsn: hsn || null,
+        gst: gstVal !== null ? gstVal : 18,
+        discount: discountVal,
+        basePrice: basePriceVal,
+        regularPrice: regularPriceVal,
+        rating: ratingVal,
+        reviewCount: reviewCountVal,
+        moq: moqVal !== null ? moqVal : 1
     });
     if (!newProduct) {
         throw new ApiError(409, "Could not create product");
     }
+
+    const inventory = await Inventory.create({
+        product: newProduct._id,
+        physicalStock: 0,
+        reservedStock: 0,
+        version: 0
+    });
+
+    newProduct.inventory = inventory._id;
+    await newProduct.save();
 
     //add the product in subCategory
     const updatedSubCategory = await SubCategory.findByIdAndUpdate(
@@ -353,125 +393,351 @@ const createProduct = asyncHandler(async (req, res) => {
 //     );
 // });
 
-// ✅ FIX 1: updateProductStock — product_controller.js
-// REPLACE the entire function (lines 255–354) with this:
 
 const updateProductStock = asyncHandler(async (req, res) => {
     let {
         vendor,
-        variantName,
+        variantId,
         purchasePrice,
         quantity,
-        productId
+        clientVersion
     } = req.body;
 
-    if (!variantName || quantity === undefined || !productId) {
-        throw new ApiError(400, "All stock details are required");
+    // Strict validation rule enforcement
+    if (clientVersion === undefined || clientVersion === null) {
+        throw new ApiError(400, "Security Validation Failed: clientVersion parameter is required to adjust inventory lines.");
     }
 
-    variantName = variantName.trim();
+    if (!variantId || quantity === undefined || purchasePrice === undefined) {
+        throw new ApiError(400, "All stock processing fields are required (variantId, quantity, purchasePrice)");
+    }
 
     const parsedQuantity = parseInt(quantity);
-    if (isNaN(parsedQuantity)) {
-        throw new ApiError(400, "Quantity must be a valid number");
-    }
-    if (parsedQuantity === 0) {
-        throw new ApiError(400, "Quantity cannot be 0");
+    if (isNaN(parsedQuantity) || parsedQuantity === 0) {
+        throw new ApiError(400, "Processing volume must evaluate to a valid non-zero integer");
     }
 
-    const stockCorrected = vendor === "zaz";
-    const stockCorrected2 = vendor === "zaz2";
+    // CRITICAL OPTIMIZATION: Validate Variant outside the heavy transaction layer
+    const variant = await Variant.findById(variantId);
+    if (!variant) {
+        throw new ApiError(404, "Invalid Operational Scope: Targeted variant could not be found.");
+    }
+    const productId = variant.productId;
 
-    // if (!existingProduct.variants.has(variantName)) {
-    //     throw new ApiError(404, `Variant "${variantName}" not found on this product`);
-    // }
-
-    // ── Single atomic $inc — no stale read, no overwrite ─────────────────────
     const session = await mongoose.startSession();
     let updatedProduct = null;
 
     try {
         await session.withTransaction(async () => {
 
-            // ── Verify product + variant exist BEFORE touching anything ──────────────
-            const existingProduct = await Product.findById(productId).select("variants totalStock stock stockCorrected");
-            if (!existingProduct) {
-                throw new ApiError(409, "Product not found");
+            // STEP 1: Strict Concurrency Check First (Isolated Source of Truth)
+            // Defensive backfill: if inventory does not exist, initialize it first.
+            let inventoryExists = await Inventory.findOne({ product: productId }).session(session);
+            if (!inventoryExists) {
+                await Inventory.create([{
+                    product: productId,
+                    physicalStock: 0,
+                    reservedStock: 0,
+                    version: 0
+                }], { session });
             }
 
-            if (!existingProduct.variants.has(variantName)) {
-                await Product.findByIdAndUpdate(
-                    productId,
-                    { $set: { [`variants.${variantName}`]: 0 } },
-                    { session }
+            const updatedInventory = await Inventory.findOneAndUpdate(
+                { product: productId, version: clientVersion },
+                {
+                    $inc: {
+                        physicalStock: parsedQuantity,
+                        version: 1 // Increment checkpoint sequence line
+                    }
+                },
+                { new: true, session }
+            );
+
+            // Fail-Fast: Abort transaction instantly if a conflict occurs
+            if (!updatedInventory) {
+                throw new ApiError(409, "Transaction Conflict: This inventory allocation line was updated by another process. Please refresh your view.");
+            }
+
+            // STEP 2: Evaluate Purchase Price Layer
+            // Attempt to update the existing purchase set array entry atomically
+            let afterVariantUpdate = await Variant.findOneAndUpdate(
+                { _id: variantId, "purchaseSets.price": purchasePrice },
+                {
+                    $inc: {
+                        "purchaseSets.$.quantity": parsedQuantity,
+                        "purchaseSets.$.remainingStock": parsedQuantity,
+                        totalStock: parsedQuantity
+                    }
+                },
+                { new: true, session }
+            );
+
+            // Fallback Engine: If the purchase price layer doesn't exist yet, push a brand-new entry
+            if (!afterVariantUpdate) {
+                afterVariantUpdate = await Variant.findByIdAndUpdate(
+                    variantId,
+                    {
+                        $push: {
+                            purchaseSets: {
+                                price: purchasePrice,
+                                quantity: parsedQuantity,
+                                remainingStock: parsedQuantity
+                            }
+                        },
+                        $inc: { totalStock: parsedQuantity }
+                    },
+                    { new: true, session }
                 );
             }
 
-            // Step 1: Atomic increment first — this is the source of truth
-            const afterUpdate = await Product.findOneAndUpdate(
-                {
-                    _id: productId,
-                    [`variants.${variantName}`]: { $exists: true }
-                },
+            // Safety check to intercept syntactically correct but missing runtime IDs
+            if (!afterVariantUpdate) {
+                throw new ApiError(404, "Data Integrity Violation: Variant manipulation baseline fell out of sync execution scopes.");
+            }
+
+            // STEP 3: Update Top-Level Storefront Product Cache
+            const afterProductUpdate = await Product.findByIdAndUpdate(
+                productId,
                 {
                     $inc: {
                         totalStock: parsedQuantity,
-                        [`variants.${variantName}`]: parsedQuantity
+                        availableStock: parsedQuantity
                     },
-                    // ...(stockCorrected && { $set: { stockCorrected: true } })
-                    ...((stockCorrected || stockCorrected2) && {
-                        $set: {
-                            ...(stockCorrected && { stockCorrected: true, isChecked: true }),
-                            ...(stockCorrected2 && { stockCorrected2: true, isChecked: true })
-                        }
-                    })
+                    $set: { inventory: updatedInventory._id }
                 },
-                { new: true, session }  // new:true → returns POST-increment values
-            ).select("variants totalStock stock stockCorrected");
+                { new: true, session }
+            );
 
-            if (!afterUpdate) {
-                throw new ApiError(409, "Stock update failed — product or variant not found");
+            if (!afterProductUpdate) {
+                throw new ApiError(409, "Storefront Catalog Synchronisation Failure: Operation aborted securely.");
             }
 
-            // Step 2: Derive previousStock from the actual DB result
-            //         This is always accurate regardless of concurrent orders
-            const updatedVariantQty = afterUpdate.variants.get(variantName);
-            const previousVariantQty = updatedVariantQty - parsedQuantity;
-
-            // Step 3: Create stock log inside the same transaction
+            // STEP 4: Build Variant-Level Immutable Stock Log
+            const variantTotalStockAfter = afterVariantUpdate.totalStock;
             const [stockEntry] = await Stock.create([{
-                type: STOCK_TYPES.STOCK_IN,
+                type: STOCK_TYPES.STOCK_IN, // Maps to your STOCK_TYPES matrix reference schemas
                 vendor,
-                variantName,
+                variantId,
+                variantName: variant.name,
                 purchasePrice,
                 quantity: parsedQuantity,
-                previousStock: previousVariantQty,  // accurate
-                updatedStock: updatedVariantQty,     // accurate
-                productId
+                previousStock: variantTotalStockAfter - parsedQuantity, // Accurate variant snapshot history
+                updatedStock: variantTotalStockAfter,
+                productId,
+                isScratchy: false
             }], { session });
 
-            // Step 4: Link the new stock entry to the product
+            // STEP 5: Associate Log Index Reference back to parent product document
             await Product.findByIdAndUpdate(
                 productId,
                 { $push: { stock: stockEntry._id } },
                 { session }
             );
 
-            // Step 5: Re-fetch with full population for the API response
-            updatedProduct = await Product.findById(productId)
-                .populate("category stock groups")
-                .session(session)
-                .exec();
+            // STEP 6: Execute single cleanly populated readout pass for frontend application view updates
+            // updatedProduct = await Product.findById(productId)
+            //     // .populate("category stock groups variants")
+            //     .session(session)
+            //     .exec();
         });
-
     } catch (err) {
-        throw err;
+        throw err; // Handled cleanly by your global ApiError handling middleware
     } finally {
-        session.endSession();
+        session.endSession(); // Clear and release transaction thread back to pool allocation
     }
 
     return res.status(201).json(
-        new ApiResponse(201, updatedProduct, "Product stock updated successfully")
+        new ApiResponse(201, null, "Product stock parameters updated successfully.")
+    );
+});
+
+
+const bulkUpdateProductStock = asyncHandler(async (req, res) => {
+    let {
+        vendor,
+        productId,
+        updates,
+        clientVersion
+    } = req.body;
+
+    // Enforce explicit Optimistic Concurrency Control (OCC) tracking metrics globally
+    if (clientVersion === undefined || clientVersion === null) {
+        throw new ApiError(400, "Security Validation Failed: clientVersion parameter is required to perform bulk inventory mutations.");
+    }
+
+    if (!updates || !Array.isArray(updates) || updates.length === 0) {
+        throw new ApiError(400, "Updates processing matrix array is required and cannot be empty.");
+    }
+
+    // --- PHASE 1: PRE-VALIDATION & AGGREGATION (Outside heavy transaction layers) ---
+    let totalBulkQuantity = 0;
+    const validatedUpdates = [];
+    let resolvedProductId = productId;
+
+    for (const update of updates) {
+        let { variantId, quantity, purchasePrice } = update;
+        console.log(variantId, quantity, purchasePrice);
+        if (!variantId || quantity === undefined || purchasePrice === undefined) {
+            throw new ApiError(400, "Variant identification strings, quantities, and cost brackets are required across all entries.");
+        }
+
+        const parsedQuantity = parseInt(quantity);
+        if (isNaN(parsedQuantity) || parsedQuantity === 0) {
+            throw new ApiError(400, "Processing volumes must evaluate to valid non-zero operational values.");
+        }
+
+        // Validate variant tracking boundaries outside transaction allocations to prevent resource choking
+        const variant = await Variant.findById(variantId);
+        if (!variant) {
+            throw new ApiError(404, `Operational Target Missing: Variant reference row could not be located for ID: ${variantId}`);
+        }
+
+        if (!resolvedProductId) {
+            resolvedProductId = variant.productId;
+        } else if (resolvedProductId.toString() !== variant.productId.toString()) {
+            throw new ApiError(400, "Data Integration Mismatch: Bulk updating across multiple distinct products inside a single payload is prohibited.");
+        }
+
+        totalBulkQuantity += parsedQuantity;
+        validatedUpdates.push({
+            variant,
+            parsedQuantity,
+            purchasePrice
+        });
+    }
+
+    if (!resolvedProductId) {
+        throw new ApiError(400, "Target Mapping Failure: Unable to calculate parent product tracking parameters cleanly.");
+    }
+
+    const session = await mongoose.startSession();
+    let updatedProduct = null;
+
+    try {
+        await session.withTransaction(async () => {
+
+            // Defensive backfill: if inventory does not exist, initialize it first.
+            let inventoryExists = await Inventory.findOne({ product: resolvedProductId }).session(session);
+            if (!inventoryExists) {
+                await Inventory.create([{
+                    product: resolvedProductId,
+                    physicalStock: 0,
+                    reservedStock: 0,
+                    version: 0
+                }], { session });
+            }
+
+            // --- PHASE 2: THE CENTRAL VERSION LOCK ENGINE ---
+            // Execute exactly ONE version-check database statement utilizing the aggregate bulk calculation total. NO UPSERT.
+            const updatedInventory = await Inventory.findOneAndUpdate(
+                { product: resolvedProductId, version: clientVersion },
+                {
+                    $inc: {
+                        physicalStock: totalBulkQuantity,
+                        version: 1 // Single clean version progression regardless of item array size
+                    }
+                },
+                { new: true, session }
+            );
+
+            // Fail-Fast: Abort transaction instantly if overlapping webhooks or admins touched this product row
+            if (!updatedInventory) {
+                throw new ApiError(409, "Bulk Transaction Conflict: The central inventory line was updated by another background process. Please refresh your data matrix view.");
+            }
+
+            const generatedStockLogIds = [];
+
+            // --- PHASE 3: SUB-LOOP SUB-DOCUMENT MUTATIONS ---
+            for (const item of validatedUpdates) {
+                const { variant, parsedQuantity, purchasePrice } = item;
+                const variantId = variant._id;
+
+                // Step 1: Update target Variant cost tiers and total arrays atomically inside the safe transaction shell
+                let afterVariantUpdate = await Variant.findOneAndUpdate(
+                    { _id: variantId, "purchaseSets.price": purchasePrice },
+                    {
+                        $inc: {
+                            "purchaseSets.$.quantity": parsedQuantity,
+                            "purchaseSets.$.remainingStock": parsedQuantity,
+                            totalStock: parsedQuantity
+                        }
+                    },
+                    { new: true, session }
+                );
+
+                // Fallback Engine: Push a brand new purchase pricing matrix row if the layer is unique
+                if (!afterVariantUpdate) {
+                    afterVariantUpdate = await Variant.findByIdAndUpdate(
+                        variantId,
+                        {
+                            $push: {
+                                purchaseSets: {
+                                    price: purchasePrice,
+                                    quantity: parsedQuantity,
+                                    remainingStock: parsedQuantity
+                                }
+                            },
+                            $inc: { totalStock: parsedQuantity }
+                        },
+                        { new: true, session }
+                    );
+                }
+
+                if (!afterVariantUpdate) {
+                    throw new ApiError(404, `Data Integrity Fault: Variant execution array synchronization failed on row: ${variantId}`);
+                }
+
+                // Step 2: Build individual variant tracking historical log footprints
+                const variantTotalStockAfter = afterVariantUpdate.totalStock;
+                const [stockEntry] = await Stock.create([{
+                    type: STOCK_TYPES.STOCK_IN, // Maps to your STOCK_TYPES matrix reference schemas
+                    vendor,
+                    variantId,
+                    variantName: variant.name,
+                    purchasePrice,
+                    quantity: parsedQuantity,
+                    previousStock: variantTotalStockAfter - parsedQuantity, // Safe individual variant history snapshot tracking
+                    updatedStock: variantTotalStockAfter,
+                    productId: resolvedProductId,
+                    isScratchy: false
+                }], { session });
+
+                generatedStockLogIds.push(stockEntry._id);
+            }
+
+            // Step 4: Execute a single aggregate update transaction sweep to synchronize the parent Product storefront cache
+            const afterProductUpdate = await Product.findByIdAndUpdate(
+                resolvedProductId,
+                {
+                    $inc: {
+                        totalStock: totalBulkQuantity,
+                        availableStock: totalBulkQuantity
+                    },
+                    // Append all newly generated operational logs directly into the history array row inside a single operation
+                    $push: { stock: { $each: generatedStockLogIds } },
+                    $set: { inventory: updatedInventory._id }
+                },
+                { new: true, session }
+            );
+
+            if (!afterProductUpdate) {
+                throw new ApiError(409, "Storefront Catalog Synchronization Failure: Operation terminated securely within pipeline scopes.");
+            }
+
+            // Step 5: Read out cleanly populated dataset matrix values for direct client response transmissions
+            // updatedProduct = await Product.findById(resolvedProductId)
+            //     .populate("category stock groups variants")
+            //     .session(session)
+            //     .exec();
+        });
+    } catch (err) {
+        throw err; // Passed cleanly downstream into your global ApiError interceptor middleware
+    } finally {
+        session.endSession(); // Terminate execution context allocation footprints securely
+    }
+
+    return res.status(201).json(
+        new ApiResponse(201, null, "Product variant stock arrays updated in bulk successfully.")
     );
 });
 
@@ -497,7 +763,7 @@ const markProductChecked = asyncHandler(async (req, res) => {
         },
         { new: true }
     )
-    // .populate("category stock groups").exec(); //populate order, group here
+    // .populate("category stock groups variants").exec();
     if (!updatedProduct) {
         throw new ApiError(409, "Could not update product");
     }
@@ -517,7 +783,7 @@ const getStockHistoryByProduct = asyncHandler(async (req, res) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
     const skip = (page - 1) * limit;
 
-    const { variantName, type, isScratchy } = req.query;
+    const { variantName, type } = req.query;
 
     const filter = { productId };
     if (variantName && variantName !== "all") {
@@ -525,12 +791,6 @@ const getStockHistoryByProduct = asyncHandler(async (req, res) => {
     }
     if (type && type !== "all") {
         filter.type = type;
-    }
-
-    if (isScratchy === "true") {
-        filter.isScratchy = true;
-    } else if (isScratchy === "false") {
-        filter.isScratchy = { $ne: true };
     }
 
     const [history, totalCount] = await Promise.all([
@@ -571,17 +831,15 @@ const editProduct = asyncHandler(async (req, res) => {
         keyInformation, images,
         basePrice, regularPrice,
         hsn, sku, gst,
-        rating, reviewCount
+        rating, reviewCount,
+        sellingPrice,
+        discount, moq,
+        webVisibility, appVisibility
     } = req.body;
-
-    //TODO: Add Images to it
 
     //Validations
     if (
         !_id
-        // || !slug ||
-        // !name || !fullName || !description ||
-        // price == undefined || price == null || !categoryId
     ) {
         throw new ApiError(400, "Details not found");
     }
@@ -591,9 +849,11 @@ const editProduct = asyncHandler(async (req, res) => {
         throw new ApiError(409, `Product not found`);
     }
 
-    const foundCategory = await SubCategory.findById(categoryId);
-    if (!foundCategory) {
-        throw new ApiError(409, `Category not found`);
+    if (categoryId) {
+        const foundCategory = await SubCategory.findById(categoryId);
+        if (!foundCategory) {
+            throw new ApiError(409, `Category not found`);
+        }
     }
 
     if (brandId) {
@@ -606,12 +866,23 @@ const editProduct = asyncHandler(async (req, res) => {
         }
     }
 
-    //create selling price
-    let sellingPrice = foundProduct?.sellingPrice[foundProduct?.sellingPrice?.length - 1];
-    if (price && sellingPrice?.price !== price) {
-        sellingPrice = [...foundProduct?.sellingPrice, { price }]
-    } else {
-        sellingPrice = foundProduct?.sellingPrice
+    //create selling price and calculate min/max prices
+    let sellingPriceObj = foundProduct?.sellingPrice;
+    if (sellingPrice) {
+        sellingPriceObj = typeof sellingPrice === "string" ? JSON.parse(sellingPrice) : sellingPrice;
+    } else if (price) {
+        sellingPriceObj = {
+            type: "fixed",
+            slabs: [{ quantity: 1, price: parseFloat(price) || 0 }]
+        };
+    }
+
+    let minPrice = 0;
+    let maxPrice = 0;
+    if (sellingPriceObj.slabs && sellingPriceObj.slabs.length > 0) {
+        const prices = sellingPriceObj.slabs.map(slab => slab.price);
+        minPrice = Math.min(...prices);
+        maxPrice = Math.max(...prices);
     }
 
     const updates = {
@@ -620,18 +891,26 @@ const editProduct = asyncHandler(async (req, res) => {
         description: description?.trim() || foundProduct?.description,
         brand: brandId ? brandId : foundProduct?.brand ? foundProduct?.brand : null,
         slug,
-        hsn, sku,
-        gst,
-        active: active != undefined ? active : foundProduct?.active,
-        sellingPrice,
+        hsn: hsn === "" ? null : hsn || foundProduct?.hsn,
+        sku: sku === "" ? null : sku || foundProduct?.sku,
+        gst: gst !== undefined ? parseOptionalNumber(gst) : foundProduct?.gst,
+        discount: discount !== undefined ? parseOptionalNumber(discount) : foundProduct?.discount,
+        active: active !== undefined ? active : foundProduct?.active,
+        webVisibility: webVisibility !== undefined ? webVisibility : foundProduct?.webVisibility,
+        appVisibility: appVisibility !== undefined ? appVisibility : foundProduct?.appVisibility,
+        sellingPrice: sellingPriceObj,
+        minPrice,
+        maxPrice,
         descriptionPoints: descriptionPoints || foundProduct?.descriptionPoints,
         keyInformation: keyInformation || foundProduct?.keyInformation,
-        basePrice: basePrice || foundProduct?.basePrice || 0,
-        regularPrice: regularPrice || foundProduct?.regularPrice || 0,
-        category: categoryId,
+        basePrice: basePrice !== undefined ? parseOptionalNumber(basePrice) : foundProduct?.basePrice,
+        regularPrice: regularPrice !== undefined ? parseOptionalNumber(regularPrice) : foundProduct?.regularPrice,
+        category: categoryId || foundProduct?.category,
         images: images ? images : foundProduct?.images,
         tags: tags ? tags : foundProduct?.tags,
-        rating, reviewCount
+        rating: rating !== undefined ? parseOptionalNumber(rating) : foundProduct?.rating,
+        reviewCount: reviewCount !== undefined ? parseOptionalNumber(reviewCount) : foundProduct?.reviewCount,
+        moq: moq !== undefined ? parseOptionalNumber(moq) : foundProduct?.moq
     }
 
     const updatedProduct = await Product.findByIdAndUpdate(
@@ -640,7 +919,7 @@ const editProduct = asyncHandler(async (req, res) => {
             ...updates
         },
         { new: true }
-    ).populate("category stock groups").exec(); //populate order, group here
+    ).populate("category stock groups variants").exec();
     if (!updatedProduct) {
         throw new ApiError(409, "Could not update product");
     }
@@ -670,7 +949,8 @@ const editProduct = asyncHandler(async (req, res) => {
                 }
             },
             { new: true }
-        ).populate("products parentCategory").exec();
+        )
+        // .populate("products parentCategory").exec();
         console.log("New Sub Category: ", newCategory);
     }
 
@@ -703,7 +983,8 @@ const updateProductStatus = asyncHandler(async (req, res) => {
             active: active != undefined ? active : foundProduct?.active
         },
         { new: true }
-    ).populate("category stock groups").exec(); //populate order, group here
+    )
+    // .populate("category stock groups variants").exec();
     if (!updatedProduct) {
         throw new ApiError(409, "Could not update product");
     }
@@ -716,7 +997,7 @@ const updateProductStatus = asyncHandler(async (req, res) => {
 const getProductBySlug = asyncHandler(async (req, res) => {
     const completeProductDetails = await Product.findOne({
         slug: req.params.slug
-    }).populate("category groups").select("-orders -stock").exec();
+    }).populate("category groups variants").select("-orders -stock").exec();
 
     if (!completeProductDetails) {
         throw new ApiError(409, "Could not fetch product details");
@@ -770,6 +1051,12 @@ const getProductById = asyncHandler(async (req, res) => {
             model: "SubCategory",
             select: "name"
         })
+        .populate({
+            path: "brand",
+            select: "name"
+        })
+        .populate("variants")
+        .populate("inventory")
         .select("-orders")
         .lean()
         .exec();
@@ -779,7 +1066,7 @@ const getProductById = asyncHandler(async (req, res) => {
     }
 
     // Count orders per variant and status combination using countDocuments
-    const variants = completeProductDetails.variants || {};
+    const variants = completeProductDetails.variants || [];
     const statuses = [
         "New", "Accepted", "Rejected", "Shipped", "Delivered",
         "Cancelled", "Returned", "Replaced", "Hold",
@@ -787,7 +1074,7 @@ const getProductById = asyncHandler(async (req, res) => {
     ];
 
     const countPromises = [];
-    const variantNames = Object.keys(variants);
+    const variantNames = variants.map(v => v.name);
 
     variantNames.forEach(variantName => {
         statuses.forEach(status => {
@@ -972,7 +1259,7 @@ const getAllProductSlugs = asyncHandler(async (req, res) => {
 const getAllProducts = asyncHandler(async (req, res) => {
     const allProducts = await Product.find({})
         .select("-orders -stock")
-        .populate("groups category").exec();
+        .populate("groups category variants").exec();
 
     if (!allProducts) {
         throw new ApiError(409, "Could not find products");
@@ -988,7 +1275,7 @@ const getAllActiveInstockProducts = asyncHandler(async (req, res) => {
         active: true, totalStock: { $gt: 0 }
     })
         .select("-orders -stock")
-        .populate("groups category").exec();
+        .populate("groups category variants").exec();
 
     if (!allProducts) {
         throw new ApiError(409, "Could not find products");
@@ -999,10 +1286,157 @@ const getAllActiveInstockProducts = asyncHandler(async (req, res) => {
     )
 });
 
+
+
+
+// New variant CRUD controllers
+const createVariant = asyncHandler(async (req, res) => {
+    const { productId, name, images, totalStock, webVisibility, appVisibility, active, purchaseSets } = req.body;
+    if (!productId || !name) {
+        throw new ApiError(400, "Product ID and Variant Name are required");
+    }
+    const product = await Product.findById(productId);
+    if (!product) {
+        throw new ApiError(404, "Product not found");
+    }
+    const newVariant = await Variant.create({
+        productId,
+        name,
+        images: images || [],
+        totalStock: totalStock || 0,
+        webVisibility: webVisibility !== undefined ? webVisibility : true,
+        appVisibility: appVisibility !== undefined ? appVisibility : true,
+        active: active !== undefined ? active : true,
+        purchaseSets: purchaseSets || []
+    });
+
+    // add variant reference to Product
+    await Product.findByIdAndUpdate(productId, {
+        $push: { variants: newVariant._id }
+    });
+
+    return res.status(201).json(new ApiResponse(201, newVariant, "Variant created successfully"));
+});
+
+const updateVariant = asyncHandler(async (req, res) => {
+    const { variantId } = req.params;
+    if (!variantId || !mongoose.Types.ObjectId.isValid(variantId)) {
+        throw new ApiError(400, "Valid Variant ID required");
+    }
+    const updates = req.body;
+    const updatedVariant = await Variant.findByIdAndUpdate(
+        variantId,
+        { $set: updates },
+        { new: true }
+    );
+    if (!updatedVariant) {
+        throw new ApiError(404, "Variant not found");
+    }
+    return res.status(200).json(new ApiResponse(200, updatedVariant, "Variant updated successfully"));
+});
+
+const deleteVariant = asyncHandler(async (req, res) => {
+    const { variantId } = req.params;
+    if (!variantId || !mongoose.Types.ObjectId.isValid(variantId)) {
+        throw new ApiError(400, "Valid Variant ID required");
+    }
+    const variant = await Variant.findById(variantId);
+    if (!variant) {
+        throw new ApiError(404, "Variant not found");
+    }
+
+    // remove from Product
+    await Product.findByIdAndUpdate(variant.productId, {
+        $pull: { variants: variantId }
+    });
+
+    await Variant.findByIdAndDelete(variantId);
+    return res.status(200).json(new ApiResponse(200, null, "Variant deleted successfully"));
+});
+
+// Update Product Price slabs separate API
+const updateProductPrice = asyncHandler(async (req, res) => {
+    const { _id } = req.params;
+    const { price, sellingPrice } = req.body;
+
+    if (!_id || !mongoose.Types.ObjectId.isValid(_id)) {
+        throw new ApiError(400, "Valid Product ID required");
+    }
+
+    const product = await Product.findById(_id);
+    if (!product) {
+        throw new ApiError(404, "Product not found");
+    }
+
+    let sellingPriceObj;
+    if (sellingPrice) {
+        sellingPriceObj = typeof sellingPrice === "string" ? JSON.parse(sellingPrice) : sellingPrice;
+    } else if (price) {
+        sellingPriceObj = {
+            type: "fixed",
+            slabs: [{ quantity: 1, price: parseFloat(price) }]
+        };
+    } else {
+        throw new ApiError(400, "Price or sellingPrice is required");
+    }
+
+    let minPrice = 0;
+    let maxPrice = 0;
+    if (sellingPriceObj.slabs && sellingPriceObj.slabs.length > 0) {
+        const prices = sellingPriceObj.slabs.map(slab => slab.price);
+        minPrice = Math.min(...prices);
+        maxPrice = Math.max(...prices);
+    }
+
+    const updatedProduct = await Product.findByIdAndUpdate(
+        _id,
+        {
+            $set: {
+                sellingPrice: sellingPriceObj,
+                minPrice,
+                maxPrice
+            }
+        },
+        { new: true }
+    ).populate("category stock groups variants").exec();
+
+    return res.status(200).json(new ApiResponse(200, updatedProduct, "Product price updated successfully"));
+});
+
+
+
 const markProductInGroup = asyncHandler(async (req, res) => { });
-const deleteProduct = asyncHandler(async (req, res) => { });
+const deleteProduct = asyncHandler(async (req, res) => {
+    const { _id } = req.params;
+    if (_id && mongoose.Types.ObjectId.isValid(_id)) {
+        await Inventory.deleteMany({ product: _id });
+    }
+});
 const getProductsByCategory = asyncHandler(async (req, res) => { });
 const getProductsByGroup = asyncHandler(async (req, res) => { });
+
+const getProductInventoryDetails = asyncHandler(async (req, res) => {
+    const _id = req?.params?._id;
+    if (!_id || !mongoose.Types.ObjectId.isValid(_id)) {
+        throw new ApiError(400, "Valid ID required");
+    }
+    const product = await Product.findById(_id)
+        .select("name fullName totalStock availableStock inventory variants")
+        .populate({
+            path: "variants",
+            select: "name totalStock active webVisibility appVisibility"
+        })
+        .populate({
+            path: "inventory",
+            select: "physicalStock reservedStock version"
+        })
+        .lean()
+        .exec();
+    if (!product) {
+        throw new ApiError(404, "Product not found");
+    }
+    return res.status(200).json(new ApiResponse(200, product, "Product inventory details fetched successfully"));
+});
 
 export {
     createProduct,
@@ -1011,15 +1445,20 @@ export {
     getStockHistoryByProduct,
     editProduct,
     updateProductStatus,
-    markProductInGroup,
-    deleteProduct,
     getRelatedProducts,
     getAllProductSlugs,
     getAllProducts,
     getAllActiveInstockProducts,
-    getProductsByCategory,
-    getProductsByGroup,
     getProductById,
     getProductBySlug,
-    getProductOrders
+    getProductOrders,
+    createVariant,
+    updateVariant,
+    deleteVariant,
+    updateProductPrice,
+    markProductInGroup,
+    deleteProduct, getProductsByCategory,
+    getProductsByGroup,
+    bulkUpdateProductStock,
+    getProductInventoryDetails
 }

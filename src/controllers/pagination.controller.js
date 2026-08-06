@@ -431,7 +431,7 @@ export const getPaginatedProducts = asyncHandler(async (req, res) => {
       .limit(parsedLimit)
       // .populate("category", "name slug")
       // .populate("orders stock groups category")
-      .populate("stock category")
+      .populate("stock category variants")
       .populate({
         path: "category",
         model: "SubCategory",
@@ -618,7 +618,7 @@ export const getPaginatedProductsForAdmin = asyncHandler(async (req, res) => {
       .limit(parsedLimit)
       // .populate("category", "name slug")
       // .populate("orders stock groups category")
-      .populate("stock category")
+      .populate("stock category variants")
       .populate({
         path: "category",
         model: "SubCategory",

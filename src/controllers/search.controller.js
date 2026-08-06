@@ -127,30 +127,16 @@ export const searchProductsPaginated = asyncHandler(async (req, res) => {
       matchStage.brand = { $in: objectIds };
     }
 
-    // price filter for latestPrice
-    const priceFilter = {};
-    if (!isNaN(priceFrom)) priceFilter.$gte = priceFrom;
-    if (!isNaN(priceTo)) priceFilter.$lte = priceTo;
-
-    // Pipeline helper that extracts latest price (last index element)
-    const addLatestPriceStage = {
-      $addFields: {
-        latestPrice: {
-          $let: {
-            vars: {
-              latestPriceObj: { $arrayElemAt: ["$sellingPrice", -1] }
-            },
-            in: { $ifNull: ["$$latestPriceObj.price", 0] }
-          }
-        }
-      }
-    };
+    // price filter directly on minPrice field
+    if (!isNaN(priceFrom) || !isNaN(priceTo)) {
+      matchStage.minPrice = {};
+      if (!isNaN(priceFrom)) matchStage.minPrice.$gte = priceFrom;
+      if (!isNaN(priceTo)) matchStage.minPrice.$lte = priceTo;
+    }
 
     // 1) Compute total matching documents
     const countPipeline = [
       { $match: matchStage },
-      addLatestPriceStage,
-      ...(Object.keys(priceFilter).length > 0 ? [{ $match: { latestPrice: priceFilter } }] : []),
       { $count: "total" }
     ];
 
@@ -174,8 +160,11 @@ export const searchProductsPaginated = asyncHandler(async (req, res) => {
     // 2) Fetch products, sort, and paginate
     const pipeline = [
       { $match: matchStage },
-      addLatestPriceStage,
-      ...(Object.keys(priceFilter).length > 0 ? [{ $match: { latestPrice: priceFilter } }] : []),
+      {
+        $addFields: {
+          latestPrice: { $ifNull: ["$minPrice", 0] }
+        }
+      },
       {
         $project: {
           orders: 0,
@@ -195,7 +184,8 @@ export const searchProductsPaginated = asyncHandler(async (req, res) => {
       { $limit: limit }
     ];
 
-    const products = await Product.aggregate(pipeline, { allowDiskUse: true }).exec();
+    let products = await Product.aggregate(pipeline, { allowDiskUse: true }).exec();
+    products = await Product.populate(products, { path: "variants" });
 
     const returned = Array.isArray(products) ? products.length : 0;
     const newLastIndex = start + returned - 1;
@@ -233,18 +223,11 @@ export const searchProductsPaginated = asyncHandler(async (req, res) => {
       matchQuery.brand = { $in: objectIds };
     }
 
-    // price filter for latestPrice (latest index value in sellingPrice array)
-    const exprConditions = [];
-    const latestPriceExpr = { $arrayElemAt: ["$sellingPrice.price", -1] };
-
-    if (!isNaN(priceFrom)) {
-      exprConditions.push({ $gte: [latestPriceExpr, priceFrom] });
-    }
-    if (!isNaN(priceTo)) {
-      exprConditions.push({ $lte: [latestPriceExpr, priceTo] });
-    }
-    if (exprConditions.length > 0) {
-      matchQuery.$expr = exprConditions.length === 1 ? exprConditions[0] : { $and: exprConditions };
+    // price filter directly on minPrice field
+    if (!isNaN(priceFrom) || !isNaN(priceTo)) {
+      matchQuery.minPrice = {};
+      if (!isNaN(priceFrom)) matchQuery.minPrice.$gte = priceFrom;
+      if (!isNaN(priceTo)) matchQuery.minPrice.$lte = priceTo;
     }
 
     // 1) Compute total matching documents using countDocuments
@@ -267,18 +250,25 @@ export const searchProductsPaginated = asyncHandler(async (req, res) => {
     // 2) Fetch products with the query, sort, and skip/limit pagination
     const products = await Product.find(matchQuery)
       .select("-orders -stock -groups -category")
+      .populate("variants")
       .sort({ totalStock: -1, _id: 1 })
       .skip(start)
       .limit(limit)
       .lean()
       .exec();
 
-    const returned = Array.isArray(products) ? products.length : 0;
+    // Map minPrice to latestPrice for frontend compatibility
+    const productsWithLatestPrice = products.map(p => ({
+      ...p,
+      latestPrice: p.minPrice || 0
+    }));
+
+    const returned = Array.isArray(productsWithLatestPrice) ? productsWithLatestPrice.length : 0;
     const newLastIndex = start + returned - 1;
     const hasMore = (start + returned) < total;
 
     return res.status(200).json(new ApiResponse(200, {
-      products,
+      products: productsWithLatestPrice,
       pagination: {
         lastIndex: newLastIndex,
         limit,
@@ -376,14 +366,7 @@ export const searchProducts = asyncHandler(async (req, res) => {
     { $match: matchStage },
     {
       $addFields: {
-        latestPrice: {
-          $let: {
-            vars: {
-              sortedPrices: { $sortArray: { input: "$sellingPrice", sortBy: { createdAt: -1 } } }
-            },
-            in: { $arrayElemAt: ["$$sortedPrices.price", 0] }
-          }
-        },
+        latestPrice: { $ifNull: ["$minPrice", 0] },
         hasStock: { $cond: [{ $gt: ["$totalStock", 0] }, 1, 0] },
         isCategoryMatch: {
           $cond: {
@@ -422,7 +405,8 @@ export const searchProducts = asyncHandler(async (req, res) => {
     }
   ];
 
-  const products = await Product.aggregate(pipeline, { allowDiskUse: true });
+  let products = await Product.aggregate(pipeline, { allowDiskUse: true });
+  products = await Product.populate(products, { path: "variants" });
 
   return res.status(200).json(
     new ApiResponse(200, products, "Products fetched successfully")
