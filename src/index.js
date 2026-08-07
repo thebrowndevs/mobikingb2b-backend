@@ -15,3 +15,5 @@ connectDB()
     .catch((err) => {
         console.log("MONGO db connection failed !!! ", err);
     })
+
+// Trigger reload to load new env vars: 1

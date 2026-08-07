@@ -38,6 +38,82 @@ const userSchema = new mongoose.Schema({
         trim: true,
         unique: true
     },
+    business: {
+        active: {
+            type: Boolean,
+            default: false
+        },
+        verified: {
+            type: Boolean,
+            default: false
+        },
+        businessName: {
+            type: String,
+            trim: true
+        },
+        businessEmail: {
+            type: String,
+            trim: true
+        },
+        businessPhone: {
+            type: String,
+            trim: true
+        },
+        gstNumber: {
+            type: String,
+            trim: true
+        },
+        isApproved: {
+            type: Boolean,
+            default: false
+        },
+        gstVerified: {
+            type: Boolean,
+            default: false
+        },
+        gstData: {
+            type: mongoose.Schema.Types.Mixed
+        },
+        approvedBy: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'User'
+        },
+        approvedAt: {
+            type: Date
+        },
+        regsiteredAddress: {
+            street: {
+                type: String,
+                // required: true,
+            },
+            street2: {
+                type: String,
+            },
+            city: {
+                type: String,
+                // required: true,
+            },
+            state: {
+                type: String,
+                // required: true,
+            },
+            country: {
+                type: String,
+                // required: true,
+                default: "India"
+            },
+            pinCode: {
+                type: String,
+                // required: true,
+            },
+            latitude: {
+                type: Number,
+            },
+            longitude: {
+                type: Number,
+            }
+        }
+    },
     address: [{
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Address'

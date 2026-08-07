@@ -353,44 +353,10 @@ const loginUser = asyncHandler(async (req, res) => {
         //populate orders
 
         if (!user) {
-            user = await User.create({
-                phoneNo,
-                role,
-                email: phoneNo
-            });
-
-            const newCart = await Cart.create({
-                userId: user?._id,
-            });
-
-            user = await User.findByIdAndUpdate(
-                user?._id,
-                {
-                    cart: newCart?._id
-                },
-                { new: true }
-            ).populate({
-                path: "cart",
-                populate: {
-                    path: "items.productId",
-                    model: "Product",
-                    populate: {
-                        path: "category",  // This is the key part
-                        model: "SubCategory"
-                    }
-                }
-            })
-                .populate("wishlist")
-                .populate("address")
-                .populate("orders")
-                .exec();
-            //populate orders
-
+            throw new ApiError(404, "Account not registered. Please register first.");
         } else {
             if (user?.role !== role) {
                 throw new ApiError(400, `Employee Account Registered with the phone number ${user?.phoneNo}`);
-            } else {
-
             }
         }
 
@@ -452,8 +418,98 @@ const loginUser = asyncHandler(async (req, res) => {
                 "User logged In Successfully"
             )
         )
+});
 
-})
+const signupUser = asyncHandler(async (req, res) => {
+    const { role, phoneNo } = req.body;
+
+    if (!role) {
+        throw new ApiError(400, 'Role Not Found');
+    }
+
+    if (role !== ROLES.USER) {
+        throw new ApiError(400, 'Only customer accounts can sign up using this route');
+    }
+
+    if (!phoneNo) {
+        throw new ApiError(400, 'Phone number not found');
+    }
+
+    let user = await User.findOne({ phoneNo });
+    if (user) {
+        throw new ApiError(409, "Account already registered. Please log in.");
+    }
+
+    user = await User.create({
+        phoneNo,
+        role,
+        email: phoneNo
+    });
+
+    const newCart = await Cart.create({
+        userId: user?._id,
+    });
+
+    user = await User.findByIdAndUpdate(
+        user?._id,
+        {
+            cart: newCart?._id
+        },
+        { new: true }
+    ).populate({
+        path: "cart",
+        populate: {
+            path: "items.productId",
+            model: "Product",
+            populate: {
+                path: "category",  // This is the key part
+                model: "SubCategory"
+            }
+        }
+    })
+        .populate("wishlist")
+        .populate("address")
+        .populate("orders")
+        .exec();
+
+    const { accessToken, refreshToken } = await generateAccessAndRefereshTokens(user?._id);
+
+    const loggedInUser = await User.findById(user?._id)
+        .select("-password -refreshToken")
+        .populate({
+            path: "cart",
+            populate: {
+                path: "items.productId",
+                model: "Product",
+                populate: {
+                    path: "category",  // This is the key part
+                    model: "SubCategory"
+                }
+            }
+        })
+        .populate("wishlist")
+        .populate("address")
+        .exec();
+
+    const options = {
+        httpOnly: true,
+        secure: true
+    }
+
+    return res
+        .status(201)
+        .cookie("accessToken", accessToken, options)
+        .cookie("refreshToken", refreshToken, options)
+        .json(
+            new ApiResponse(
+                201,
+                {
+                    user: loggedInUser, accessToken, refreshToken
+                },
+                "Account registered and logged in successfully"
+            )
+        );
+});
 
 const customerSignupByEmail = asyncHandler(async (req, res) => {
     let { name, email, phoneNo, password } = req.body;
@@ -1869,6 +1925,7 @@ const rejectWarrantyRequest = asyncHandler(async (req, res) => {
 
 export {
     loginUser,
+    signupUser,
     customerSignupByEmail,
     customerLoginByEmail,
     getUserPermissions,

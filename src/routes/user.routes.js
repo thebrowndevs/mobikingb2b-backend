@@ -12,6 +12,7 @@ import {
     getUserPermissions,
     getUsersByRole,
     loginUser,
+    signupUser,
     logoutUser,
     placeCancelRequest,
     placeReturnRequest,
@@ -55,6 +56,7 @@ router.route("/customer/:phoneNo").get(verifyJWT, getCustomerByMobile);
 router.route("/createUser").post(verifyJWT, createEmployee);
 router.route("/sendOtp").post(sendOtp);
 router.route("/login").post(verifyOtp, loginUser);
+router.route("/signup").post(verifyOtp, signupUser);
 router.route("/send-Email-otp").post(verifyJWT, sendEmailOtp);
 router.route("/verify-Email-otp").post(verifyJWT, verifyEmailOtp);
 router.route("/reset-password").post(verifyJWT, resetPassword);
