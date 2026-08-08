@@ -8,6 +8,10 @@ export const itemsSchema = new mongoose.Schema({
         required: true
     },
     product_id: String,
+    variantId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Variant'
+    },
     sku: {
         type: String,
     },
@@ -25,6 +29,24 @@ export const itemsSchema = new mongoose.Schema({
         type: Number,
         required: true,
         default: 1
+    },
+    purchasePrice: {
+        type: Number
+    },
+    purchaseSetId: {
+        type: String
+    },
+    discount: {
+        type: Number,
+        default: 0
+    },
+    appliedSlab: {
+        quantity: Number,
+        price: Number
+    },
+    gst: {
+        type: Number,
+        default: 0
     },
     returnQuantity: {
         type: Number,
@@ -62,6 +84,14 @@ const cartSchema = new mongoose.Schema({
     totalCartValue: {
         type: Number,
         required: true,
+        default: 0
+    },
+    deliveryCharge: {
+        type: Number,
+        default: 0
+    },
+    discount: {
+        type: Number,
         default: 0
     },
     items: [itemsSchema]

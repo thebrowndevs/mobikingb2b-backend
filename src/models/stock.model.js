@@ -7,10 +7,22 @@ const stockSchema = new mongoose.Schema({
     },
     type: {
         type: String,
-        enum: ["stock-in", "add-item", "remove-item", "return", "cancel", "reject", "purchase", "purchase-restore"]
+        enum: ["stock-in", "add-item", "remove-item", "return", "cancel", "reject", "purchase", "purchase-restore", "reserved", "hold", "cancelled", "rejected"]
+    },
+    category: {
+        type: String,
+        enum: ["physical", "virtual"],
+        default: "virtual"
     },
     orderId: {
         type: String,
+    },
+    quotationId: {
+        type: String,
+    },
+    quotationRef: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Quotation',
     },
     isScratchy: {
         type: Boolean,

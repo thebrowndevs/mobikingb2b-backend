@@ -42,6 +42,7 @@ import paymentRouter from './routes/payment.routes.js'
 import couponRouter from './routes/coupon.routes.js'
 import blogRouter from './routes/blog.routes.js'
 import onboardingRouter from './routes/onboarding.routes.js'
+import quotationRouter from './routes/quotation.routes.js'
 
 // v2 routes import
 import productRouterV2 from './routes/v2/product.routes.js'
@@ -76,6 +77,7 @@ app.use("/api/v1/payment", paymentRouter)
 app.use("/api/v1/coupon", couponRouter)
 app.use("/api/v1/blogs", blogRouter)
 app.use("/api/v1/onboarding", onboardingRouter)
+app.use("/api/v1/quotations", quotationRouter)
 app.use("/api/v1/webhook/payment", paymentWebhookV2)
 app.use("/api/v2/payment/phonepe-webhook", phonepeWebhookV2)
 

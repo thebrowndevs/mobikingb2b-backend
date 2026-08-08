@@ -4,50 +4,95 @@ import { ApiError } from '../utils/ApiError.js';
 import { ApiResponse } from '../utils/ApiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { Product } from './../models/product.model.js';
+import { Variant } from '../models/variant.model.js';
+
+// Helper to recalculate selling prices of all items in cart dynamically based on product slabs
+async function recalculateCartPrices(cart) {
+    if (!cart || !cart.items || cart.items.length === 0) {
+        if (cart) {
+            cart.totalCartValue = 0;
+        }
+        return;
+    }
+
+    // Group items by productId to find total product quantity
+    const productQuantities = {};
+    for (const item of cart.items) {
+        if (!item.productId) continue;
+        const pId = item.productId.toString();
+        productQuantities[pId] = (productQuantities[pId] || 0) + item.quantity;
+    }
+
+    // Fetch product details and update item prices
+    for (const pId of Object.keys(productQuantities)) {
+        const product = await Product.findById(pId);
+        if (!product) continue;
+
+        const totalQty = productQuantities[pId];
+
+        // Determine price from slabs based on totalQty
+        let activeSlab = product.sellingPrice?.slabs?.[0] || { quantity: 60, price: product.basePrice || 0 };
+        if (product.sellingPrice?.slabs && product.sellingPrice.slabs.length > 0) {
+            const sortedSlabs = [...product.sellingPrice.slabs].sort((a, b) => b.quantity - a.quantity);
+            for (const slab of sortedSlabs) {
+                if (totalQty >= slab.quantity) {
+                    activeSlab = slab;
+                    break;
+                }
+            }
+        }
+
+        // Update all items of this product in cart
+        for (const item of cart.items) {
+            if (item.productId && item.productId.toString() === pId) {
+                item.price = activeSlab.price;
+                item.appliedSlab = {
+                    quantity: activeSlab.quantity,
+                    price: activeSlab.price
+                };
+            }
+        }
+    }
+
+    // Recalculate total value
+    cart.totalCartValue = cart.items.reduce((total, item) => {
+        return total + item.quantity * item.price;
+    }, 0);
+}
 
 const addProductInCart = asyncHandler(async (req, res) => {
-    let {
-        cartId,
-        productId,
-        variantName,
-        quantity // optional now
-    } = req.body;
+    let itemsInput = Array.isArray(req.body) ? req.body : (req.body.items || []);
 
-    // Parse quantity or default to 1
-    const parsedQuantity = parseInt(quantity);
-    const qtyToAdd = (!quantity || isNaN(parsedQuantity) || parsedQuantity <= 0) ? 1 : parsedQuantity;
-
-    if (!productId || !variantName) {
-        throw new ApiError(400, "ProductId, and variantName are required");
+    // Backwards compatibility for single item additions
+    if (!Array.isArray(itemsInput) || itemsInput.length === 0) {
+        const { productId, variantId, variantName, quantity } = req.body;
+        if (productId) {
+            let vId = variantId;
+            if (!vId && variantName) {
+                const foundV = await Variant.findOne({ productId, name: variantName });
+                vId = foundV?._id;
+            }
+            if (productId && vId) {
+                itemsInput = [{
+                    productId,
+                    variantId: vId,
+                    quantity: quantity || 1
+                }];
+            }
+        }
     }
 
-    // Assign the cart Id saved in user to cartId
-    cartId = req?.user?.cart;
-
-    // 1. Fetch product with category
-    const product = await Product.findById(productId)
-        .populate("category")
-        .exec();
-
-    if (!product) {
-        throw new ApiError(404, "Product not found");
+    if (itemsInput.length === 0) {
+        throw new ApiError(400, "Items array or item details are required");
     }
 
-    const availableVariantStock = product.variants.get(variantName);
-    if (availableVariantStock === undefined) {
-        throw new ApiError(400, "Selected variant does not exist");
-    }
-
-    const latestPrice = product.sellingPrice?.[product.sellingPrice.length - 1]?.price;
-    if (latestPrice == undefined || latestPrice == null || isNaN(latestPrice)) {
-        throw new ApiError(400, "No valid price found for product");
-    }
-
-    // 2. Check if cart exists or create
-    // console.log("cart Id: ", cartId);
-
+    const cartId = req?.user?.cart;
     let cart = null;
-    if (!cartId) {
+    if (cartId) {
+        cart = await Cart.findById(cartId);
+    }
+
+    if (!cart) {
         const allCarts = await Cart.find({ userId: req?.user?._id });
         for (let c of allCarts) {
             await Cart.findByIdAndDelete(c?._id);
@@ -56,67 +101,80 @@ const addProductInCart = asyncHandler(async (req, res) => {
             userId: req.user._id,
             items: []
         });
-        // console.log("New Cart: ", cart);
-    } else {
-        cart = await Cart.findById(cartId);
-        // console.log("Existing Cart: ", cart);
     }
 
-    let items = cart?.items || [];
-    const existingIndex = items.findIndex(
-        item =>
-            item.productId.toString() === productId &&
-            item.variantName === variantName
-    );
+    const cartItems = cart.items || [];
 
-    if (existingIndex !== -1) {
-        // Item exists — increment quantity
-        const currentQty = items[existingIndex].quantity;
-        const newQty = currentQty + qtyToAdd;
+    for (const item of itemsInput) {
+        const { productId, variantId, quantity } = item;
+        const qtyToAdd = parseInt(quantity);
+        if (isNaN(qtyToAdd) || qtyToAdd <= 0) continue;
 
-        if (newQty > availableVariantStock) {
-            throw new ApiError(400, `Only ${availableVariantStock} units available for ${variantName}`);
+        if (!productId || !variantId) {
+            throw new ApiError(400, "productId and variantId are required for all items");
         }
 
-        items[existingIndex] = {
-            ...items[existingIndex].toObject(),
-            fullName: product?.fullName,
-            basePrice: product?.basePrice,
-            quantity: newQty,
-            price: latestPrice // sync to latest price
-        };
-    } else {
-        // Add new item
-        if (qtyToAdd > availableVariantStock) {
-            throw new ApiError(400, `Only ${availableVariantStock} units available for ${variantName}`);
+        const product = await Product.findById(productId);
+        if (!product) {
+            throw new ApiError(404, `Product not found for ID: ${productId}`);
         }
 
-        items.push({
-            productId,
-            fullName: product?.fullName,
-            basePrice: product?.basePrice,
-            variantName,
-            quantity: qtyToAdd,
-            price: latestPrice
-        });
+        const variant = await Variant.findById(variantId);
+        if (!variant) {
+            throw new ApiError(404, `Variant not found for ID: ${variantId}`);
+        }
+
+        const availableVariantStock = variant.totalStock || 0;
+
+        const existingIndex = cartItems.findIndex(
+            it => it.variantId.toString() === variantId.toString()
+        );
+
+        let finalQty = qtyToAdd;
+        if (existingIndex !== -1) {
+            finalQty = cartItems[existingIndex].quantity + qtyToAdd;
+        }
+
+        if (finalQty > availableVariantStock) {
+            throw new ApiError(400, `Only ${availableVariantStock} units available for variant "${variant.name}"`);
+        }
+
+        const latestPrice = product.sellingPrice?.[product.sellingPrice.length - 1]?.price || product.basePrice || 0;
+
+        if (existingIndex !== -1) {
+            cartItems[existingIndex] = {
+                ...cartItems[existingIndex].toObject(),
+                quantity: finalQty,
+                price: latestPrice,
+                gst: product.gst || 18,
+                discount: 0
+            };
+        } else {
+            cartItems.push({
+                productId,
+                variantId: variant._id,
+                sku: String(variant._id),
+                fullName: product.fullName,
+                basePrice: product.basePrice,
+                variantName: variant.name,
+                quantity: finalQty,
+                price: latestPrice,
+                gst: product.gst || 18,
+                discount: 0
+            });
+        }
     }
 
-    // 3. Save updated cart
-    cart.items = items;
+    cart.items = cartItems;
 
-    // Recalculate total cart value
-    cart.totalCartValue = items.reduce((total, item) => {
-        return total + item.quantity * item.price;
-    }, 0);
-    // console.log("Cart Before save: ", cart);
+    // Recalculate prices based on slabs
+    await recalculateCartPrices(cart);
 
     const updatedCart = await cart.save();
-    // console.log("Cart After save: ", updatedCart);
     if (!updatedCart) {
         throw new ApiError(500, "Failed to update cart");
     }
 
-    // 4. Populate user with product details
     const updatedUser = await User.findByIdAndUpdate(
         req.user._id,
         {
@@ -131,111 +189,97 @@ const addProductInCart = asyncHandler(async (req, res) => {
                 path: "items.productId",
                 model: "Product",
                 populate: {
-                    path: "category",  // This is the key part
+                    path: "category",
                     model: "SubCategory"
                 }
             }
         })
         .populate("wishlist")
-        // .populate("orders")
         .exec();
-    //populate orders
 
-    // console.log("User", updatedUser);
+    // Hiding purchasePrice and purchaseSetId from customer response
+    if (updatedUser.cart && updatedUser.cart.items) {
+        updatedUser.cart.items = updatedUser.cart.items.map(it => {
+            const obj = it.toObject ? it.toObject() : it;
+            delete obj.purchasePrice;
+            delete obj.purchaseSetId;
+            return obj;
+        });
+    }
 
-    return res.status(201).json(
-        new ApiResponse(201, {
+    return res.status(200).json(
+        new ApiResponse(200, {
             user: updatedUser
-        }, "Product added to cart successfully")
+        }, "Products added to cart successfully")
     );
 });
 
 const removeProductFromCart = asyncHandler(async (req, res) => {
-    let { cartId, productId, variantName } = req.body;
+    let itemsInput = Array.isArray(req.body) ? req.body : (req.body.items || []);
 
-    if (!productId || !variantName) {
-        throw new ApiError(400, "cartId, productId, and variantName are required");
-    }
-
-    cartId = req?.user?.cart;
-    let cart = null;
-    if (!cartId) {
-        const allCarts = await Cart.find({ userId: req?.user?._id });
-        for (let c of allCarts) {
-            await Cart.findByIdAndDelete(c?._id);
+    // Backwards compatibility for single item removals
+    if (!Array.isArray(itemsInput) || itemsInput.length === 0) {
+        const { productId, variantId, variantName, quantity } = req.body;
+        if (productId) {
+            let vId = variantId;
+            if (!vId && variantName) {
+                const foundV = await Variant.findOne({ productId, name: variantName });
+                vId = foundV?._id;
+            }
+            if (productId && vId) {
+                itemsInput = [{
+                    productId,
+                    variantId: vId,
+                    quantity: quantity || 1
+                }];
+            }
         }
-        cart = await Cart.create({
-            userId: req.user._id,
-            items: []
-        });
-        // console.log("New Cart: ", cart);
-    } else {
-        cart = await Cart.findById(cartId);
-        // console.log("Existing Cart: ", cart);
     }
 
-    // 1. Fetch the cart
+    if (itemsInput.length === 0) {
+        throw new ApiError(400, "Items array or item details are required");
+    }
+
+    const cartId = req?.user?.cart;
+    if (!cartId) {
+        throw new ApiError(404, "Cart not found");
+    }
+
+    const cart = await Cart.findById(cartId);
     if (!cart) {
         throw new ApiError(404, "Cart not found");
     }
 
-    const items = cart.items || [];
+    const cartItems = cart.items || [];
 
-    const index = items.findIndex(
-        item =>
-            item.productId.toString() === productId &&
-            item.variantName === variantName
-    );
+    for (const item of itemsInput) {
+        const { variantId, quantity } = item;
+        const qtyToRemove = parseInt(quantity) || 1;
 
-    if (index === -1) {
-        throw new ApiError(404, "Item not found in cart");
+        const index = cartItems.findIndex(
+            it => it.variantId.toString() === variantId.toString()
+        );
+
+        if (index === -1) continue;
+
+        const newQty = cartItems[index].quantity - qtyToRemove;
+        if (newQty > 0) {
+            cartItems[index].quantity = newQty;
+        } else {
+            cartItems.splice(index, 1);
+        }
     }
 
-    // 2. Fetch product to get latest price (for consistency)
-    const product = await Product.findById(productId);
-    if (!product) {
-        throw new ApiError(404, "Product not found");
-    }
+    cart.items = cartItems;
 
-    const latestPrice = product.sellingPrice?.[product.sellingPrice.length - 1]?.price;
-    if (!latestPrice || isNaN(latestPrice)) {
-        throw new ApiError(400, "Invalid product price");
-    }
+    // Recalculate prices based on slabs
+    await recalculateCartPrices(cart);
 
-    // 3. Decrement quantity or remove if 1
-    if (items[index].quantity > 1) {
-        items[index].fullName = product?.fullName;
-        // items[index].basePrice = product?.basePrice;
-        items[index].quantity -= 1;
-        items[index].price = latestPrice; // Sync latest price
-    } else {
-        items.splice(index, 1); // Remove if quantity is now 0
-    }
-
-    // 4. Save updated cart
-    cart.items = items;
-
-    // Recalculate total cart value
-    cart.totalCartValue = items.reduce((total, item) => {
-        return total + item.quantity * item.price;
-    }, 0);
-
-    let updatedCart = await cart.save();
-
+    const updatedCart = await cart.save();
     if (!updatedCart) {
         throw new ApiError(500, "Failed to update cart");
     }
 
-    // 6. Recalculate total cart value
-    // const totalCartValue = updatedCart.items.reduce((total, item) => {
-    //     return total + item.quantity * item.price;
-    // }, 0);
-
-    // // updatedCart.items = items;
-    // updatedCart.totalCartValue = totalCartValue;
-    // updatedCart = await updatedCart.save();
-
-    // 5. Populate user with cart and product details
     const updatedUser = await User.findByIdAndUpdate(
         req.user._id,
         {
@@ -250,25 +294,32 @@ const removeProductFromCart = asyncHandler(async (req, res) => {
                 path: "items.productId",
                 model: "Product",
                 populate: {
-                    path: "category",  // This is the key part
+                    path: "category",
                     model: "SubCategory"
                 }
             }
         })
         .populate("wishlist")
-        // .populate("orders")
         .exec();
-    //populate orders
+
+    // Hiding purchasePrice and purchaseSetId from customer response
+    if (updatedUser.cart && updatedUser.cart.items) {
+        updatedUser.cart.items = updatedUser.cart.items.map(it => {
+            const obj = it.toObject ? it.toObject() : it;
+            delete obj.purchasePrice;
+            delete obj.purchaseSetId;
+            return obj;
+        });
+    }
 
     return res.status(200).json(
         new ApiResponse(200, {
-            user: updatedUser,
-            // totalCartValue
-        }, "Product removed from cart successfully")
+            user: updatedUser
+        }, "Products removed from cart successfully")
     );
 });
 
 export {
     addProductInCart,
     removeProductFromCart
-}
+};

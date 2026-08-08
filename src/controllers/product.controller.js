@@ -516,6 +516,7 @@ const updateProductStock = asyncHandler(async (req, res) => {
             const variantTotalStockAfter = afterVariantUpdate.totalStock;
             const [stockEntry] = await Stock.create([{
                 type: STOCK_TYPES.STOCK_IN, // Maps to your STOCK_TYPES matrix reference schemas
+                category: "physical",
                 vendor,
                 variantId,
                 variantName: variant.name,
@@ -691,6 +692,7 @@ const bulkUpdateProductStock = asyncHandler(async (req, res) => {
                 const variantTotalStockAfter = afterVariantUpdate.totalStock;
                 const [stockEntry] = await Stock.create([{
                     type: STOCK_TYPES.STOCK_IN, // Maps to your STOCK_TYPES matrix reference schemas
+                    category: "physical",
                     vendor,
                     variantId,
                     variantName: variant.name,

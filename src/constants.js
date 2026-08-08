@@ -16,6 +16,10 @@ export const STOCK_TYPES = {
     REJECT: "reject",
     PURCHASE: "purchase",
     PURCHASE_RESTORE: "purchase-restore",
+    RESERVED: "reserved",
+    HOLD: "hold",
+    CANCELLED: "cancelled",
+    REJECTED: "rejected",
 }
 
 export const ORDER_TYPES = {

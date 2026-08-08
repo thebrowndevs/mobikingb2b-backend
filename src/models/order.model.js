@@ -257,6 +257,13 @@ const orderSchema = new mongoose.Schema(
         },
 
         /****************  RELATIONS  *****************/
+        quotationId: {
+            type: String
+        },
+        quotationRef: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Quotation"
+        },
         userId: {
             type: mongoose.Schema.Types.ObjectId,
             ref: "User",
@@ -294,9 +301,9 @@ const orderSchema = new mongoose.Schema(
 
 orderSchema.index({ createdAt: -1 });
 orderSchema.pre("save", async function (next) {
-    if (this.isNew && !this.abondonedOrder && this.type != ORDER_TYPES.PARTIAL_RETURN) { // only for new orders that are not abandoned
+    if (this.isNew && !this.orderId && !this.abondonedOrder && this.type != ORDER_TYPES.PARTIAL_RETURN) { // only for new orders that are not abandoned
         const counter = await Counter.findOneAndUpdate(
-            { _id: "orderId" },
+            { _id: "quotationId" },
             { $inc: { seq: 1 } },
             { new: true, upsert: true, setDefaultsOnInsert: true }
         ).lean();  // lean() improves concurrency performance
@@ -308,7 +315,7 @@ orderSchema.pre("save", async function (next) {
 
 orderSchema.statics.generateNextOrderId = async function () {
     const counter = await Counter.findOneAndUpdate(
-        { _id: "orderId" },
+        { _id: "quotationId" },
         { $inc: { seq: 1 } },
         { new: true, upsert: true, setDefaultsOnInsert: true }
     ).lean();

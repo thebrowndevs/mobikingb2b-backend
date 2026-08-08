@@ -13,6 +13,7 @@ import mongoose from "mongoose";
 import { Address } from './../models/address.model.js';
 import { sendOtpEmail, sendPasswordResetEmail } from "../utils/emailService.js";
 import crypto from "crypto";
+import { Variant } from "../models/variant.model.js";
 
 // ******************************************************
 //                  USER AUTH CONTROLLERS
@@ -804,7 +805,6 @@ const getUserCart = asyncHandler(async (req, res) => {
     const validItems = [];
 
     for (const item of cart.items) {
-
         const product = item.productId;
 
         // product removed
@@ -813,18 +813,17 @@ const getUserCart = asyncHandler(async (req, res) => {
             continue;
         }
 
-        const variantKey = String(item.variantName || "").trim();
-
-        // variant removed
-        if (!product.variants || !product.variants.has(variantKey)) {
+        // variant check
+        const variant = await Variant.findById(item.variantId);
+        if (!variant || !variant.active) {
             updated = true;
             continue;
         }
 
-        const availableStock = product.variants.get(variantKey);
+        const availableStock = variant.totalStock || 0;
 
         // out of stock
-        if (!availableStock || availableStock <= 0) {
+        if (availableStock <= 0) {
             updated = true;
             continue;
         }
