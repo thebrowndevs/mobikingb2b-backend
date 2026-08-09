@@ -6,46 +6,68 @@ const groupSchema = new mongoose.Schema({
         required: true,
         unique: [true, "Group name must be unique"]
     },
-    sequenceNo: {
-        type: Number,
-        default: 0
-        // required: true,
-        // unique: [true, "Sequence number must be unique"]
-    },
-    banner: {
+    slug: {
         type: String,
-        // required: true
+        required: true,
+        unique: [true, "Group slug must be unique"]
     },
-    bannerLink: {
+    groupType: {
         type: String,
+        enum: ['categories', 'subcategories', 'products'],
+        required: true
     },
-    isBannerLinkActive: {
+    heading: {
+        type: String,
+        required: true
+    },
+    
+    // Website specific styling
+    webBanner: {
+        type: String
+    },
+    isWebBannerVisible: {
         type: Boolean,
         default: false
+    },
+    webBackgroundColor: {
+        type: String
+    },
+    isWebBgColorVisible: {
+        type: Boolean,
+        default: false
+    },
+
+    // Mobile App specific styling
+    appBanner: {
+        type: String
+    },
+    isAppBannerVisible: {
+        type: Boolean,
+        default: false
+    },
+    appBackgroundColor: {
+        type: String
+    },
+    isAppBgColorVisible: {
+        type: Boolean,
+        default: false
+    },
+
+    bannerLink: {
+        type: String
+    },
+    placement: {
+        type: String,
+        enum: ['grid', 'scroll'],
+        default: 'scroll'
     },
     active: {
         type: Boolean,
         default: true
     },
-    isBannerVisble: {
-        type: Boolean,
-        default: false
-    },
-    backgroundColor: {
-        type: String
-    },
-    isBackgroundColorVisible: {
-        type: Boolean,
-        default: false
-    },
-    isSpecial: {
-        type: Boolean,
-        default: false
-    },
     products: [{
         type: mongoose.Schema.Types.ObjectId,
-        ref: 'Product',
-        required: true
+        ref: 'Product'
     }],
     categories: [{
         type: mongoose.Schema.Types.ObjectId,

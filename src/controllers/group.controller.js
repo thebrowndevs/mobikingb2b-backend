@@ -9,51 +9,61 @@ import { Home } from "../models/home.model.js";
 
 const createGroup = asyncHandler(async (req, res) => {
     const {
-        name, sequenceNo, active, isBannerLinkActive,
-        banner, bannerLink, isBannerVisble, isSpecial,
-        backgroundColor, isBackgroundColorVisible,
-        categories, parentCategories
+        name, slug, groupType, heading,
+        webBanner, isWebBannerVisible, webBackgroundColor, isWebBgColorVisible,
+        appBanner, isAppBannerVisible, appBackgroundColor, isAppBgColorVisible,
+        bannerLink, placement, active,
+        products, categories, parentCategories
     } = req.body;
 
-    //Validate details
-    if (
-        !name
-    ) {
-        throw new ApiError(400, "Details not found");
+    const groupHeading = heading || name;
+    const groupName = name || groupHeading;
+    const groupSlug = slug || groupName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+
+    if (!groupName || !groupType || !groupHeading || !groupSlug) {
+        throw new ApiError(400, "Required details (name/heading, groupType, slug) not found");
     }
 
-    //create new group
     const newGroup = await Group.create({
-        name, sequenceNo: sequenceNo || 0, active,
-        isBannerVisble, isSpecial, isBannerLinkActive,
-        backgroundColor, isBackgroundColorVisible,
-        banner: banner ? banner : "",
-        bannerLink: bannerLink ? bannerLink : "",
-        categories: categories ? categories : [],
-        parentCategories: parentCategories ? parentCategories : []
+        name: groupName,
+        slug: groupSlug,
+        groupType,
+        heading: groupHeading,
+        webBanner: webBanner || "",
+        isWebBannerVisible: !!isWebBannerVisible,
+        webBackgroundColor: webBackgroundColor || "",
+        isWebBgColorVisible: !!isWebBgColorVisible,
+        appBanner: appBanner || "",
+        isAppBannerVisible: !!isAppBannerVisible,
+        appBackgroundColor: appBackgroundColor || "",
+        isAppBgColorVisible: !!isAppBgColorVisible,
+        bannerLink: bannerLink || "",
+        placement: placement || "scroll",
+        active: active ?? true,
+        products: products || [],
+        categories: categories || [],
+        parentCategories: parentCategories || []
     });
+
     if (!newGroup) {
         throw new ApiError(500, "Could not create group");
     }
 
-    //return response
     return res.status(201).json(
         new ApiResponse(201, newGroup, "Group created Successfully")
-    )
+    );
 });
 
 const editGroup = asyncHandler(async (req, res) => {
     const {
-        name, sequenceNo, active, isBannerLinkActive,
-        banner, bannerLink, isBannerVisble, isSpecial,
-        backgroundColor, isBackgroundColorVisible,
-        categories, parentCategories
+        name, slug, groupType, heading,
+        webBanner, isWebBannerVisible, webBackgroundColor, isWebBgColorVisible,
+        appBanner, isAppBannerVisible, appBackgroundColor, isAppBgColorVisible,
+        bannerLink, placement, active,
+        products, categories, parentCategories
     } = req.body;
 
-    //Validate details
-    if (
-        !req?.params?._id
-    ) {
+    if (!req?.params?._id) {
         throw new ApiError(400, "Details not found");
     }
 
@@ -62,25 +72,35 @@ const editGroup = asyncHandler(async (req, res) => {
         throw new ApiError(409, `Group not found`);
     }
 
-    //edit group
+    const groupHeading = heading || name || foundGroup.heading;
+    const groupName = name || heading || foundGroup.name;
+    const groupSlug = slug || foundGroup.slug || groupName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '');
+
     const updatedGroup = await Group.findByIdAndUpdate(
         req?.params?._id,
         {
-            name: name || foundGroup?.name,
-            sequenceNo: sequenceNo ? sequenceNo : foundGroup?.sequenceNo || 0,
-            active: active != undefined ? active : foundGroup?.active,
-            isBannerLinkActive: isBannerLinkActive != undefined ? isBannerLinkActive : foundGroup?.isBannerLinkActive,
-            isBannerVisble: isBannerVisble != undefined ? isBannerVisble : foundGroup?.isBannerVisble,
-            isSpecial: isSpecial != undefined ? isSpecial : foundGroup?.isSpecial,
-            banner: banner ? banner : foundGroup?.banner,
-            bannerLink: bannerLink ? bannerLink : "",
-            categories: categories ? categories : foundGroup?.categories,
-            parentCategories: parentCategories ? parentCategories : foundGroup?.parentCategories,
-            backgroundColor: backgroundColor || foundGroup?.backgroundColor || "",
-            isBackgroundColorVisible: isBackgroundColorVisible != undefined ? isBackgroundColorVisible : foundGroup?.isBackgroundColorVisible,
+            name: groupName,
+            slug: groupSlug,
+            groupType: groupType || foundGroup.groupType,
+            heading: groupHeading,
+            webBanner: webBanner !== undefined ? webBanner : foundGroup.webBanner,
+            isWebBannerVisible: isWebBannerVisible !== undefined ? !!isWebBannerVisible : foundGroup.isWebBannerVisible,
+            webBackgroundColor: webBackgroundColor !== undefined ? webBackgroundColor : foundGroup.webBackgroundColor,
+            isWebBgColorVisible: isWebBgColorVisible !== undefined ? !!isWebBgColorVisible : foundGroup.isWebBgColorVisible,
+            appBanner: appBanner !== undefined ? appBanner : foundGroup.appBanner,
+            isAppBannerVisible: isAppBannerVisible !== undefined ? !!isAppBannerVisible : foundGroup.isAppBannerVisible,
+            appBackgroundColor: appBackgroundColor !== undefined ? appBackgroundColor : foundGroup.appBackgroundColor,
+            isAppBgColorVisible: isAppBgColorVisible !== undefined ? !!isAppBgColorVisible : foundGroup.isAppBgColorVisible,
+            bannerLink: bannerLink !== undefined ? bannerLink : foundGroup.bannerLink,
+            placement: placement || foundGroup.placement || "scroll",
+            active: active !== undefined ? active : foundGroup.active,
+            products: products !== undefined ? products : foundGroup.products,
+            categories: categories !== undefined ? categories : foundGroup.categories,
+            parentCategories: parentCategories !== undefined ? parentCategories : foundGroup.parentCategories
         },
         { new: true }
     );
+
     if (!updatedGroup) {
         throw new ApiError(500, "Could not edit group");
     }
@@ -95,10 +115,9 @@ const editGroup = asyncHandler(async (req, res) => {
         });
     }
 
-    //return response
     return res.status(201).json(
         new ApiResponse(201, updatedGroup, "Group edited Successfully")
-    )
+    );
 });
 
 const deleteGroup = asyncHandler(async (req, res) => {
@@ -418,7 +437,10 @@ const getAllGroupsAdmin = asyncHandler(async (req, res) => {
 
     const query = {};
     if (searchQuery) {
-        query.name = { $regex: searchQuery, $options: "i" };
+        query.$or = [
+            { name: { $regex: searchQuery, $options: "i" } },
+            { heading: { $regex: searchQuery, $options: "i" } }
+        ];
     }
 
     const totalGroups = await Group.countDocuments(query);
@@ -426,16 +448,15 @@ const getAllGroupsAdmin = asyncHandler(async (req, res) => {
     const skip = (page - 1) * limit;
 
     const groups = await Group.find(query)
-        .populate("categories")
+        .populate({
+            path: "categories",
+            model: "SubCategory",
+            select: "name slug"
+        })
         .populate({
             path: 'parentCategories',
             model: 'Category',
-            select: 'name _id slug image'
-        })
-        .populate({
-            path: 'products',
-            model: 'Product',
-            select: '_id fullName images regularPrice basePrice sellingPrice totalStock'
+            select: 'name slug'
         })
         .sort({ createdAt: -1 })
         .skip(skip)

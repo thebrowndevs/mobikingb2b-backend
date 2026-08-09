@@ -112,6 +112,7 @@ const getAllCategorySlugs = asyncHandler(async (req, res) => {
 
 const getAllCategories = asyncHandler(async (req, res) => {
     const { searchQuery, search } = req.query;
+    let { page, limit } = req.query;
     const query = searchQuery || search;
     const filter = {};
 
@@ -125,19 +126,52 @@ const getAllCategories = asyncHandler(async (req, res) => {
         ];
     }
 
-    const allCategories = await Category.find(filter).populate({
-        path: "subCategories",
-        model: "SubCategory",
-        select: "-products"
-    }).sort({ createdAt: -1 }).exec();
+    if (page !== undefined && limit !== undefined) {
+        page = parseInt(page, 10) || 1;
+        limit = parseInt(limit, 10) || 10;
+        const skip = (page - 1) * limit;
 
-    if (!allCategories) {
-        throw new ApiError(409, "Could not find categories");
+        const totalCategories = await Category.countDocuments(filter);
+        const totalPages = Math.ceil(totalCategories / limit);
+
+        const categories = await Category.find(filter)
+            .populate({
+                path: "subCategories",
+                model: "SubCategory",
+                select: "-products"
+            })
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .exec();
+
+        return res.status(200).json(
+            new ApiResponse(200, {
+                categories,
+                pagination: {
+                    totalCategories,
+                    totalPages,
+                    currentPage: page,
+                    limit,
+                    hasMore: page < totalPages
+                }
+            }, "Categories fetched Successfully")
+        );
+    } else {
+        const allCategories = await Category.find(filter).populate({
+            path: "subCategories",
+            model: "SubCategory",
+            select: "-products"
+        }).sort({ createdAt: -1 }).exec();
+
+        if (!allCategories) {
+            throw new ApiError(409, "Could not find categories");
+        }
+
+        return res.status(200).json(
+            new ApiResponse(200, allCategories, "Categories fetched Successfully")
+        );
     }
-
-    return res.status(200).json(
-        new ApiResponse(200, allCategories, "Categories fetched Successfully")
-    )
 });
 
 const getCategoryById = asyncHandler(async (req, res) => {
@@ -441,6 +475,7 @@ const getAllSubCategorySlugs = asyncHandler(async (req, res) => {
 
 const getAllSubCategories = asyncHandler(async (req, res) => {
     const { parentCategory, categoryId, searchQuery, search } = req.query;
+    let { page, limit } = req.query;
     const filter = {};
 
     const categoryFilter = parentCategory || categoryId;
@@ -459,22 +494,53 @@ const getAllSubCategories = asyncHandler(async (req, res) => {
         ];
     }
 
-    const allSubCategories = await SubCategory.find(filter)
-        .populate({
-            path: "parentCategory",
-            model: "Category",
-            // select: "name slug"
-        })
-        .sort({ sequenceNo: 1, createdAt: -1 })
-        .exec();
+    if (page !== undefined && limit !== undefined) {
+        page = parseInt(page, 10) || 1;
+        limit = parseInt(limit, 10) || 10;
+        const skip = (page - 1) * limit;
 
-    if (!allSubCategories) {
-        throw new ApiError(409, "Could not find sub categories");
+        const totalSubCategories = await SubCategory.countDocuments(filter);
+        const totalPages = Math.ceil(totalSubCategories / limit);
+
+        const subCategories = await SubCategory.find(filter)
+            .populate({
+                path: "parentCategory",
+                model: "Category",
+            })
+            .sort({ sequenceNo: 1, createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .exec();
+
+        return res.status(200).json(
+            new ApiResponse(200, {
+                subCategories,
+                pagination: {
+                    totalSubCategories,
+                    totalPages,
+                    currentPage: page,
+                    limit,
+                    hasMore: page < totalPages
+                }
+            }, "Sub-Categories fetched Successfully")
+        );
+    } else {
+        const allSubCategories = await SubCategory.find(filter)
+            .populate({
+                path: "parentCategory",
+                model: "Category",
+            })
+            .sort({ sequenceNo: 1, createdAt: -1 })
+            .exec();
+
+        if (!allSubCategories) {
+            throw new ApiError(409, "Could not find sub categories");
+        }
+
+        return res.status(200).json(
+            new ApiResponse(200, allSubCategories, "Sub Categories fetched Successfully")
+        );
     }
-
-    return res.status(200).json(
-        new ApiResponse(200, allSubCategories, "Sub Categories fetched Successfully")
-    )
 });
 
 const getProductsBySubCategory = asyncHandler(async (req, res) => {
