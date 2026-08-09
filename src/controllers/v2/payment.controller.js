@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import mongoose from 'mongoose';
 import { Order } from '../../models/order.model.js';
 import { PaymentLink } from '../../models/payment_link.model.js';
+import { Payment } from '../../models/payment.model.js';
 import { confirmOrderPaymentLogic } from '../../services/payment.service.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { ApiResponse } from '../../utils/ApiResponse.js';
@@ -285,6 +286,17 @@ export const phonepeWebhookV2 = asyncHandler(async (req, res) => {
                             order.paymentStatus = 'Paid';
                             order.paymentDate = new Date();
                             await order.save({ session });
+
+                            if (isLinked.referenceId) {
+                                await Payment.findByIdAndUpdate(
+                                    isLinked.referenceId,
+                                    {
+                                        status: "Paid",
+                                        paidAt: new Date(),
+                                        notes: `Paid via PhonePe Link. Transaction ID: ${phonepePaymentId}`
+                                    }
+                                ).session(session);
+                            }
                         } else {
                             // Standard checkout confirmation
                             await confirmOrderPaymentLogic(

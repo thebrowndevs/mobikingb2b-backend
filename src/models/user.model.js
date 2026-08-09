@@ -169,6 +169,10 @@ const userSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Query'
     }],
+    quotations: [{
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Quotation'
+    }],
     orders: [{
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Order'

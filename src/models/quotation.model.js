@@ -17,6 +17,25 @@ const quotationSchema = new mongoose.Schema(
             type: Boolean,
             default: false
         },
+        type: {
+            type: String,
+            enum: ["Regular", "Pos", "Manual"],
+            default: "Regular"
+        },
+        method: {
+            type: String,
+            enum: ["COD", "Online", "UPI", "Cash", "Mixed"]
+        },
+        paymentMode: {
+            type: String,
+            enum: ["complete", "parcel"]
+        },
+        latitude: {
+            type: Number
+        },
+        longitude: {
+            type: Number
+        },
         reason: { type: String },
         comments: { type: String },
 
@@ -65,6 +84,15 @@ const quotationSchema = new mongoose.Schema(
         query: {
             type: mongoose.Schema.Types.ObjectId,
             ref: "Query"
+        },
+
+        // Order reference (populated when booked)
+        orderRef: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Order"
+        },
+        orderId: {
+            type: String
         },
 
         // Product Items Details

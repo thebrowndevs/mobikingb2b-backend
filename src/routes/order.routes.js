@@ -30,7 +30,13 @@ import {
     returnOrderV2,
     restoreOrderStock,
     markAsDeliveredManually,
-    recordCallAttempt
+    recordCallAttempt,
+    addOrderPayment,
+    editOrderPayment,
+    getOrderPayments,
+    generatePaymentRecordLink,
+    manualShipOrder,
+    updateManualShippingStatus
 } from "../controllers/order.controller.js";
 import {
     assignBestCourier,
@@ -55,6 +61,15 @@ router.route("/online/verify").post(verifyJWT, verifyPayment);
 // router.route("/online/restore").post(verifyJWT, restoreOrderStock);
 router.route("/user").get(verifyJWT, getAllOrdersByUser);
 router.route("/review").post(verifyJWT, reviewOrder);
+
+// Payments & manual shipping routes
+router.route("/payments/add").post(verifyJWT, addOrderPayment);
+router.route("/payments/edit/:paymentId").put(verifyJWT, editOrderPayment);
+router.route("/payments/list/:orderId").get(verifyJWT, getOrderPayments);
+router.route("/payments/generate-link").post(verifyJWT, generatePaymentRecordLink);
+router.route("/manual-ship").post(verifyJWT, manualShipOrder);
+router.route("/manual-ship/status").post(verifyJWT, updateManualShippingStatus);
+
 router.route("/:_id").put(verifyJWT, updateOrder);
 router.route("/items/add").post(verifyJWT, addItemQuantityInOrder);
 router.route("/items/remove").post(verifyJWT, removeItemQuantityInOrder);

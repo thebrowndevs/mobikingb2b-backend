@@ -4,6 +4,7 @@ import axios from 'axios';
 import crypto from 'crypto';
 import { v4 as uuidv4 } from "uuid";
 import { Order } from "../models/order.model.js";
+import { Payment } from "../models/payment.model.js";
 import { Cart } from "../models/cart.model.js";
 import { Product } from '../models/product.model.js';   // <-- import Product
 import { ApiError } from "../utils/ApiError.js";
@@ -20,6 +21,9 @@ import { flattenOrder } from '../utils/flattenOrder.js'; // keep your util
 import { Counter } from './../models/counter.model.js';
 import { Stock } from '../models/stock.model.js';
 import { STOCK_TYPES, ORDER_TYPES } from '../constants.js';
+import { initiateRazorpayPaymentLink } from '../services/razorpay.service.js';
+import { initiatePhonepePaymentLink } from '../services/phonepe.service.js';
+import { CompanyDetails } from '../models/company_details.model.js';
 
 const razorpayConfig = () => {
     const razorpay = new Razorpay({
@@ -72,8 +76,9 @@ const paymentLinkWebhook = asyncHandler(async (req, res) => {
 
         if (event.event === "payment_link.paid") {
             const paymentDate = new Date();
+            const orderId = paymentLink?.notes?.orderId || foundPaymentLink?.orderId;
             const updatedOrder = await Order.findByIdAndUpdate(
-                paymentLink?.notes?.orderId,
+                orderId,
                 {
                     abondonedOrder: false,
                     razorpayOrderId: paymentLink?.order_id,
@@ -83,6 +88,17 @@ const paymentLinkWebhook = asyncHandler(async (req, res) => {
                 },
                 { new: true }
             );
+
+            if (foundPaymentLink && foundPaymentLink.referenceId) {
+                await Payment.findByIdAndUpdate(
+                    foundPaymentLink.referenceId,
+                    {
+                        status: "Paid",
+                        paidAt: paymentDate,
+                        notes: `Paid via Razorpay Link. Transaction ID: ${payment?.id}`
+                    }
+                );
+            }
         }
 
         // Update order status based on payment_link.paid or failed
@@ -2350,7 +2366,7 @@ const updateOrder = asyncHandler(async (req, res) => {
             throw new ApiError(400, 'Order not found.');
         }
 
-        if (foundOrder?.shipmentId) {
+        if (foundOrder?.shipmentId && foundOrder?.shippingType !== 'Manual') {
             throw new ApiError(409, 'Order is created at shiprocket');
         }
 
@@ -4818,6 +4834,325 @@ const recordCallAttempt = asyncHandler(async (req, res) => {
         .json(new ApiResponse(200, updatedOrder, "Call attempt recorded successfully"));
 });
 
+const addOrderPayment = asyncHandler(async (req, res) => {
+    const { orderId, amount, method, status = "Paid", notes, paidAt } = req.body;
+
+    if (!orderId || amount === undefined || !method) {
+        throw new ApiError(400, "orderId, amount, and method are required.");
+    }
+
+    const order = await Order.findById(orderId);
+    if (!order) {
+        throw new ApiError(404, "Order not found.");
+    }
+
+    const session = await mongoose.startSession();
+    try {
+        let paymentDoc;
+        await session.withTransaction(async () => {
+            paymentDoc = await Payment.create([{
+                orderId: order.orderId,
+                orderRef: order._id,
+                amount: Number(amount),
+                method,
+                status,
+                notes: notes || "",
+                paidAt: status === "Paid" ? (paidAt ? new Date(paidAt) : new Date()) : undefined
+            }], { session });
+
+            // Fetch all paid payments for this order to recalculate
+            const allPayments = await Payment.find({ orderRef: order._id, status: "Paid" }).session(session);
+            const totalPaid = allPayments.reduce((sum, p) => sum + p.amount, 0);
+
+            order.amountPaid = totalPaid;
+            order.remainingAmount = Math.max(0, order.orderAmount - totalPaid);
+
+            if (order.remainingAmount <= 0) {
+                order.paymentStatus = "Paid";
+                order.paymentDate = new Date();
+            } else {
+                order.paymentStatus = "Pending";
+            }
+
+            await order.save({ session });
+        });
+
+        return res.status(200).json(new ApiResponse(200, { payment: paymentDoc[0], order }, "Payment added and order totals updated successfully."));
+    } catch (error) {
+        console.error("Error in addOrderPayment:", error);
+        throw error;
+    } finally {
+        session.endSession();
+    }
+});
+
+const editOrderPayment = asyncHandler(async (req, res) => {
+    const { paymentId } = req.params;
+    const { amount, method, status, notes, paidAt } = req.body;
+
+    if (!paymentId) {
+        throw new ApiError(400, "Payment ID is required.");
+    }
+
+    const payment = await Payment.findById(paymentId);
+    if (!payment) {
+        throw new ApiError(404, "Payment transaction not found.");
+    }
+
+    const order = await Order.findById(payment.orderRef);
+    if (!order) {
+        throw new ApiError(404, "Order associated with payment not found.");
+    }
+
+    const session = await mongoose.startSession();
+    try {
+        await session.withTransaction(async () => {
+            payment.amount = amount !== undefined ? Number(amount) : payment.amount;
+            payment.method = method || payment.method;
+            payment.status = status || payment.status;
+            payment.notes = notes !== undefined ? notes : payment.notes;
+
+            if (status === "Paid") {
+                payment.paidAt = paidAt ? new Date(paidAt) : (payment.paidAt || new Date());
+            } else if (status === "Pending") {
+                payment.paidAt = undefined;
+            }
+
+            await payment.save({ session });
+
+            // Recalculate order payment totals
+            const allPayments = await Payment.find({ orderRef: order._id, status: "Paid" }).session(session);
+            const totalPaid = allPayments.reduce((sum, p) => sum + p.amount, 0);
+
+            order.amountPaid = totalPaid;
+            order.remainingAmount = Math.max(0, order.orderAmount - totalPaid);
+
+            if (order.remainingAmount <= 0) {
+                order.paymentStatus = "Paid";
+                order.paymentDate = new Date();
+            } else {
+                order.paymentStatus = "Pending";
+            }
+
+            await order.save({ session });
+        });
+
+        return res.status(200).json(new ApiResponse(200, { payment, order }, "Payment updated and order totals updated successfully."));
+    } catch (error) {
+        console.error("Error in editOrderPayment:", error);
+        throw error;
+    } finally {
+        session.endSession();
+    }
+});
+
+const getOrderPayments = asyncHandler(async (req, res) => {
+    const { orderId } = req.params;
+
+    if (!orderId) {
+        throw new ApiError(400, "Order ID is required.");
+    }
+
+    const payments = await Payment.find({ orderRef: orderId }).sort({ createdAt: -1 });
+
+    return res.status(200).json(new ApiResponse(200, payments, "Order payments retrieved successfully."));
+});
+
+const generatePaymentRecordLink = asyncHandler(async (req, res) => {
+    const { paymentId, gateway } = req.body;
+
+    if (!paymentId) {
+        throw new ApiError(400, "Payment ID is required.");
+    }
+
+    if (!gateway || !["razorpay", "phonepe"].includes(gateway)) {
+        throw new ApiError(400, "Invalid or missing gateway. Must be 'razorpay' or 'phonepe'.");
+    }
+
+    // Check gateway toggles in CompanyDetails
+    const settings = await CompanyDetails.findOne();
+    if (settings && settings.paymentGatewaySettings) {
+        if (gateway === "phonepe" && !settings.paymentGatewaySettings.enablePhonepe) {
+            throw new ApiError(400, "PhonePe payment gateway is currently disabled.");
+        }
+        if (gateway === "razorpay" && !settings.paymentGatewaySettings.enableRazorpay) {
+            throw new ApiError(400, "Razorpay payment gateway is currently disabled.");
+        }
+    }
+
+    const payment = await Payment.findById(paymentId);
+    if (!payment) {
+        throw new ApiError(404, "Payment transaction not found.");
+    }
+
+    if (payment.method !== "Online") {
+        throw new ApiError(400, "Payment link can only be generated for Online payment methods.");
+    }
+
+    if (payment.paymentLinkUrl) {
+        return res.status(200).json(new ApiResponse(200, { payment }, "Payment link already exists."));
+    }
+
+    const order = await Order.findById(payment.orderRef);
+    if (!order) {
+        throw new ApiError(404, "Order associated with payment not found.");
+    }
+
+    try {
+        let linkResponse = {};
+        const reqOrigin = req.headers.origin || `${req.protocol}://${req.get('host')}`;
+        const backendOrigin = `${req.protocol}://${req.get('host')}`;
+
+        if (gateway === "phonepe") {
+            const tempLink = await initiatePhonepePaymentLink(
+                order.orderId, payment.amount, order.phoneNo, reqOrigin, backendOrigin
+            );
+            linkResponse = { id: tempLink.id, short_url: tempLink.short_url };
+        } else {
+            const tempLink = await initiateRazorpayPaymentLink(
+                order.orderId, payment.amount, order.name, order.phoneNo
+            );
+            linkResponse = { id: tempLink.id, short_url: tempLink.short_url };
+        }
+
+        payment.paymentLinkId = linkResponse.id;
+        payment.paymentLinkUrl = linkResponse.short_url;
+        await payment.save();
+
+        const newPaymentLink = new PaymentLink({
+            gateway,
+            orderId: order._id,
+            amount: payment.amount,
+            name: order.name,
+            email: order.email,
+            phoneNo: order.phoneNo,
+            paymentLink_id: linkResponse.id,
+            link: linkResponse.short_url,
+            referenceId: payment._id
+        });
+        await newPaymentLink.save();
+
+        return res.status(200).json(
+            new ApiResponse(200, { payment, payment_link: linkResponse.short_url }, "Payment link generated successfully.")
+        );
+    } catch (error) {
+        console.error("Error in generatePaymentRecordLink:", error);
+        const errMsg = error?.error?.description || error.message || "Failed to generate payment link.";
+        throw new ApiError(500, errMsg);
+    }
+});
+
+const manualShipOrder = asyncHandler(async (req, res) => {
+    const {
+        orderId,
+        awbCode,
+        courierName,
+        shippingPartner,
+        address,
+        address2,
+        city,
+        state,
+        pincode,
+        country,
+        schedulePickup,
+        pickupScheduledAt,
+        pickupTokenNumber,
+        expectedDeliveryDate
+    } = req.body;
+
+    if (!orderId) {
+        throw new ApiError(400, "Order ID is required.");
+    }
+
+    const order = await Order.findById(orderId);
+    if (!order) {
+        throw new ApiError(404, "Order not found.");
+    }
+
+    order.shippingType = "Manual";
+    order.awbCode = awbCode || "";
+    order.courierName = courierName || "";
+    order.shippingPartner = shippingPartner || "";
+    order.courierAssignedAt = new Date();
+
+    if (address) order.address = address;
+    if (address2 !== undefined) order.address2 = address2;
+    if (city) order.city = city;
+    if (state) order.state = state;
+    if (pincode) order.pincode = pincode;
+    if (country) order.country = country;
+
+    if (schedulePickup) {
+        order.pickupScheduled = true;
+        order.pickupDate = pickupScheduledAt ? new Date(pickupScheduledAt).toISOString() : new Date().toISOString();
+        order.expectedDeliveryDate = expectedDeliveryDate ? new Date(expectedDeliveryDate).toISOString() : "";
+        order.status = "Shipped";
+        order.shippedAt = new Date();
+        order.scans.push({
+            date: new Date(),
+            location: order.city || "",
+            status: "Courier assigned",
+            activity: "Courier assigned - Yet to pickup"
+        });
+    } else {
+        order.scans.push({
+            date: new Date(),
+            location: order.city || "",
+            status: "Shipping details added",
+            activity: "Shipping details added"
+        });
+    }
+
+    order.markModified("scans");
+    await order.save();
+
+    return res.status(200).json(new ApiResponse(200, order, "Manual shipping details saved successfully."));
+});
+
+const updateManualShippingStatus = asyncHandler(async (req, res) => {
+    const { orderId, shippingStatus, date, description } = req.body;
+
+    if (!orderId || !shippingStatus) {
+        throw new ApiError(400, "Order ID and shippingStatus are required.");
+    }
+
+    const order = await Order.findById(orderId);
+    if (!order) {
+        throw new ApiError(404, "Order not found.");
+    }
+
+    const statusDate = date ? new Date(date) : new Date();
+    order.shippingStatus = shippingStatus;
+
+    if (shippingStatus === "delivered") {
+        order.status = "Delivered";
+        order.deliveredAt = statusDate.toISOString();
+    } else if (shippingStatus === "rto initiated") {
+        order.status = "RTO Initiated";
+        order.rtoInitiatedAt = statusDate.toISOString();
+    } else if (shippingStatus === "rto delivered") {
+        order.status = "RTO Delivered";
+        order.rtoDeliveredAt = statusDate.toISOString();
+    } else if (shippingStatus === "rto accepted") {
+        order.status = "RTO Acknowledged";
+    } else if (shippingStatus === "picked up") {
+        order.status = "Shipped";
+        order.shippedAt = statusDate;
+    }
+
+    order.scans.push({
+        date: statusDate,
+        location: order.city || "",
+        status: shippingStatus,
+        activity: description || ""
+    });
+
+    order.markModified("scans");
+    await order.save();
+
+    return res.status(200).json(new ApiResponse(200, order, "Manual shipping status updated successfully."));
+});
+
 export {
     paymentLinkWebhook,
     createPosOrder,
@@ -4851,5 +5186,59 @@ export {
     returnOrder,
     returnOrderV2,
     markAsDeliveredManually,
-    recordCallAttempt
+    recordCallAttempt,
+
+    // New manual shipping and payments controllers
+    addOrderPayment,
+    editOrderPayment,
+    getOrderPayments,
+    generatePaymentRecordLink,
+    manualShipOrder,
+    updateManualShippingStatus
 }
+
+// =========================================================================
+// LEGACY CONTROLLERS (DO NOT REMOVE)
+// =========================================================================
+
+const legacy_updateOrder = asyncHandler(async (req, res) => {
+    try {
+        const orderId = req?.params?._id;
+        const updates = req?.body;
+
+        if (
+            !orderId
+        ) {
+            throw new ApiError(400, 'Order Id not found.');
+        }
+
+        const foundOrder = await Order.findById(orderId);
+        if (!foundOrder) {
+            throw new ApiError(400, 'Order not found.');
+        }
+
+        if (foundOrder?.shipmentId) {
+            throw new ApiError(409, 'Order is created at shiprocket');
+        }
+
+        const updateData = { ...updates };
+        if (updates?.status === 'Accepted' && !foundOrder?.acceptedAt) {
+            updateData.acceptedAt = new Date();
+            updateData.acceptedReason = updates?.reason || "";
+        }
+
+        const updatedOrder = await Order.findByIdAndUpdate(
+            orderId,
+            updateData,
+            { new: true }
+        );
+
+        return res.status(201).json(
+            new ApiResponse(201, { updatedOrder }, "Order updated Successfully")
+        );
+
+    } catch (err) {
+        console.error('Error updating order:', err.message);
+        return res.status(500).json({ message: err.message || 'Internal server error' });
+    }
+});

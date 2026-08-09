@@ -3,9 +3,12 @@ import mongoose from "mongoose";
 const paymentSchema = new mongoose.Schema(
     {
         orderId: {
-            type: mongoose.Schema.Types.ObjectId,
-            ref: "Order",
+            type: String,
             required: true
+        },
+        orderRef: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Order"
         },
         amount: {
             type: Number,
@@ -13,7 +16,6 @@ const paymentSchema = new mongoose.Schema(
         },
         method: {
             type: String,
-            enum: ["COD", "Online"],
             required: true
         },
         status: {

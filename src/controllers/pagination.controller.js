@@ -120,6 +120,9 @@ export const getPaginatedOrders = asyncHandler(async (req, res) => {
         filter.type = "Regular";
         filter.isAppOrder = true;
         break;
+      case "manual":
+        filter.type = "Manual";
+        break;
       case "abandoned":
         filter.abondonedOrder = true;
         break;
@@ -158,7 +161,7 @@ export const getPaginatedOrders = asyncHandler(async (req, res) => {
   const [
     totalCount,
     newCount, acceptedCount, rejectedCount, holdCount, shippedCount, cancelledCount, deliveredCount,
-    allOrderCount, posOrderCount, websiteOrderCount, appOrderCount, abandonedOrderCount
+    allOrderCount, posOrderCount, websiteOrderCount, appOrderCount, manualOrderCount, abandonedOrderCount
   ] = await Promise.all([
     Order.countDocuments(filter),
     Order.countDocuments({ ...filter, status: "New" }),
@@ -172,6 +175,7 @@ export const getPaginatedOrders = asyncHandler(async (req, res) => {
     Order.countDocuments({ ...countFilter, type: "Pos" }),
     Order.countDocuments({ ...countFilter, type: "Regular", isAppOrder: false }),
     Order.countDocuments({ ...countFilter, type: "Regular", isAppOrder: true }),
+    Order.countDocuments({ ...countFilter, type: "Manual" }),
     Order.countDocuments({ ...countFilter, abondonedOrder: true }),
   ]);
 
@@ -225,7 +229,7 @@ export const getPaginatedOrders = asyncHandler(async (req, res) => {
       newCount, acceptedCount, rejectedCount, holdCount,
       shippedCount, cancelledCount, deliveredCount,
       allOrderCount, posOrderCount, websiteOrderCount,
-      appOrderCount, abandonedOrderCount,
+      appOrderCount, manualOrderCount, abandonedOrderCount,
       pagination: {
         page,
         limit,
@@ -1001,10 +1005,18 @@ export const getPaginatedQuotations = asyncHandler(async (req, res) => {
   if (type && type !== "all") {
     switch (type) {
       case "web":
+        filter.type = "Regular";
         filter.isAppOrder = false;
         break;
       case "app":
+        filter.type = "Regular";
         filter.isAppOrder = true;
+        break;
+      case "pos":
+        filter.type = "Pos";
+        break;
+      case "manual":
+        filter.type = "Manual";
         break;
     }
   }
@@ -1041,7 +1053,7 @@ export const getPaginatedQuotations = asyncHandler(async (req, res) => {
   const [
     totalCount,
     newCount, acceptedCount, rejectedCount, holdCount, bookedCount, cancelledCount,
-    allCount, webCount, appCount
+    allCount, webCount, appCount, posCount, manualCount
   ] = await Promise.all([
     Quotation.countDocuments({ ...filter, ...searchFilter }),
     Quotation.countDocuments({ ...filter, ...searchFilter, status: "New" }),
@@ -1051,8 +1063,10 @@ export const getPaginatedQuotations = asyncHandler(async (req, res) => {
     Quotation.countDocuments({ ...filter, ...searchFilter, status: "Booked" }),
     Quotation.countDocuments({ ...filter, ...searchFilter, status: "Cancelled" }),
     Quotation.countDocuments(countFilter),
-    Quotation.countDocuments({ ...countFilter, isAppOrder: false }),
-    Quotation.countDocuments({ ...countFilter, isAppOrder: true }),
+    Quotation.countDocuments({ ...countFilter, type: "Regular", isAppOrder: false }),
+    Quotation.countDocuments({ ...countFilter, type: "Regular", isAppOrder: true }),
+    Quotation.countDocuments({ ...countFilter, type: "Pos" }),
+    Quotation.countDocuments({ ...countFilter, type: "Manual" }),
   ]);
 
   const totalPages = Math.ceil(totalCount / limit);
@@ -1087,6 +1101,8 @@ export const getPaginatedQuotations = asyncHandler(async (req, res) => {
         all: allCount,
         web: webCount,
         app: appCount,
+        pos: posCount,
+        manual: manualCount,
         statuses: {
           New: newCount,
           Accepted: acceptedCount,

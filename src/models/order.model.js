@@ -209,13 +209,26 @@ const orderSchema = new mongoose.Schema(
         },
         type: {
             type: String,
-            enum: ["Regular", "Pos", "Partial Return"],
+            enum: ["Regular", "Pos", "Partial Return", "Manual"],
             default: "Regular"
         },
         method: {
             type: String,
-            enum: ["COD", "Online", "UPI", "Cash"],
-            default: "COD"
+            enum: ["COD", "Online", "UPI", "Cash", "Mixed"],
+            // default: "COD"
+        },
+        paymentMode: {
+            type: String,
+            enum: ["complete", "parcel"]
+        },
+        shippingPartner: {
+            type: String
+        },
+        latitude: {
+            type: Number
+        },
+        longitude: {
+            type: Number
         },
         isAppOrder: {
             type: Boolean,

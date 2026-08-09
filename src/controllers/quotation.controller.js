@@ -56,7 +56,9 @@ export const createQuotation = asyncHandler(async (req, res) => {
             city: foundAddress.city || "",
             state: foundAddress.state || "",
             country: foundAddress.country || "India",
-            pincode: foundAddress.pinCode || ""
+            pincode: foundAddress.pinCode || "",
+            latitude: foundAddress.latitude || null,
+            longitude: foundAddress.longitude || null
         };
 
         // Initialize new Quotation document
@@ -75,6 +77,7 @@ export const createQuotation = asyncHandler(async (req, res) => {
             orderAmount,
             status: "New",
             isAppOrder: req.body.isAppOrder || false,
+            type: req.body.type || "Regular",
             items: cart.items
         });
 
@@ -193,6 +196,13 @@ export const createQuotation = asyncHandler(async (req, res) => {
             cart.items = [];
             cart.totalCartValue = 0;
             await cart.save({ session });
+
+            // Add quotation to user's quotations list
+            await User.findByIdAndUpdate(
+                req.user._id,
+                { $push: { quotations: newQuote._id } },
+                { session }
+            );
         });
 
         // Fetch freshly populated user object
@@ -432,7 +442,7 @@ export const bookQuotation = asyncHandler(async (req, res) => {
 
         // Create standard Order
         const newOrder = new Order({
-            status: "New",
+            status: "Accepted",
             paymentStatus: "Pending",
             orderState: "Confirmed",
             abondonedOrder: false,
@@ -468,7 +478,21 @@ export const bookQuotation = asyncHandler(async (req, res) => {
 
             userId: quotation.userId,
             query: quotation.query,
-            items: quotation.items
+            items: quotation.items,
+
+            // Geolocation
+            latitude: quotation.latitude || null,
+            longitude: quotation.longitude || null,
+
+            // B2B booking specific details
+            paymentMode: req.body.paymentMode,
+            method: req.body.method || quotation.method || "COD",
+            type: quotation.type || "Regular",
+            isAppOrder: quotation.isAppOrder === true,
+            length: Number(req.body.length) || quotation.length || 19,
+            breadth: Number(req.body.breadth) || quotation.breadth || 16,
+            height: Number(req.body.height) || quotation.height || 6,
+            weight: Number(req.body.weight) || quotation.weight || 0.5
         });
 
         await session.withTransaction(async () => {
@@ -497,9 +521,18 @@ export const bookQuotation = asyncHandler(async (req, res) => {
                 await newOrder.save({ session });
             }
 
-            // Mark quotation status as Booked
+            // Mark quotation status as Booked and link to order
             quotation.status = "Booked";
+            quotation.orderRef = newOrder._id;
+            quotation.orderId = newOrder.orderId;
             await quotation.save({ session });
+
+            // Add order to user's orders list
+            await User.findByIdAndUpdate(
+                quotation.userId,
+                { $push: { orders: newOrder._id } },
+                { session }
+            );
 
             const stockEntries = [];
 
