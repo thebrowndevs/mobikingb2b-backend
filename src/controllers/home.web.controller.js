@@ -38,7 +38,7 @@ const getWebsiteCategories = asyncHandler(async (req, res) => {
         .populate({
             path: "movingCategories",
             model: "SubCategory",
-            select: "name slug icon"
+            select: "name slug photos"
         })
         .select("movingCategories")
         .lean();
@@ -67,26 +67,55 @@ const getWebsiteGroups = asyncHandler(async (req, res) => {
     }
 
     const groupsRaw = await Group.find({ _id: { $in: paginatedIds }, active: true }).lean();
-    
+
     const idStrings = paginatedIds.map(id => id.toString());
     const groups = groupsRaw.sort((a, b) => idStrings.indexOf(a._id.toString()) - idStrings.indexOf(b._id.toString()));
 
     const groupsWithProducts = await Promise.all(
         groups.map(async (group) => {
-            const productIds = group.products || [];
-            const [products, totalProducts] = await Promise.all([
-                Product.find({ _id: { $in: productIds }, active: true })
-                    .select("fullName slug images regularPrice basePrice sellingPrice totalStock")
-                    .limit(10)
-                    .lean(),
-                Product.countDocuments({ _id: { $in: productIds }, active: true })
-            ]);
-
-            return {
-                ...group,
-                products,
-                totalProducts
-            };
+            if (group.groupType === 'subcategories') {
+                const subcategoryIds = group.categories || [];
+                const subcategories = await SubCategory.find({ _id: { $in: subcategoryIds }, active: true })
+                    .select("name slug photos")
+                    .lean();
+                // sort to match input sequence
+                const idStrings = subcategoryIds.map(id => id.toString());
+                const sortedSubcategories = subcategories.sort((a, b) => idStrings.indexOf(a._id.toString()) - idStrings.indexOf(b._id.toString()));
+                return {
+                    ...group,
+                    subcategories: sortedSubcategories,
+                    totalItems: sortedSubcategories.length
+                };
+            } else if (group.groupType === 'categories') {
+                const categoryIds = group.parentCategories || [];
+                const categories = await Category.find({ _id: { $in: categoryIds }, active: true })
+                    .select("name slug image")
+                    .lean();
+                // sort to match input sequence
+                const idStrings = categoryIds.map(id => id.toString());
+                const sortedCategories = categories.sort((a, b) => idStrings.indexOf(a._id.toString()) - idStrings.indexOf(b._id.toString()));
+                return {
+                    ...group,
+                    categories: sortedCategories,
+                    totalItems: sortedCategories.length
+                };
+            } else {
+                const productIds = group.products || [];
+                const [products, totalProducts] = await Promise.all([
+                    Product.find({ _id: { $in: productIds }, active: true })
+                        .select("-orders -stock -groups -category")
+                        .limit(10)
+                        .lean(),
+                    Product.countDocuments({ _id: { $in: productIds }, active: true })
+                ]);
+                const idStrings = productIds.map(id => id.toString());
+                const sortedProducts = products.sort((a, b) => idStrings.indexOf(a._id.toString()) - idStrings.indexOf(b._id.toString()));
+                return {
+                    ...group,
+                    products: sortedProducts,
+                    totalProducts
+                };
+            }
         })
     );
 
@@ -122,7 +151,7 @@ const getWebGroupProductsPaginated = asyncHandler(async (req, res) => {
     }
 
     const products = await Product.find({ _id: { $in: paginatedIds }, active: true })
-        .select("fullName slug images regularPrice basePrice sellingPrice totalStock")
+        .select("-orders -stock -groups -category")
         .lean();
 
     const idStrings = paginatedIds.map(id => id.toString());
@@ -150,6 +179,8 @@ const getWebGroupProductsPaginated = asyncHandler(async (req, res) => {
 });
 
 import { sendRouteReloadNotification } from "../services/firebase.service.js";
+import { Category } from "../models/category.model.js";
+import { SubCategory } from "../models/sub_category.model.js";
 
 // Legacy support for website layout API
 const getHomeLayoutWebsite = asyncHandler(async (req, res) => {
@@ -261,7 +292,7 @@ const getWebsiteHomeLayoutAdmin = asyncHandler(async (req, res) => {
 
 const updateWebsiteHomeLayoutAdmin = asyncHandler(async (req, res) => {
     const { banners, movingCategories, groups } = req.body;
-    
+
     let latestLayout = await WebsiteHome.findOne({ active: true });
     if (!latestLayout) {
         latestLayout = await WebsiteHome.create({ active: true });
@@ -276,15 +307,15 @@ const updateWebsiteHomeLayoutAdmin = asyncHandler(async (req, res) => {
         },
         { new: true }
     )
-    .populate({
-        path: 'movingCategories',
-        model: 'SubCategory',
-        select: '_id name slug photos image'
-    })
-    .populate({
-        path: 'groups',
-        model: 'Group'
-    });
+        .populate({
+            path: 'movingCategories',
+            model: 'SubCategory',
+            select: '_id name slug photos image'
+        })
+        .populate({
+            path: 'groups',
+            model: 'Group'
+        });
 
     sendRouteReloadNotification("/home/website");
 

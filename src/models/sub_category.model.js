@@ -17,47 +17,11 @@ const subCatgeorySchema = new mongoose.Schema({
         type: [String],
         default: []
     },
-    sequenceNo: {
-        type: Number,
-        default: 0
-        // required: [true, "Sequence Number already exist"],
-        // unique: [true, "Sequence Number must be Unique"]
-    },
-    icon: {
-        type: String
-    },
-    upperBanner: {
-        type: String,
-        // keep it required - commented temporarily
-        // required: [true, "Upper Banner already exist"]
-    },
-    lowerBanner: {
-        type: String,
-        // keep it required - commented temporarily
-        // required: [true, "Lower Banner already exist"]
-    },
     active: {
         type: Boolean,
         default: true
     },
-    theme: {
-        type: String,
-        enum: ["light", "dark"],
-        default: "light"
-    },
-    featured: {
-        type: Boolean,
-        default: false
-    },
     deliveryCharge: {
-        type: Number,
-        default: 0
-    },
-    minOrderAmount: {
-        type: Number,
-        default: 0
-    },
-    minFreeDeliveryOrderAmount: {
         type: Number,
         default: 0
     },

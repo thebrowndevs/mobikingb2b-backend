@@ -507,7 +507,7 @@ const getAllSubCategories = asyncHandler(async (req, res) => {
                 path: "parentCategory",
                 model: "Category",
             })
-            .sort({ sequenceNo: 1, createdAt: -1 })
+            .sort({ createdAt: -1 })
             .skip(skip)
             .limit(limit)
             .exec();
@@ -530,7 +530,7 @@ const getAllSubCategories = asyncHandler(async (req, res) => {
                 path: "parentCategory",
                 model: "Category",
             })
-            .sort({ sequenceNo: 1, createdAt: -1 })
+            .sort({ createdAt: -1 })
             .exec();
 
         if (!allSubCategories) {
