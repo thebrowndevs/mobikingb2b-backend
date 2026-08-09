@@ -6,6 +6,7 @@ import { User } from "../models/user.model.js";
 import { Query } from "../models/query.model.js";
 import { Coupon } from "../models/coupon.model.js";
 import { Brand } from "../models/brand.model.js";
+import { Quotation } from "../models/quotation.model.js";
 
 export const getSalesDataController = asyncHandler(async (req, res) => {
   const startDate = req?.query?.startDate;
@@ -973,5 +974,128 @@ export const getPaginatedCoupons = asyncHandler(async (req, res) => {
         hasPrevPage: parsedPage > 1,
       },
     }, "Coupons fetched successfully")
+  );
+});
+
+/**
+ * PAGINATED QUOTATIONS (ORDER REQUESTS) CONTROLLER
+ */
+export const getPaginatedQuotations = asyncHandler(async (req, res) => {
+  const status = req?.query?.status;
+  const type = req?.query?.type; // 'all', 'web', 'app', etc.
+  const startDate = req?.query?.startDate;
+  const endDate = req?.query?.endDate;
+  const searchQuery = req?.query?.searchQuery?.trim();
+  const queryParameter = req?.query?.queryParameter; // 'customer' or 'request'
+
+  const page = Math.max(1, parseInt(req?.query?.page) || 1);
+  const limit = Math.min(100, Math.max(1, parseInt(req?.query?.limit) || 10));
+  const skip = (page - 1) * limit;
+
+  const filter = {};
+  const searchFilter = {};
+  const countFilter = {};
+
+  if (status && status !== "all") filter.status = status;
+
+  if (type && type !== "all") {
+    switch (type) {
+      case "web":
+        filter.isAppOrder = false;
+        break;
+      case "app":
+        filter.isAppOrder = true;
+        break;
+    }
+  }
+
+  if (startDate && endDate) {
+    const start = new Date(`${startDate}T00:00:00+05:30`);
+    const end = new Date(`${endDate}T23:59:59.999+05:30`);
+    filter.createdAt = { $gte: start, $lte: end };
+    countFilter.createdAt = { $gte: start, $lte: end };
+  }
+
+  if (searchQuery && queryParameter === "customer") {
+    const regex = new RegExp(searchQuery, "i");
+    searchFilter.$or = [
+      { name: regex },
+      { email: regex },
+      { phoneNo: regex }
+    ];
+    delete filter['createdAt'];
+  } else if (searchQuery && queryParameter === "request") {
+    searchFilter.quotationId = new RegExp(`^${searchQuery}`, "i");
+    delete filter['createdAt'];
+  } else if (searchQuery) {
+    const regex = new RegExp(searchQuery, "i");
+    searchFilter.$or = [
+      { quotationId: new RegExp(`^${searchQuery}`, "i") },
+      { name: regex },
+      { email: regex },
+      { phoneNo: regex }
+    ];
+    delete filter['createdAt'];
+  }
+
+  const [
+    totalCount,
+    newCount, acceptedCount, rejectedCount, holdCount, bookedCount, cancelledCount,
+    allCount, webCount, appCount
+  ] = await Promise.all([
+    Quotation.countDocuments({ ...filter, ...searchFilter }),
+    Quotation.countDocuments({ ...filter, ...searchFilter, status: "New" }),
+    Quotation.countDocuments({ ...filter, ...searchFilter, status: "Accepted" }),
+    Quotation.countDocuments({ ...filter, ...searchFilter, status: "Rejected" }),
+    Quotation.countDocuments({ ...filter, ...searchFilter, status: "Hold" }),
+    Quotation.countDocuments({ ...filter, ...searchFilter, status: "Booked" }),
+    Quotation.countDocuments({ ...filter, ...searchFilter, status: "Cancelled" }),
+    Quotation.countDocuments(countFilter),
+    Quotation.countDocuments({ ...countFilter, isAppOrder: false }),
+    Quotation.countDocuments({ ...countFilter, isAppOrder: true }),
+  ]);
+
+  const totalPages = Math.ceil(totalCount / limit);
+
+  const quotations = await Quotation.find({ ...filter, ...searchFilter })
+    .sort({ createdAt: -1 })
+    .skip(skip)
+    .limit(limit)
+    .populate({
+      path: "userId",
+      model: "User",
+      select: "name email phoneNo"
+    })
+    .populate({
+      path: "items.productId",
+      model: "Product",
+      select: "name fullName basePrice sellingPrice images"
+    });
+
+  return res.status(200).json(
+    new ApiResponse(200, {
+      quotations,
+      totalCount,
+      pagination: {
+        page,
+        limit,
+        totalPages,
+        hasNextPage: page < totalPages,
+        hasPrevPage: page > 1,
+      },
+      counts: {
+        all: allCount,
+        web: webCount,
+        app: appCount,
+        statuses: {
+          New: newCount,
+          Accepted: acceptedCount,
+          Rejected: rejectedCount,
+          Hold: holdCount,
+          Booked: bookedCount,
+          Cancelled: cancelledCount
+        }
+      }
+    }, "Quotations paginated fetched successfully")
   );
 });

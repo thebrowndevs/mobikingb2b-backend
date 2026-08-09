@@ -70,6 +70,15 @@ const stockSchema = new mongoose.Schema({
         type: Number,
         // required: true,
     },
+    previousPhysicalStock: {
+        type: Number,
+    },
+    updatedPhysicalStock: {
+        type: Number,
+    },
+    totalProductStock: {
+        type: Number,
+    },
     orderRef: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Order',

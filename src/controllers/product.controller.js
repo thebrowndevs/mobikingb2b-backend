@@ -466,7 +466,9 @@ const updateProductStock = asyncHandler(async (req, res) => {
                     $inc: {
                         "purchaseSets.$.quantity": parsedQuantity,
                         "purchaseSets.$.remainingStock": parsedQuantity,
-                        totalStock: parsedQuantity
+                        "purchaseSets.$.availableStock": parsedQuantity,
+                        totalStock: parsedQuantity,
+                        availableStock: parsedQuantity
                     }
                 },
                 { new: true, session }
@@ -481,10 +483,14 @@ const updateProductStock = asyncHandler(async (req, res) => {
                             purchaseSets: {
                                 price: purchasePrice,
                                 quantity: parsedQuantity,
-                                remainingStock: parsedQuantity
+                                remainingStock: parsedQuantity,
+                                availableStock: parsedQuantity
                             }
                         },
-                        $inc: { totalStock: parsedQuantity }
+                        $inc: {
+                            totalStock: parsedQuantity,
+                            availableStock: parsedQuantity
+                        }
                     },
                     { new: true, session }
                 );
@@ -501,7 +507,8 @@ const updateProductStock = asyncHandler(async (req, res) => {
                 {
                     $inc: {
                         totalStock: parsedQuantity,
-                        availableStock: parsedQuantity
+                        availableStock: parsedQuantity,
+                        totalProductStock: parsedQuantity
                     },
                     $set: { inventory: updatedInventory._id }
                 },
@@ -514,6 +521,8 @@ const updateProductStock = asyncHandler(async (req, res) => {
 
             // STEP 4: Build Variant-Level Immutable Stock Log
             const variantTotalStockAfter = afterVariantUpdate.totalStock;
+            const variantAvailableStockAfter = afterVariantUpdate.availableStock;
+            const totalProductStockAfter = afterProductUpdate.totalProductStock || afterProductUpdate.totalStock;
             const [stockEntry] = await Stock.create([{
                 type: STOCK_TYPES.STOCK_IN, // Maps to your STOCK_TYPES matrix reference schemas
                 category: "physical",
@@ -522,8 +531,11 @@ const updateProductStock = asyncHandler(async (req, res) => {
                 variantName: variant.name,
                 purchasePrice,
                 quantity: parsedQuantity,
-                previousStock: variantTotalStockAfter - parsedQuantity, // Accurate variant snapshot history
-                updatedStock: variantTotalStockAfter,
+                previousStock: variantAvailableStockAfter - parsedQuantity, // Available stock before
+                updatedStock: variantAvailableStockAfter,                   // Available stock after
+                previousPhysicalStock: variantTotalStockAfter - parsedQuantity, // Physical stock before
+                updatedPhysicalStock: variantTotalStockAfter,                   // Physical stock after
+                totalProductStock: totalProductStockAfter,                      // Product physical total
                 productId,
                 isScratchy: false
             }], { session });
@@ -660,7 +672,9 @@ const bulkUpdateProductStock = asyncHandler(async (req, res) => {
                         $inc: {
                             "purchaseSets.$.quantity": parsedQuantity,
                             "purchaseSets.$.remainingStock": parsedQuantity,
-                            totalStock: parsedQuantity
+                            "purchaseSets.$.availableStock": parsedQuantity,
+                            totalStock: parsedQuantity,
+                            availableStock: parsedQuantity
                         }
                     },
                     { new: true, session }
@@ -675,10 +689,14 @@ const bulkUpdateProductStock = asyncHandler(async (req, res) => {
                                 purchaseSets: {
                                     price: purchasePrice,
                                     quantity: parsedQuantity,
-                                    remainingStock: parsedQuantity
+                                    remainingStock: parsedQuantity,
+                                    availableStock: parsedQuantity
                                 }
                             },
-                            $inc: { totalStock: parsedQuantity }
+                            $inc: {
+                                totalStock: parsedQuantity,
+                                availableStock: parsedQuantity
+                            }
                         },
                         { new: true, session }
                     );
@@ -690,6 +708,7 @@ const bulkUpdateProductStock = asyncHandler(async (req, res) => {
 
                 // Step 2: Build individual variant tracking historical log footprints
                 const variantTotalStockAfter = afterVariantUpdate.totalStock;
+                const variantAvailableStockAfter = afterVariantUpdate.availableStock;
                 const [stockEntry] = await Stock.create([{
                     type: STOCK_TYPES.STOCK_IN, // Maps to your STOCK_TYPES matrix reference schemas
                     category: "physical",
@@ -698,8 +717,10 @@ const bulkUpdateProductStock = asyncHandler(async (req, res) => {
                     variantName: variant.name,
                     purchasePrice,
                     quantity: parsedQuantity,
-                    previousStock: variantTotalStockAfter - parsedQuantity, // Safe individual variant history snapshot tracking
-                    updatedStock: variantTotalStockAfter,
+                    previousStock: variantAvailableStockAfter - parsedQuantity, // Available stock before
+                    updatedStock: variantAvailableStockAfter,                   // Available stock after
+                    previousPhysicalStock: variantTotalStockAfter - parsedQuantity, // Physical stock before
+                    updatedPhysicalStock: variantTotalStockAfter,                   // Physical stock after
                     productId: resolvedProductId,
                     isScratchy: false
                 }], { session });
@@ -713,13 +734,22 @@ const bulkUpdateProductStock = asyncHandler(async (req, res) => {
                 {
                     $inc: {
                         totalStock: totalBulkQuantity,
-                        availableStock: totalBulkQuantity
+                        availableStock: totalBulkQuantity,
+                        totalProductStock: totalBulkQuantity
                     },
                     // Append all newly generated operational logs directly into the history array row inside a single operation
                     $push: { stock: { $each: generatedStockLogIds } },
                     $set: { inventory: updatedInventory._id }
                 },
                 { new: true, session }
+            );
+
+            // Now update the totalProductStock snapshot inside each generated stock log entry!
+            const totalProductStockAfter = afterProductUpdate.totalProductStock || afterProductUpdate.totalStock;
+            await Stock.updateMany(
+                { _id: { $in: generatedStockLogIds } },
+                { $set: { totalProductStock: totalProductStockAfter } },
+                { session }
             );
 
             if (!afterProductUpdate) {

@@ -6,8 +6,16 @@ const quotationSchema = new mongoose.Schema(
     {
         status: {
             type: String,
-            enum: ["New", "Cancelled", "Hold", "Booked"],
+            enum: ["Accepted", "Rejected", "New", "Cancelled", "Hold", "Booked"],
             default: "New"
+        },
+        reservedStockRestored: {
+            type: Boolean,
+            default: false
+        },
+        isAppOrder: {
+            type: Boolean,
+            default: false
         },
         reason: { type: String },
         comments: { type: String },

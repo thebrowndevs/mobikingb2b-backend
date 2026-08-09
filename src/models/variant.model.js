@@ -22,6 +22,11 @@ const purchaseSetSchema = new mongoose.Schema({
         type: Number,
         required: true,
         default: 0
+    },
+    availableStock: {
+        type: Number,
+        required: true,
+        default: 0
     }
 }, { timestamps: true });
 
@@ -39,6 +44,10 @@ const variantSchema = new mongoose.Schema({
         type: String
     }],
     totalStock: {
+        type: Number,
+        default: 0
+    },
+    availableStock: {
         type: Number,
         default: 0
     },

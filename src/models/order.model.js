@@ -107,9 +107,9 @@ const orderSchema = new mongoose.Schema(
         },
 
         /****************  SHIPROCKET FIELDS  *****************/
-        shipmentId: String,  // Shiprocket shipment_id
-        shiprocketOrderId: String,  // Shiprocket order_id
-        shiprocketChannelId: String,  // Channel order ref
+        // shipmentId: String,  // Shiprocket shipment_id
+        // shiprocketOrderId: String,  // Shiprocket order_id
+        // shiprocketChannelId: String,  // Channel order ref
         awbCode: String,  // Air‑way bill
         courierName: String,
         courierAssignedAt: Date,
@@ -129,10 +129,10 @@ const orderSchema = new mongoose.Schema(
             default: false
         },
 
-        pickupTokenNumber: String,  // “2025‑06‑14”
+        // pickupTokenNumber: String,  // “2025‑06‑14”
         pickupDate: String,  // “2025‑06‑14”
         expectedDeliveryDate: String,  // “2025‑06‑14”
-        pickupSlot: String,  // e.g. “14:00‑18:00”
+        // pickupSlot: String,  // e.g. “14:00‑18:00”
         shippingLabelUrl: String,  // e.g. “14:00‑18:00”
         shippingManifestUrl: String,  // e.g. “14:00‑18:00”
 
@@ -234,6 +234,9 @@ const orderSchema = new mongoose.Schema(
         couponCode: { type: String },
         couponType: { type: String },
         orderAmount: { type: Number, required: true },
+        amountPaid: { type: Number, default: 0 },
+        remainingAmount: { type: Number, default: 0 },
+        shippingType: { type: String, enum: ["Manual", "Partner"], default: "Manual" },
         deliveryCharge: { type: Number, default: 0 },
         discount: { type: Number, default: 0 },
         gst: { type: String },
@@ -300,18 +303,18 @@ const orderSchema = new mongoose.Schema(
 );
 
 orderSchema.index({ createdAt: -1 });
-orderSchema.pre("save", async function (next) {
-    if (this.isNew && !this.orderId && !this.abondonedOrder && this.type != ORDER_TYPES.PARTIAL_RETURN) { // only for new orders that are not abandoned
-        const counter = await Counter.findOneAndUpdate(
-            { _id: "quotationId" },
-            { $inc: { seq: 1 } },
-            { new: true, upsert: true, setDefaultsOnInsert: true }
-        ).lean();  // lean() improves concurrency performance
-        this.orderId = counter.seq;
-        console.log("Order Id: ", this.orderId);
-    }
-    next();
-});
+// orderSchema.pre("save", async function (next) {
+//     if (this.isNew && !this.orderId && !this.abondonedOrder && this.type != ORDER_TYPES.PARTIAL_RETURN) { // only for new orders that are not abandoned
+//         const counter = await Counter.findOneAndUpdate(
+//             { _id: "quotationId" },
+//             { $inc: { seq: 1 } },
+//             { new: true, upsert: true, setDefaultsOnInsert: true }
+//         ).lean();  // lean() improves concurrency performance
+//         this.orderId = counter.seq;
+//         console.log("Order Id: ", this.orderId);
+//     }
+//     next();
+// });
 
 orderSchema.statics.generateNextOrderId = async function () {
     const counter = await Counter.findOneAndUpdate(
