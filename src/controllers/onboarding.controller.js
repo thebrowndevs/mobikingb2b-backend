@@ -177,6 +177,100 @@ export const verifyGst = asyncHandler(async (req, res) => {
     );
 });
 
+export const verifyGstPos = asyncHandler(async (req, res) => {
+    const { gstin, phoneNo } = req.body;
+
+    if (!gstin || gstin.trim().length !== 15) {
+        throw new ApiError(400, "A valid 15-character GSTIN is required");
+    }
+
+    const normalized = gstin.trim().toUpperCase();
+
+    // 1. Check if GST is already linked to an existing user in our DB
+    const existingUser = await User.findOne({ "business.gstNumber": normalized })
+        .populate("address")
+        .lean();
+
+    if (existingUser) {
+        // Compare phone numbers (last 10 digits to normalize formatting differences)
+        const cleanDbPhone = String(existingUser.phoneNo || "").trim().slice(-10);
+        const cleanInputPhone = String(phoneNo || "").trim().slice(-10);
+
+        if (cleanDbPhone !== cleanInputPhone) {
+            throw new ApiError(400, "This GST number is already registered with another account.");
+        }
+
+        const defaultAddr = (existingUser.address && Array.isArray(existingUser.address))
+            ? (existingUser.address.find(a => a.isDefault) || existingUser.address[0] || {})
+            : {};
+        return res.json(
+            new ApiResponse(200, {
+                alreadyRegistered: true,
+                user: {
+                    _id: existingUser._id,
+                    name: existingUser.name || "",
+                    phoneNo: existingUser.phoneNo || "",
+                    email: existingUser.email || "",
+                    gstNumber: existingUser.business?.gstNumber || "",
+                    address: defaultAddr.street || "",
+                    address2: defaultAddr.street2 || "",
+                    city: defaultAddr.city || "",
+                    state: defaultAddr.state || "",
+                    pincode: defaultAddr.pinCode || "",
+                    country: defaultAddr.country || "India"
+                }
+            }, "GST number is already linked to this customer account.")
+        );
+    }
+
+    // 2. If not registered, proceed with paid IDfy API verification call
+    let apiResponse;
+    try {
+        apiResponse = await axios.post(
+            "https://gst-verification.p.rapidapi.com/v3/tasks/sync/verify_with_source/ind_gst_certificate",
+            {
+                task_id: crypto.randomUUID(),
+                group_id: "8e16424a-58fc-4ba4-ab20-5bc8e7c3c41e",
+                data: {
+                    gstin: normalized
+                }
+            },
+            {
+                headers: {
+                    "Content-Type": "application/json",
+                    "x-rapidapi-host": "gst-verification.p.rapidapi.com",
+                    "x-rapidapi-key": process.env.RAPIDAPI_GST_KEY,
+                },
+                timeout: 15000,
+            }
+        );
+    } catch (err) {
+        const msg = err?.response?.data?.message || err.message || "GST verification service unavailable";
+        throw new ApiError(502, `GST API error: ${msg}`);
+    }
+
+    const raw = apiResponse.data;
+    const sourceOutput = raw?.result?.source_output;
+
+    if (!sourceOutput || raw.status !== "completed") {
+        throw new ApiError(502, "GST verification service returned an unexpected response");
+    }
+
+    if (sourceOutput.status !== "id_found") {
+        throw new ApiError(404, "GSTIN not found in government records");
+    }
+
+    if (sourceOutput.gstin_status !== "Active") {
+        throw new ApiError(400, `GSTIN is not active. Current status: ${sourceOutput.gstin_status}`);
+    }
+
+    const parsed = parseGstResponse(sourceOutput);
+
+    return res.json(
+        new ApiResponse(200, { ...parsed, alreadyRegistered: false, rawSnapshot: sourceOutput }, "GSTIN verified successfully")
+    );
+});
+
 /**
  * POST /api/v1/onboarding/business
  * Saves business details (GST or manual). Sets business.active = true.

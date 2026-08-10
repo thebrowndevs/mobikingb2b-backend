@@ -496,15 +496,15 @@ export const getPaginatedProductsForAdmin = asyncHandler(async (req, res) => {
         break;
 
       case "InStock":
-        filter.totalStock = { $gt: 0 }; // Changed from $gte: 1 for clarity
+        filter.availableStock = { $gt: 0 };
         break;
 
       case "OutOfStock":
-        filter.totalStock = { $lte: 0 };
+        filter.availableStock = { $lte: 0 };
         break;
 
       case "zero":
-        filter.totalStock = { $eq: 0 }; // More robust than just 0
+        filter.availableStock = { $eq: 0 };
         break;
     }
   }

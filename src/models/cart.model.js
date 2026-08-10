@@ -40,6 +40,10 @@ export const itemsSchema = new mongoose.Schema({
         type: Number,
         default: 0
     },
+    discountPercent: {
+        type: Number,
+        default: 0
+    },
     appliedSlab: {
         quantity: Number,
         price: Number

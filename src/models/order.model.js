@@ -252,6 +252,7 @@ const orderSchema = new mongoose.Schema(
         shippingType: { type: String, enum: ["Manual", "Partner"], default: "Manual" },
         deliveryCharge: { type: Number, default: 0 },
         discount: { type: Number, default: 0 },
+        discountPercent: { type: Number, default: 0 },
         gst: { type: String },
         subtotal: Number,
 
