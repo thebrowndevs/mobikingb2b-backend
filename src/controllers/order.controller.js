@@ -7,6 +7,9 @@ import { Order } from "../models/order.model.js";
 import { Payment } from "../models/payment.model.js";
 import { Cart } from "../models/cart.model.js";
 import { Product } from '../models/product.model.js';   // <-- import Product
+import { Quotation } from '../models/quotation.model.js';
+import { Variant } from '../models/variant.model.js';
+import { Inventory } from '../models/inventory.model.js';
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { User } from "../models/user.model.js";
@@ -108,228 +111,177 @@ const paymentLinkWebhook = asyncHandler(async (req, res) => {
     }
 });
 
+
 const createPosOrder = asyncHandler(async (req, res) => {
     const session = await mongoose.startSession();
 
     try {
         const {
             userId,
-            name, phoneNo,
-            orderAmount,
+            name, phoneNo, email,
+            address, address2, city, state, pincode, country,
             gst,
-            comments,
-            discount,
+            method,
+            paymentMode,
             subtotal,
-            method = 'Cash',
+            discount,
+            deliveryCharge,
+            orderAmount,
+            comments,
             items
         } = req.body;
 
-        if (
-            !userId ||
-            !name || !phoneNo ||
-            !orderAmount ||
-            // !gst || 
-            !method || !items
-        ) {
-            throw new ApiError(400, 'Required details not found.');
+        if (!userId || !name || !phoneNo || !orderAmount || !items || !method || !paymentMode) {
+            throw new ApiError(400, 'Required checkout details not found.');
         }
 
-        const nowIso = new Date().toISOString();
-        const paymentDate = (method == "Cash" || method == "Online") ? new Date() : null;
-        let newOrderDoc = new Order({
+        let newQuote = new Quotation({
             userId,
             name: name.trim(),
+            email: email?.trim() || "",
             phoneNo: phoneNo.trim(),
-            method,
-            type: ORDER_TYPES.POS,
-            status: 'Delivered',
-            deliveredAt: nowIso,
-            orderState: "Confirmed",
-            paymentStatus: method == 'Online' ? 'Pending' : 'Paid',
-            paymentDate,
-            orderId: uuidv4().split('-')[0].toUpperCase(),
-            orderAmount,
-            discount,
-            gst,
+            comments: comments || "",
+            address,
+            address2,
+            city,
+            state,
+            country: country || "India",
+            pincode,
             subtotal,
-            items,
-            comments
+            discount,
+            deliveryCharge,
+            orderAmount,
+            method,
+            paymentMode,
+            status: "New",
+            type: "Pos",
+            items
         });
 
         let updatedUser = null;
         await session.withTransaction(async () => {
-            // Save order
-            newOrderDoc = await newOrderDoc.save({ session });
+            // Save the Quotation (triggers QT_XXXXXX id generation)
+            await newQuote.save({ session });
 
             const stockEntries = [];
 
-            for (const item of newOrderDoc.items) {
+            for (const item of newQuote.items) {
                 const qty = Math.floor(Number(item.quantity));
-                if (!Number.isInteger(qty) || qty <= 0) {
-                    throw new ApiError(400, `Invalid quantity for product ${item.productId}`);
-                }
+                if (qty <= 0) continue;
 
-                const variantKey = String(item.variantName || "").trim();
-                if (!variantKey) {
-                    throw new ApiError(400, `Missing variantName for product ${item.productId}`);
-                }
-
-                // ✅ findOneAndUpdate with new:true — one operation, no second read
-                const afterDecrement = await Product.findOneAndUpdate(
+                // 1. Atomically find and decrement availableStock on the Variant collection
+                const variant = await Variant.findOneAndUpdate(
                     {
-                        _id: item.productId,
-                        totalStock: { $gte: qty },
-                        [`variants.${variantKey}`]: { $gte: qty }
+                        productId: item.productId,
+                        name: item.variantName,
+                        active: true,
+                        availableStock: { $gte: qty }
                     },
                     {
-                        $inc: {
-                            totalStock: -qty,
-                            [`variants.${variantKey}`]: -qty
-                        }
+                        $inc: { availableStock: -qty }
                     },
                     { new: true, session }
-                ).select("variants totalStock");
+                );
 
-                if (!afterDecrement) {
-                    throw new ApiError(400, `Insufficient stock or variant "${variantKey}" not found`);
+                if (!variant) {
+                    throw new ApiError(400, `Insufficient available stock for variant "${item.variantName}".`);
                 }
 
-                // ✅ Accurate — derived from actual post-decrement DB values
-                const updatedStock = afterDecrement.variants.get(variantKey);
-                const previousStock = updatedStock + qty;
+                // 2. Atomically find and decrement availableStock on parent Product
+                const parentProduct = await Product.findOneAndUpdate(
+                    { _id: item.productId, availableStock: { $gte: qty } },
+                    { $inc: { availableStock: -qty } },
+                    { new: true, session }
+                );
 
+                if (!parentProduct) {
+                    throw new ApiError(400, `Insufficient available stock for parent product.`);
+                }
+
+                const currentTotalProductStock = parentProduct.totalProductStock || parentProduct.totalStock || 0;
+
+                // 3. Atomically update/upsert Inventory (Reserved Stock)
+                const inventory = await Inventory.findOneAndUpdate(
+                    { product: item.productId },
+                    { $inc: { reservedStock: qty } },
+                    { new: true, upsert: true, setDefaultsOnInsert: true, session }
+                );
+
+                // Sync variant ids & avg purchase price on Quotation items
+                const quoteItem = newQuote.items.find(i => String(i.productId) === String(item.productId) && i.variantName === item.variantName);
+                if (quoteItem) {
+                    quoteItem.purchasePrice = item.price; // directly use items price (prefilled from slab)
+                    quoteItem.variantId = variant._id;
+                    quoteItem.sku = String(variant._id);
+                }
+
+                // Queue Stock Log (Virtual Category - reserved)
                 stockEntries.push({
-                    orderId: newOrderDoc.orderId,
-                    orderRef: newOrderDoc._id,
-                    type: STOCK_TYPES.PURCHASE,
-                    variantName: variantKey,
+                    quotationId: newQuote.quotationId,
+                    quotationRef: newQuote._id,
+                    type: STOCK_TYPES.RESERVED,
+                    category: "virtual",
+                    variantId: variant._id,
+                    variantName: variant.name,
                     purchasePrice: item.price,
                     quantity: qty,
-                    previousStock,
-                    updatedStock,
+                    previousStock: variant.availableStock + qty,
+                    updatedStock: variant.availableStock,
+                    previousPhysicalStock: variant.totalStock,
+                    updatedPhysicalStock: variant.totalStock,
+                    totalProductStock: currentTotalProductStock,
                     productId: item.productId
                 });
             }
 
+            // Save Quotation item updates
+            await newQuote.save({ session });
+
+            // Write Stock logs
             if (stockEntries.length > 0) {
                 await Stock.insertMany(stockEntries, { session });
             }
 
-            // for (const item of newOrderDoc.items) {
-            //     const qty = Math.floor(Number(item.quantity));
-            //     if (!Number.isInteger(qty) || qty <= 0) {
-            //         throw new ApiError(400, `Invalid quantity for product ${item.productId}`);
-            //     }
-
-            //     const variantKey = String(item.variantName || "").trim();
-            //     if (!variantKey) {
-            //         throw new ApiError(400, `Missing variantName for product ${item.productId}`);
-            //     }
-
-            //     // ✅ Pehle atomic decrement
-            //     const result = await Product.updateOne(
-            //         {
-            //             _id: item.productId,
-            //             totalStock: { $gte: qty },
-            //             [`variants.${variantKey}`]: { $gte: qty }
-            //         },
-            //         {
-            //             $inc: {
-            //                 totalStock: -qty,
-            //                 [`variants.${variantKey}`]: -qty
-            //             }
-            //         },
-            //         { session }
-            //     );
-
-            //     if (!result || result.modifiedCount === 0) {
-            //         throw new ApiError(400, `Insufficient stock or variant "${variantKey}" not found`);
-            //     }
-
-            //     // ✅ Decrement ke baad fresh read
-            //     const freshProduct = await Product.findById(item.productId)
-            //         .session(session)
-            //         .select("variants totalStock");
-
-            //     const updatedStock = freshProduct.variants.get(variantKey);
-            //     const previousStock = updatedStock + qty;
-
-            //     stockEntries.push({
-            //         orderId: newOrderDoc.orderId,
-            //         type: STOCK_TYPES.PURCHASE,  // POS wale mein "purchase" string tha — yeh consistent karo
-            //         variantName: variantKey,
-            //         purchasePrice: item.price,
-            //         quantity: qty,
-            //         previousStock,
-            //         updatedStock,
-            //         productId: item.productId
-            //     });
-            // }
-
-            // // ✅ Saare items ke baad ek saath insert
-            // if (stockEntries.length > 0) {
-            //     await Stock.insertMany(stockEntries, { session });
-            // }
-
-            // ✅ Add order to each product
-
-            //Finding unique product ids and then add them
-
-
+            // Finding unique product ids and then add quotation ref
             const uniqueProductIds = new Set();
-            newOrderDoc.items.forEach(it => {
-                if (it.productId && it.productId._id) {
-                    uniqueProductIds.add(it.productId._id.toString());
+            newQuote.items.forEach(it => {
+                if (it.productId) {
+                    uniqueProductIds.add(it.productId.toString());
                 }
             });
 
-            const productOrderOps = Array.from(uniqueProductIds).map(productId => ({
+            const productQuotationOps = Array.from(uniqueProductIds).map(productId => ({
                 updateOne: {
                     filter: { _id: productId },
-                    update: { $push: { orders: newOrderDoc._id } }
+                    update: { $push: { quotations: newQuote._id } }
                 }
             }));
 
-            // console.log("Product Ids: ",productOrderOps);
-            if (productOrderOps.length > 0) {
-                const productResult = await Product.bulkWrite(productOrderOps, { session });
-                console.log('Order pushed to products:', productResult);
-            } else {
-                console.warn('⚠️ No valid products found to push order');
+            if (productQuotationOps.length > 0) {
+                await Product.bulkWrite(productQuotationOps, { session });
             }
 
-            // Add order to user
+            // Add quotation to user's quotations list
             updatedUser = await User.findByIdAndUpdate(
                 userId,
-                { $push: { orders: newOrderDoc._id } },
+                { $push: { quotations: newQuote._id } },
                 { new: true, session }
             ).select('-password -refreshToken')
-                .populate({
-                    path: "cart",
-                    populate: {
-                        path: "items.productId",
-                        model: "Product",
-                        populate: {
-                            path: "category",  // This is the key part
-                            model: "SubCategory"
-                        }
-                    }
-                })
                 .populate("wishlist")
                 .populate("address")
                 .populate("orders")
+                .populate("quotations")
                 .exec();
 
-            if (!updatedUser) throw new ApiError(500, "Failed to update user orders");
-
+            if (!updatedUser) throw new ApiError(500, "Failed to update user quotations");
         });
 
         return res.status(201).json(
-            new ApiResponse(201, { order: newOrderDoc, user: updatedUser }, "Order Placed Successfully")
+            new ApiResponse(201, { quotation: newQuote, user: updatedUser }, "POS Quotation Placed Successfully")
         );
 
     } catch (err) {
-        console.error('Error placing order:', err.message);
+        console.error('Error placing POS Quotation:', err.message);
         return res.status(500).json({ message: err.message || 'Internal server error' });
     } finally {
         session.endSession();
