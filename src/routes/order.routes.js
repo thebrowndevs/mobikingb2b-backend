@@ -36,8 +36,25 @@ import {
     getOrderPayments,
     generatePaymentRecordLink,
     manualShipOrder,
-    updateManualShippingStatus
+    updateManualShippingStatus,
+    systemCreatedCancel
 } from "../controllers/order.controller.js";
+import {
+    raisePartialReturnRequest,
+    getPaginatedPartialRequests,
+    getPartialReturnRequestById,
+    acceptPartialReturnRequest,
+    rejectPartialReturnRequest,
+    holdPartialReturnRequest,
+    reopenPartialReturnRequest,
+    sendPartialReturnReply,
+    getPartialReturnRequestsByOrderId,
+    initiateOrderRefund
+} from "../controllers/v2/order.controller.js";
+import {
+    assignPartialReturnCourier,
+    schedulePartialReturnPickup
+} from "../controllers/v2/shiprocket.controller.js";
 import {
     assignBestCourier,
     assignReturnCourier,
@@ -113,38 +130,51 @@ router.route("/reject").post(
 
 router.route("/cancel").post(
     verifyJWT,
-    shiprocketAuth,
-    preShiprocketCancel,
-    createdCancel,
-    awbCancel,
-    postPickupCancel,
-    inTransitCancel,
-    deliveredCancel
+    systemCreatedCancel
 )
 
+// LEGACY RETURN FLOW (DO NOT USE)
 // router.route('/return').post(
 //     verifyJWT,
 //     shiprocketAuth,
 //     returnOrder
 // )
+// router.route('/return/accept').post(
+//     verifyJWT,
+//     shiprocketAuth,
+//     returnOrderV2,
+// )
+// router.route('/return/courier/assign').post(
+//     verifyJWT,
+//     shiprocketAuth,
+//     assignReturnCourier,
+// )
+// router.route('/return/pickup/schedule').post(
+//     verifyJWT,
+//     shiprocketAuth,
+//     scheduleReturnOrderPickup
+// )
 
-router.route('/return/accept').post(
-    verifyJWT,
-    shiprocketAuth,
-    returnOrderV2,
-)
-
-router.route('/return/courier/assign').post(
-    verifyJWT,
-    shiprocketAuth,
-    assignReturnCourier,
-)
-
-router.route('/return/pickup/schedule').post(
-    verifyJWT,
-    shiprocketAuth,
-    scheduleReturnOrderPickup
-)
+/* ─────────────────────────────────────────────────────────────────────
+   Partial Return Order Routes (v1 migrated)
+   ───────────────────────────────────────────────────────────────────── */
+router.route("/partial-return/raise").post(verifyJWT,
+    // shiprocketAuth, 
+    raisePartialReturnRequest);
+router.route("/partial-return/requests").get(verifyJWT, getPaginatedPartialRequests);
+router.route("/partial-return/requests/order/:orderId").get(verifyJWT, getPartialReturnRequestsByOrderId);
+router.route("/partial-return/requests/:id").get(verifyJWT, getPartialReturnRequestById);
+router.route("/partial-return/accept").post(verifyJWT,
+    // shiprocketAuth, 
+    acceptPartialReturnRequest);
+router.route("/partial-return/reject").post(verifyJWT, rejectPartialReturnRequest);
+router.route("/partial-return/hold").post(verifyJWT, holdPartialReturnRequest);
+router.route("/partial-return/reopen").post(verifyJWT, reopenPartialReturnRequest);
+router.route("/partial-return/reply").post(verifyJWT, sendPartialReturnReply);
+router.route("/partial-return/courier/assign").post(verifyJWT,
+    // shiprocketAuth, 
+    assignPartialReturnCourier);
+router.route("/partial-return/pickup/schedule").post(verifyJWT, shiprocketAuth, schedulePartialReturnPickup);
 
 // Track order routes
 router.route('/webhook').post(

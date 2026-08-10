@@ -11,6 +11,8 @@ import { User } from '../../models/user.model.js';
 import { Cart } from "../../models/cart.model.js";
 import { Address } from "../../models/address.model.js";
 import { Coupon } from "../../models/coupon.model.js";
+import { Variant } from "../../models/variant.model.js";
+import { Inventory } from "../../models/inventory.model.js";
 import { CompanyDetails } from "../../models/company_details.model.js";
 import { initiatePhonepePayment, checkPhonepeOrderStatus, refundPhonepePayment } from "../../services/phonepe.service.js";
 import { initiateRazorpayPayment, refundRazorpayPayment } from "../../services/razorpay.service.js";
@@ -18,9 +20,35 @@ import { confirmOrderPaymentLogic } from "../../services/payment.service.js";
 import { PartialRequests } from "../../models/partialOrderRequests.model.js";
 import { getShiprocketOrderDetails, createShiprocketReturnOrder } from "../../services/shiprocket.service.js";
 
+const syncProductStock = async (productId, session) => {
+    const variants = await Variant.find({ productId }).session(session);
+    let totalStockSum = 0;
+    let availableStockSum = 0;
+    for (const v of variants) {
+        totalStockSum += v.totalStock || 0;
+        availableStockSum += v.availableStock || 0;
+    }
+
+    await Product.findByIdAndUpdate(
+        productId,
+        {
+            totalStock: totalStockSum,
+            totalProductStock: totalStockSum,
+            availableStock: availableStockSum
+        },
+        { session }
+    );
+
+    const inventory = await Inventory.findOne({ product: productId }).session(session);
+    if (inventory) {
+        inventory.physicalStock = totalStockSum;
+        await inventory.save({ session });
+    }
+};
+
 /* ─────────────────────────────────────────────────────────────────────
-   adjustStock (v2) — Cancel / Return pe stock wapas karta hai for scratchy support
-───────────────────────────────────────────────────────────────────── */
+   adjustStock (v2) — Cancel / Return pe stock wapas karta hai for variant support
+   ───────────────────────────────────────────────────────────────────── */
 async function adjustStock(
     order,
     {
@@ -58,13 +86,11 @@ async function adjustStock(
             return null;
         }
 
-        const agg = new Map();
+        const stockEntries = [];
 
         for (const item of lockedOrder.items) {
             const qty = Math.floor(Number(item.quantity));
-            if (!Number.isInteger(qty) || qty <= 0) {
-                throw new ApiError(400, `Invalid quantity: ${item.quantity}`);
-            }
+            if (qty <= 0) continue;
 
             const productId = item.productId?._id
                 ? String(item.productId._id)
@@ -72,68 +98,85 @@ async function adjustStock(
 
             const variantKey = String(item.variantName || "").trim();
             if (!variantKey) {
-                throw new ApiError(
-                    400,
-                    `Missing variantName for product ${productId}`
-                );
+                throw new ApiError(400, `Missing variantName for product ${productId}`);
             }
 
             const isScratchy = !!item.isScratchy;
-            const key = `${productId}::${variantKey}::${isScratchy}`;
-            agg.set(key, (agg.get(key) || 0) + qty);
-        }
 
-        if (agg.size === 0) return null;
+            if (isScratchy) {
+                // Scratchy variants are stored inside Product document's scratchyVariants map
+                const afterRestore = await Product.findOneAndUpdate(
+                    { _id: productId },
+                    {
+                        $inc: {
+                            totalStock: qty,
+                            scratchyStock: qty,
+                            [`scratchyVariants.${variantKey}`]: qty
+                        }
+                    },
+                    { new: true, session }
+                ).select("scratchyVariants totalStock scratchyStock");
 
-        const stockEntries = [];
-
-        for (const [mapKey, totalQty] of agg.entries()) {
-            const [productId, variantKey, isScratchyStr] = mapKey.split("::");
-            const isScratchy = isScratchyStr === "true";
-
-            const updateQuery = isScratchy ? {
-                $inc: {
-                    totalStock: totalQty,
-                    scratchyStock: totalQty,
-                    [`scratchyVariants.${variantKey}`]: totalQty
+                if (!afterRestore) {
+                    throw new ApiError(404, `Product "${productId}" not found — restore failed`);
                 }
-            } : {
-                $inc: {
-                    totalStock: totalQty,
-                    [`variants.${variantKey}`]: totalQty
+
+                const updatedStock = afterRestore.scratchyVariants.get(variantKey);
+                const previousStock = updatedStock - qty;
+
+                stockEntries.push({
+                    orderId: lockedOrder.orderId,
+                    type,
+                    variantName: variantKey,
+                    quantity: qty,
+                    previousStock,
+                    updatedStock,
+                    productId,
+                    isScratchy: true
+                });
+            } else {
+                // Regular variants are stored in the Variant model
+                const variant = await Variant.findOne({ productId, name: variantKey }).session(session);
+                if (variant) {
+                    const previousAvailable = variant.availableStock;
+                    const previousPhysical = variant.totalStock;
+
+                    // Restock available and total variant stock
+                    variant.availableStock += qty;
+                    variant.totalStock += qty;
+
+                    // Restore remainingStock & availableStock to purchaseSets
+                    if (item.purchaseSetId) {
+                        const set = variant.purchaseSets.id(item.purchaseSetId);
+                        if (set) {
+                            set.remainingStock += qty;
+                            set.availableStock += qty;
+                        } else if (variant.purchaseSets.length > 0) {
+                            variant.purchaseSets[0].remainingStock += qty;
+                            variant.purchaseSets[0].availableStock += qty;
+                        }
+                    } else if (variant.purchaseSets.length > 0) {
+                        variant.purchaseSets[0].remainingStock += qty;
+                        variant.purchaseSets[0].availableStock += qty;
+                    }
+
+                    await variant.save({ session });
+
+                    // Sync parent product and inventory stock levels
+                    await syncProductStock(productId, session);
+
+                    stockEntries.push({
+                        orderId: lockedOrder.orderId,
+                        type,
+                        variantName: variantKey,
+                        quantity: qty,
+                        previousStock: previousPhysical,
+                        updatedStock: variant.totalStock,
+                        productId,
+                        isScratchy: false
+                    });
                 }
-            };
-
-            const selectFields = "variants scratchyVariants totalStock scratchyStock";
-
-            const afterRestore = await Product.findOneAndUpdate(
-                { _id: productId },
-                updateQuery,
-                { new: true, session }
-            ).select(selectFields);
-
-            if (!afterRestore) {
-                throw new ApiError(
-                    404,
-                    `Product "${productId}" not found — restore failed`
-                );
             }
-
-            const updatedStock = isScratchy
-                ? afterRestore.scratchyVariants.get(variantKey)
-                : afterRestore.variants.get(variantKey);
-            const previousStock = updatedStock - totalQty;
-
-            stockEntries.push({
-                orderId: lockedOrder.orderId,
-                type,
-                variantName: variantKey,
-                quantity: totalQty,
-                previousStock,
-                updatedStock,
-                productId,
-                isScratchy
-            });
         }
 
         if (stockEntries.length > 0) {

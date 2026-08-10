@@ -5105,6 +5105,184 @@ const updateManualShippingStatus = asyncHandler(async (req, res) => {
     return res.status(200).json(new ApiResponse(200, order, "Manual shipping status updated successfully."));
 });
 
+const syncProductStock = async (productId, session) => {
+    const variants = await Variant.find({ productId }).session(session);
+    let totalStockSum = 0;
+    let availableStockSum = 0;
+    for (const v of variants) {
+        totalStockSum += v.totalStock || 0;
+        availableStockSum += v.availableStock || 0;
+    }
+
+    await Product.findByIdAndUpdate(
+        productId,
+        {
+            totalStock: totalStockSum,
+            totalProductStock: totalStockSum,
+            availableStock: availableStockSum
+        },
+        { session }
+    );
+
+    const inventory = await Inventory.findOne({ product: productId }).session(session);
+    if (inventory) {
+        inventory.physicalStock = totalStockSum;
+        await inventory.save({ session });
+    }
+};
+
+async function adjustStockV3(
+    order,
+    {
+        type = STOCK_TYPES.CANCEL,
+        session: externalSession = null,
+    } = {}
+) {
+    if (
+        !order ||
+        order.abondonedOrder ||
+        !Array.isArray(order.items) ||
+        order.items.length === 0
+    ) {
+        return null;
+    }
+
+    const ownSession = !externalSession;
+    const session = externalSession ?? await mongoose.startSession();
+
+    const run = async () => {
+        const lockedOrder = await Order.findOneAndUpdate(
+            {
+                _id: order._id,
+                _restockDone: { $ne: true }
+            },
+            { $set: { _restockDone: true } },
+            { new: true, session }
+        );
+
+        if (!lockedOrder) {
+            console.warn(
+                `[adjustStockV3] Skipped — _restockDone already true ` +
+                `for order ${order._id} (type: ${type})`
+            );
+            return null;
+        }
+
+        const stockEntries = [];
+
+        for (const item of lockedOrder.items) {
+            const qty = Math.floor(Number(item.quantity));
+            if (qty <= 0) continue;
+
+            const productId = item.productId?._id
+                ? String(item.productId._id)
+                : String(item.productId);
+
+            // 1. Fetch and update the Variant
+            const variant = await Variant.findOne({ productId, name: item.variantName }).session(session);
+            if (variant) {
+                const previousAvailable = variant.availableStock;
+                const previousPhysical = variant.totalStock;
+
+                // Restock available and total variant stock
+                variant.availableStock += qty;
+                variant.totalStock += qty;
+
+                // Restore remainingStock & availableStock to purchaseSets
+                if (item.purchaseSetId) {
+                    const set = variant.purchaseSets.id(item.purchaseSetId);
+                    if (set) {
+                        set.remainingStock += qty;
+                        set.availableStock += qty;
+                    } else if (variant.purchaseSets.length > 0) {
+                        variant.purchaseSets[0].remainingStock += qty;
+                        variant.purchaseSets[0].availableStock += qty;
+                    }
+                } else if (variant.purchaseSets.length > 0) {
+                    variant.purchaseSets[0].remainingStock += qty;
+                    variant.purchaseSets[0].availableStock += qty;
+                }
+
+                await variant.save({ session });
+
+                // Sync parent product and inventory stock levels
+                await syncProductStock(productId, session);
+
+                // Fetch parent product to get updated totalProductStock for logging
+                const parentProduct = await Product.findById(productId).session(session);
+                const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+                // 2. Log Stock Ledger
+                stockEntries.push({
+                    orderId: lockedOrder.orderId,
+                    type,
+                    variantName: item.variantName,
+                    quantity: qty,
+                    previousStock: previousPhysical,
+                    updatedStock: variant.totalStock,
+                    productId,
+                    isScratchy: !!item.isScratchy
+                });
+            }
+        }
+
+        if (stockEntries.length > 0) {
+            await Stock.insertMany(stockEntries, { session });
+        }
+
+        return { restored: true };
+    };
+
+    try {
+        if (ownSession) {
+            let result = null;
+            await session.withTransaction(async () => {
+                result = await run();
+            });
+            return result;
+        } else {
+            return await run();
+        }
+    } catch (err) {
+        console.error("[adjustStockV3] failed:", err);
+        throw err;
+    } finally {
+        if (ownSession) session.endSession();
+    }
+}
+
+const systemCreatedCancel = asyncHandler(async (req, res) => {
+    const { orderId, reason } = req.body;
+
+    const order = await Order.findById(orderId);
+    if (!order) {
+        throw new ApiError(404, "Order not found");
+    }
+
+    if (order.status === "Cancelled") {
+        throw new ApiError(400, "Order already cancelled");
+    }
+
+    // Atomic session: order save + stock restore
+    const session = await mongoose.startSession();
+    try {
+        await session.withTransaction(async () => {
+            order.status = "Cancelled";
+            order.reason = reason;
+            order.requests = updateRequestStatus(order.requests, reason);
+            await order.save({ session });
+
+            await adjustStockV3(order, { type: STOCK_TYPES.CANCEL, session });
+        });
+    } finally {
+        session.endSession();
+    }
+
+    return res.json(
+        new ApiResponse(200, { order }, "Order cancelled and stock restored successfully.")
+    );
+});
+
 export {
     paymentLinkWebhook,
     createPosOrder,
@@ -5146,7 +5324,8 @@ export {
     getOrderPayments,
     generatePaymentRecordLink,
     manualShipOrder,
-    updateManualShippingStatus
+    updateManualShippingStatus,
+    systemCreatedCancel
 }
 
 // =========================================================================
