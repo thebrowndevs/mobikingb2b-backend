@@ -1457,7 +1457,10 @@ export const getPartialReturnRequestById = asyncHandler(async (req, res) => {
             populate: [
                 { path: "userId", select: "name email phone role" },
                 { path: "addressId" },
-                { path: "items.productId", select: "name fullName images" }
+                {
+                    path: "items.productId",
+                    select: "name fullName images photos price sku"
+                }
             ]
         })
         .populate({
@@ -1465,10 +1468,13 @@ export const getPartialReturnRequestById = asyncHandler(async (req, res) => {
             populate: [
                 { path: "userId", select: "name email phone role" },
                 { path: "addressId" },
-                { path: "items.productId", select: "name fullName images" }
+                {
+                    path: "items.productId",
+                    select: "name fullName images photos price sku"
+                }
             ]
         })
-        .populate("items.productId", "name fullName images")
+        .populate("items.productId", "name fullName images photos price sku")
         .populate("replies.messagedBy", "name email phone role")
         .populate("resolvedBy", "name email phone role")
         .populate("reopenedBy", "name email phone role")
