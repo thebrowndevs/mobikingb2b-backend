@@ -5,6 +5,7 @@ import { Stock } from "../models/stock.model.js";
 import { Inventory } from "../models/inventory.model.js";
 import { SubCategory } from "../models/sub_category.model.js";
 import { Order } from "../models/order.model.js";
+import { Quotation } from "../models/quotation.model.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
@@ -815,7 +816,7 @@ const getStockHistoryByProduct = asyncHandler(async (req, res) => {
     const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 10));
     const skip = (page - 1) * limit;
 
-    const { variantName, type } = req.query;
+    const { variantName, type, category, refType } = req.query;
 
     const filter = { productId };
     if (variantName && variantName !== "all") {
@@ -823,6 +824,16 @@ const getStockHistoryByProduct = asyncHandler(async (req, res) => {
     }
     if (type && type !== "all") {
         filter.type = type;
+    }
+    if (category && category !== "all") {
+        filter.category = category;
+    }
+    if (refType && refType !== "all") {
+        if (refType === "orders") {
+            filter.orderId = { $exists: true, $ne: "" };
+        } else if (refType === "quotations") {
+            filter.quotationId = { $exists: true, $ne: "" };
+        }
     }
 
     const [history, totalCount] = await Promise.all([
@@ -1456,7 +1467,7 @@ const getProductInventoryDetails = asyncHandler(async (req, res) => {
         .select("name fullName totalStock availableStock inventory variants")
         .populate({
             path: "variants",
-            select: "name totalStock active webVisibility appVisibility"
+            select: "name totalStock availableStock active webVisibility appVisibility"
         })
         .populate({
             path: "inventory",
@@ -1468,6 +1479,56 @@ const getProductInventoryDetails = asyncHandler(async (req, res) => {
         throw new ApiError(404, "Product not found");
     }
     return res.status(200).json(new ApiResponse(200, product, "Product inventory details fetched successfully"));
+});
+
+const getProductQuotations = asyncHandler(async (req, res) => {
+    const productId = req?.params?._id;
+    if (!productId || !mongoose.Types.ObjectId.isValid(productId)) {
+        throw new ApiError(400, "Valid Product Id required");
+    }
+
+    const page = Math.max(1, parseInt(req?.query?.page) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req?.query?.limit) || 10));
+    const skip = (page - 1) * limit;
+
+    const filter = {
+        "items.productId": new mongoose.Types.ObjectId(productId),
+    };
+
+    const [totalCount, quotations] = await Promise.all([
+        Quotation.countDocuments(filter),
+        Quotation.find(filter)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit)
+            .populate({
+                path: "userId",
+                model: "User",
+                select: "name email phoneNo",
+            })
+            .populate({
+                path: "items.productId",
+                model: "Product",
+                select: "name fullName"
+            })
+            .lean()
+    ]);
+
+    const totalPages = Math.ceil(totalCount / limit);
+
+    return res.status(200).json(
+        new ApiResponse(200, {
+            quotations,
+            totalCount,
+            pagination: {
+                page,
+                limit,
+                totalPages,
+                hasNextPage: page < totalPages,
+                hasPrevPage: page > 1,
+            }
+        }, "Product quotations fetched successfully")
+    );
 });
 
 export {
@@ -1484,6 +1545,7 @@ export {
     getProductById,
     getProductBySlug,
     getProductOrders,
+    getProductQuotations,
     createVariant,
     updateVariant,
     deleteVariant,

@@ -12,6 +12,7 @@ import {
     updateProductStock,
     bulkUpdateProductStock,
     getProductOrders,
+    getProductQuotations,
     createVariant,
     updateVariant,
     deleteVariant,
@@ -47,6 +48,7 @@ router.route("/category/:categoryId").get(getProductsByCategory);
 router.route("/group/:groupId").get(getProductsByGroup);
 router.route("/stock/:_id").get(verifyJWT, getStockHistoryByProduct);
 router.route("/orders/:_id").get(verifyJWT, getProductOrders);
+router.route("/quotations/:_id").get(verifyJWT, getProductQuotations);
 router.route("/inventory-details/:_id").get(verifyJWT, getProductInventoryDetails);
 router.route("/details/:slug").get(getProductBySlug);
 // Paginated & Search
