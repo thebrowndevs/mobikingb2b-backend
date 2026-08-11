@@ -135,29 +135,37 @@ async function adjustStock(
                     isScratchy: true
                 });
             } else {
-                // Regular variants are stored in the Variant model
-                const variant = await Variant.findOne({ productId, name: variantKey }).session(session);
+                const variant = await Variant.findOneAndUpdate(
+                    { _id: item.variantId },
+                    { $inc: { availableStock: qty, totalStock: qty } },
+                    { new: true, session }
+                );
+
                 if (variant) {
-                    const previousAvailable = variant.availableStock;
-                    const previousPhysical = variant.totalStock;
+                    const previousAvailable = variant.availableStock - qty;
+                    const previousPhysical = variant.totalStock - qty;
 
-                    // Restock available and total variant stock
-                    variant.availableStock += qty;
-                    variant.totalStock += qty;
+                    if (!item.purchaseSets || item.purchaseSets.length === 0) {
+                        const fallbackSetId = item.purchaseSetId || (variant.purchaseSets[0] ? String(variant.purchaseSets[0]._id) : "");
+                        item.purchaseSets = [{
+                            purchaseSetId: fallbackSetId,
+                            quantity: qty,
+                            price: item.purchasePrice || (variant.purchaseSets[0]?.price || 0)
+                        }];
+                        item.purchaseSetId = fallbackSetId;
+                    }
 
-                    // Restore remainingStock & availableStock to purchaseSets
-                    if (item.purchaseSetId) {
-                        const set = variant.purchaseSets.id(item.purchaseSetId);
-                        if (set) {
-                            set.remainingStock += qty;
-                            set.availableStock += qty;
+                    for (const alloc of item.purchaseSets) {
+                        if (alloc.purchaseSetId) {
+                            const set = variant.purchaseSets.id(alloc.purchaseSetId);
+                            if (set) {
+                                set.remainingStock += alloc.quantity;
+                                set.availableStock += alloc.quantity;
+                            }
                         } else if (variant.purchaseSets.length > 0) {
-                            variant.purchaseSets[0].remainingStock += qty;
-                            variant.purchaseSets[0].availableStock += qty;
+                            variant.purchaseSets[0].remainingStock += alloc.quantity;
+                            variant.purchaseSets[0].availableStock += alloc.quantity;
                         }
-                    } else if (variant.purchaseSets.length > 0) {
-                        variant.purchaseSets[0].remainingStock += qty;
-                        variant.purchaseSets[0].availableStock += qty;
                     }
 
                     await variant.save({ session });
@@ -165,13 +173,23 @@ async function adjustStock(
                     // Sync parent product and inventory stock levels
                     await syncProductStock(productId, session);
 
+                    // Fetch parent product to get updated totalProductStock for logging
+                    const parentProduct = await Product.findById(productId).session(session);
+                    const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
                     stockEntries.push({
                         orderId: lockedOrder.orderId,
+                        orderRef: lockedOrder._id,
                         type,
-                        variantName: variantKey,
+                        category: "physical",
+                        variantId: variant._id,
+                        variantName: variant.name,
                         quantity: qty,
-                        previousStock: previousPhysical,
-                        updatedStock: variant.totalStock,
+                        previousStock: previousAvailable,
+                        updatedStock: variant.availableStock,
+                        previousPhysicalStock: previousPhysical,
+                        updatedPhysicalStock: variant.totalStock,
+                        totalProductStock: currentTotalProductStock,
                         productId,
                         isScratchy: false
                     });
@@ -273,60 +291,153 @@ const createPosOrder = asyncHandler(async (req, res) => {
 
                 const isScratchy = !!item.isScratchy;
 
-                const updateQuery = isScratchy ? {
-                    _id: item.productId,
-                    totalStock: { $gte: qty },
-                    scratchyStock: { $gte: qty },
-                    [`scratchyVariants.${variantKey}`]: { $gte: qty }
-                } : {
-                    _id: item.productId,
-                    totalStock: { $gte: qty },
-                    [`variants.${variantKey}`]: { $gte: qty }
-                };
+                if (isScratchy) {
+                    const updateQuery = {
+                        _id: item.productId,
+                        totalStock: { $gte: qty },
+                        scratchyStock: { $gte: qty },
+                        [`scratchyVariants.${variantKey}`]: { $gte: qty }
+                    };
 
-                const updateFields = isScratchy ? {
-                    $inc: {
-                        totalStock: -qty,
-                        scratchyStock: -qty,
-                        [`scratchyVariants.${variantKey}`]: -qty
+                    const updateFields = {
+                        $inc: {
+                            totalStock: -qty,
+                            scratchyStock: -qty,
+                            [`scratchyVariants.${variantKey}`]: -qty
+                        }
+                    };
+
+                    const selectFields = "variants scratchyVariants totalStock scratchyStock";
+
+                    const afterDecrement = await Product.findOneAndUpdate(
+                        updateQuery,
+                        updateFields,
+                        { new: true, session }
+                    ).select(selectFields);
+
+                    if (!afterDecrement) {
+                        throw new ApiError(400, `Insufficient stock or variant "${variantKey}" not found`);
                     }
-                } : {
-                    $inc: {
-                        totalStock: -qty,
-                        [`variants.${variantKey}`]: -qty
+
+                    const updatedStock = afterDecrement.scratchyVariants.get(variantKey);
+                    const previousStock = updatedStock + qty;
+
+                    stockEntries.push({
+                        orderId: newOrderDoc.orderId,
+                        orderRef: newOrderDoc._id,
+                        type: STOCK_TYPES.PURCHASE,
+                        category: "physical",
+                        variantName: variantKey,
+                        quantity: qty,
+                        previousStock,
+                        updatedStock,
+                        productId: item.productId,
+                        isScratchy: true
+                    });
+                } else {
+                    const variant = await Variant.findOneAndUpdate(
+                        { 
+                            _id: item.variantId,
+                            availableStock: { $gte: qty },
+                            totalStock: { $gte: qty }
+                        },
+                        {
+                            $inc: { availableStock: -qty, totalStock: -qty }
+                        },
+                        { new: true, session }
+                    );
+
+                    if (!variant) {
+                        throw new ApiError(400, `Insufficient stock or variant not found for ID ${item.variantId}`);
                     }
-                };
 
-                const selectFields = "variants scratchyVariants totalStock scratchyStock";
+                    let remaining = qty;
+                    const allocatedSets = [];
+                    let selectedSetId = "";
+                    let totalCost = 0;
 
-                const afterDecrement = await Product.findOneAndUpdate(
-                    updateQuery,
-                    updateFields,
-                    { new: true, session }
-                ).select(selectFields);
+                    for (const set of variant.purchaseSets) {
+                        if (set.availableStock > 0) {
+                            const take = Math.min(remaining, set.availableStock);
+                            set.availableStock -= take;
+                            set.remainingStock = Math.max(0, set.remainingStock - take);
+                            allocatedSets.push({
+                                purchaseSetId: String(set._id),
+                                quantity: take,
+                                price: set.price
+                            });
+                            totalCost += take * set.price;
+                            remaining -= take;
+                            if (!selectedSetId && take > 0) {
+                                selectedSetId = String(set._id);
+                            }
+                            if (remaining === 0) break;
+                        }
+                    }
 
-                if (!afterDecrement) {
-                    throw new ApiError(400, `Insufficient stock or variant "${variantKey}" not found`);
+                    if (remaining > 0 && variant.purchaseSets.length > 0) {
+                        variant.purchaseSets[0].availableStock = Math.max(0, variant.purchaseSets[0].availableStock - remaining);
+                        variant.purchaseSets[0].remainingStock = Math.max(0, variant.purchaseSets[0].remainingStock - remaining);
+                        allocatedSets.push({
+                            purchaseSetId: String(variant.purchaseSets[0]._id),
+                            quantity: remaining,
+                            price: variant.purchaseSets[0].price
+                        });
+                        selectedSetId = String(variant.purchaseSets[0]._id);
+                        totalCost += remaining * variant.purchaseSets[0].price;
+                    }
+
+                    await variant.save({ session });
+
+                    const avgPurchasePrice = qty > 0 ? (totalCost / qty) : 0;
+                    item.purchasePrice = avgPurchasePrice;
+                    item.purchaseSetId = selectedSetId;
+                    item.purchaseSets = allocatedSets;
+
+                    const product = await Product.findById(item.productId).session(session);
+                    if (product) {
+                        let activeSlab = product.sellingPrice?.slabs?.[0] || { quantity: 60, price: product.basePrice || 0 };
+                        if (product.sellingPrice?.slabs && product.sellingPrice.slabs.length > 0) {
+                            const sortedSlabs = [...product.sellingPrice.slabs].sort((a, b) => b.quantity - a.quantity);
+                            for (const slab of sortedSlabs) {
+                                if (qty >= slab.quantity) {
+                                    activeSlab = slab;
+                                    break;
+                                }
+                            }
+                        }
+                        item.appliedSlab = {
+                            quantity: activeSlab.quantity,
+                            price: activeSlab.price
+                        };
+                    }
+
+                    await syncProductStock(item.productId, session);
+
+                    const parentProduct = await Product.findById(item.productId).session(session);
+                    const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+                    stockEntries.push({
+                        orderId: newOrderDoc.orderId,
+                        orderRef: newOrderDoc._id,
+                        type: STOCK_TYPES.PURCHASE,
+                        category: "physical",
+                        variantId: variant._id,
+                        variantName: variant.name,
+                        purchasePrice: avgPurchasePrice,
+                        quantity: qty,
+                        previousStock: variant.availableStock + qty,
+                        updatedStock: variant.availableStock,
+                        previousPhysicalStock: variant.totalStock + qty,
+                        updatedPhysicalStock: variant.totalStock,
+                        totalProductStock: currentTotalProductStock,
+                        productId: item.productId,
+                        isScratchy: false
+                    });
                 }
-
-                const updatedStock = isScratchy
-                    ? afterDecrement.scratchyVariants.get(variantKey)
-                    : afterDecrement.variants.get(variantKey);
-                const previousStock = updatedStock + qty;
-
-                stockEntries.push({
-                    orderId: newOrderDoc.orderId,
-                    orderRef: newOrderDoc._id,
-                    type: STOCK_TYPES.PURCHASE,
-                    variantName: variantKey,
-                    purchasePrice: item.price,
-                    quantity: qty,
-                    previousStock,
-                    updatedStock,
-                    productId: item.productId,
-                    isScratchy
-                });
             }
+
+            await newOrderDoc.save({ session });
 
             if (stockEntries.length > 0) {
                 await Stock.insertMany(stockEntries, { session });

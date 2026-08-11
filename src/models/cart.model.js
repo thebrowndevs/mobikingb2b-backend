@@ -36,6 +36,11 @@ export const itemsSchema = new mongoose.Schema({
     purchaseSetId: {
         type: String
     },
+    purchaseSets: [{
+        purchaseSetId: { type: String },
+        quantity: { type: Number },
+        price: { type: Number }
+    }],
     discount: {
         type: Number,
         default: 0

@@ -92,19 +92,25 @@ export const createQuotation = asyncHandler(async (req, res) => {
                 const qty = Math.floor(Number(item.quantity));
                 if (qty <= 0) continue;
 
-                // 1. Locate the Variant
-                const variant = await Variant.findOne({ productId: item.productId._id, name: item.variantName, active: true }).session(session);
-                if (!variant) {
-                    throw new ApiError(404, `Variant "${item.variantName}" not found for product.`);
-                }
+                // 1. Atomically decrement availableStock on the Variant collection
+                const variant = await Variant.findOneAndUpdate(
+                    {
+                        productId: item.productId._id,
+                        name: item.variantName,
+                        active: true,
+                        availableStock: { $gte: qty }
+                    },
+                    {
+                        $inc: { availableStock: -qty }
+                    },
+                    { new: true, session }
+                );
 
-                if (variant.availableStock < qty) {
+                if (!variant) {
                     throw new ApiError(400, `Insufficient available stock for variant "${item.variantName}".`);
                 }
 
-                // Update Variant availableStock
-                const previousAvailableStock = variant.availableStock;
-                variant.availableStock -= qty;
+                const previousAvailableStock = variant.availableStock + qty;
 
                 // FIFO allocation on purchaseSets availableStock
                 let remaining = qty;
@@ -115,12 +121,18 @@ export const createQuotation = asyncHandler(async (req, res) => {
 
                 let selectedSetId = "";
                 let totalCost = 0;
+                const allocatedSets = [];
 
                 for (const itemObj of sortedSets) {
                     const set = variant.purchaseSets[itemObj.idx];
                     const take = Math.min(remaining, set.availableStock);
                     set.availableStock -= take;
                     totalCost += take * set.price;
+                    allocatedSets.push({
+                        purchaseSetId: String(set._id),
+                        quantity: take,
+                        price: set.price
+                    });
                     remaining -= take;
 
                     if (!selectedSetId && take > 0) {
@@ -130,6 +142,17 @@ export const createQuotation = asyncHandler(async (req, res) => {
                     if (remaining === 0) break;
                 }
 
+                if (remaining > 0 && variant.purchaseSets.length > 0) {
+                    variant.purchaseSets[0].availableStock = Math.max(0, variant.purchaseSets[0].availableStock - remaining);
+                    allocatedSets.push({
+                        purchaseSetId: String(variant.purchaseSets[0]._id),
+                        quantity: remaining,
+                        price: variant.purchaseSets[0].price
+                    });
+                    selectedSetId = String(variant.purchaseSets[0]._id);
+                    totalCost += remaining * variant.purchaseSets[0].price;
+                }
+
                 const avgPurchasePrice = qty > 0 ? (totalCost / qty) : 0;
 
                 // Sync the finalized purchase price and set ID on the Quotation items
@@ -137,6 +160,7 @@ export const createQuotation = asyncHandler(async (req, res) => {
                 if (quoteItem) {
                     quoteItem.purchasePrice = avgPurchasePrice;
                     quoteItem.purchaseSetId = selectedSetId;
+                    quoteItem.purchaseSets = allocatedSets;
                     quoteItem.variantId = variant._id;
                     quoteItem.sku = String(variant._id);
                 }
@@ -272,13 +296,24 @@ export const updateQuotationStatus = asyncHandler(async (req, res) => {
                     const qty = Math.floor(Number(item.quantity));
                     if (qty <= 0) continue;
 
-                    const variant = await Variant.findOne({ productId: item.productId, name: item.variantName }).session(session);
-                    if (variant) {
-                        const previousAvailable = variant.availableStock;
-                        variant.availableStock += qty;
+                    const variant = await Variant.findOneAndUpdate(
+                        { _id: item.variantId },
+                        { $inc: { availableStock: qty } },
+                        { new: true, session }
+                    );
 
-                        // Restore availableStock to the specific purchaseSet
-                        if (item.purchaseSetId) {
+                    if (variant) {
+                        const previousAvailable = variant.availableStock - qty;
+
+                        // Restore availableStock to the specific purchaseSets
+                        if (item.purchaseSets && item.purchaseSets.length > 0) {
+                            for (const alloc of item.purchaseSets) {
+                                const set = variant.purchaseSets.id(alloc.purchaseSetId);
+                                if (set) {
+                                    set.availableStock += alloc.quantity;
+                                }
+                            }
+                        } else if (item.purchaseSetId) {
                             const set = variant.purchaseSets.id(item.purchaseSetId);
                             if (set) {
                                 set.availableStock += qty;
@@ -290,6 +325,7 @@ export const updateQuotationStatus = asyncHandler(async (req, res) => {
                         }
 
                         await variant.save({ session });
+                        await syncProductStock(item.productId, session);
 
                         // Update parent product availableStock
                         const parentProduct = await Product.findByIdAndUpdate(
@@ -338,27 +374,42 @@ export const updateQuotationStatus = asyncHandler(async (req, res) => {
                     const qty = Math.floor(Number(item.quantity));
                     if (qty <= 0) continue;
 
-                    const variant = await Variant.findOne({ productId: item.productId, name: item.variantName }).session(session);
-                    if (!variant || variant.availableStock < qty) {
+                    const variant = await Variant.findOneAndUpdate(
+                        {
+                            _id: item.variantId,
+                            availableStock: { $gte: qty }
+                        },
+                        { $inc: { availableStock: -qty } },
+                        { new: true, session }
+                    );
+
+                    if (!variant) {
                         throw new ApiError(400, `Insufficient available stock to re-reserve variant "${item.variantName}".`);
                     }
 
-                    const previousAvailable = variant.availableStock;
-                    variant.availableStock -= qty;
+                    const previousAvailable = variant.availableStock + qty;
 
-                    // Deduct availableStock from specific purchaseSet
-                    if (item.purchaseSetId) {
+                    // Deduct availableStock from specific purchaseSets
+                    if (item.purchaseSets && item.purchaseSets.length > 0) {
+                        for (const alloc of item.purchaseSets) {
+                            const set = variant.purchaseSets.id(alloc.purchaseSetId);
+                            if (set) {
+                                set.availableStock = Math.max(0, set.availableStock - alloc.quantity);
+                            }
+                        }
+                    } else if (item.purchaseSetId) {
                         const set = variant.purchaseSets.id(item.purchaseSetId);
                         if (set) {
-                            set.availableStock -= qty;
+                            set.availableStock = Math.max(0, set.availableStock - qty);
                         } else if (variant.purchaseSets.length > 0) {
-                            variant.purchaseSets[0].availableStock -= qty;
+                            variant.purchaseSets[0].availableStock = Math.max(0, variant.purchaseSets[0].availableStock - qty);
                         }
                     } else if (variant.purchaseSets.length > 0) {
-                        variant.purchaseSets[0].availableStock -= qty;
+                        variant.purchaseSets[0].availableStock = Math.max(0, variant.purchaseSets[0].availableStock - qty);
                     }
 
                     await variant.save({ session });
+                    await syncProductStock(item.productId, session);
 
                     // Deduct parent product availableStock
                     const parentProduct = await Product.findByIdAndUpdate(
@@ -541,42 +592,61 @@ export const bookQuotation = asyncHandler(async (req, res) => {
                 const qty = Math.floor(Number(item.quantity));
                 if (qty <= 0) continue;
 
-                // 1. Fetch Variant
-                const variant = await Variant.findOne({ productId: item.productId, name: item.variantName }).session(session);
+                // 1. Atomically decrement variant stock levels first
+                const updateInc = { totalStock: -qty };
+                if (quotation.reservedStockRestored) {
+                    updateInc.availableStock = -qty;
+                }
+
+                const variant = await Variant.findOneAndUpdate(
+                    { _id: item.variantId },
+                    { $inc: updateInc },
+                    { new: true, session }
+                );
+
                 if (variant) {
-                    const previousAvailable = variant.availableStock;
-                    const previousPhysical = variant.totalStock;
+                    const previousAvailable = variant.availableStock + (quotation.reservedStockRestored ? qty : 0);
+                    const previousPhysical = variant.totalStock + qty;
 
-                    // Deduct from totalStock (physical)
-                    variant.totalStock = Math.max(0, variant.totalStock - qty);
-
-                    // If reserved stock was restored (e.g. from Hold stage), we must also deduct availableStock at booking time
-                    if (quotation.reservedStockRestored) {
-                        variant.availableStock = Math.max(0, variant.availableStock - qty);
+                    // Normalize and check item.purchaseSets for B2B array-based batches
+                    if (!item.purchaseSets || item.purchaseSets.length === 0) {
+                        const fallbackSetId = item.purchaseSetId || (variant.purchaseSets[0] ? String(variant.purchaseSets[0]._id) : "");
+                        item.purchaseSets = [{
+                            purchaseSetId: fallbackSetId,
+                            quantity: qty,
+                            price: item.purchasePrice || (variant.purchaseSets[0]?.price || 0)
+                        }];
+                        item.purchaseSetId = fallbackSetId;
                     }
 
-                    // Deduct remainingStock (physical stock) and optionally availableStock from the purchaseSet
-                    if (item.purchaseSetId) {
-                        const set = variant.purchaseSets.id(item.purchaseSetId);
-                        if (set) {
-                            set.remainingStock = Math.max(0, set.remainingStock - qty);
-                            if (quotation.reservedStockRestored) {
-                                set.availableStock = Math.max(0, set.availableStock - qty);
+                    // Deduct remainingStock and availableStock from variant purchaseSets
+                    for (const alloc of item.purchaseSets) {
+                        if (alloc.purchaseSetId) {
+                            const set = variant.purchaseSets.id(alloc.purchaseSetId);
+                            if (set) {
+                                set.remainingStock = Math.max(0, set.remainingStock - alloc.quantity);
+                                if (quotation.reservedStockRestored) {
+                                    set.availableStock = Math.max(0, set.availableStock - alloc.quantity);
+                                }
                             }
                         } else if (variant.purchaseSets.length > 0) {
-                            variant.purchaseSets[0].remainingStock = Math.max(0, variant.purchaseSets[0].remainingStock - qty);
+                            variant.purchaseSets[0].remainingStock = Math.max(0, variant.purchaseSets[0].remainingStock - alloc.quantity);
                             if (quotation.reservedStockRestored) {
-                                variant.purchaseSets[0].availableStock = Math.max(0, variant.purchaseSets[0].availableStock - qty);
+                                variant.purchaseSets[0].availableStock = Math.max(0, variant.purchaseSets[0].availableStock - alloc.quantity);
                             }
-                        }
-                    } else if (variant.purchaseSets.length > 0) {
-                        variant.purchaseSets[0].remainingStock = Math.max(0, variant.purchaseSets[0].remainingStock - qty);
-                        if (quotation.reservedStockRestored) {
-                            variant.purchaseSets[0].availableStock = Math.max(0, variant.purchaseSets[0].availableStock - qty);
                         }
                     }
 
                     await variant.save({ session });
+
+                    // Sync the finalized purchase details on the Order items
+                    const orderItem = newOrder.items.find(i => String(i.productId) === String(item.productId) && i.variantName === item.variantName);
+                    if (orderItem) {
+                        orderItem.purchasePrice = item.purchasePrice;
+                        orderItem.purchaseSetId = item.purchaseSetId;
+                        orderItem.purchaseSets = item.purchaseSets;
+                        orderItem.appliedSlab = item.appliedSlab;
+                    }
 
                     // Sync parent product and inventory stock levels
                     await syncProductStock(item.productId, session);
@@ -613,6 +683,10 @@ export const bookQuotation = asyncHandler(async (req, res) => {
                     });
                 }
             }
+
+            // Save updated order and quotation items
+            await newOrder.save({ session });
+            await quotation.save({ session });
 
             if (stockEntries.length > 0) {
                 await Stock.insertMany(stockEntries, { session });
@@ -844,10 +918,21 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                     const qty = Math.floor(Number(item.quantity));
                     if (qty <= 0) continue;
 
-                    const variant = await Variant.findOne({ productId: item.productId, name: item.variantName }).session(session);
+                    const variant = await Variant.findOneAndUpdate(
+                        { _id: item.variantId },
+                        { $inc: { availableStock: qty } },
+                        { new: true, session }
+                    );
+
                     if (variant) {
-                        variant.availableStock += qty;
-                        if (item.purchaseSetId) {
+                        if (item.purchaseSets && item.purchaseSets.length > 0) {
+                            for (const alloc of item.purchaseSets) {
+                                const set = variant.purchaseSets.id(alloc.purchaseSetId);
+                                if (set) {
+                                    set.availableStock += alloc.quantity;
+                                }
+                            }
+                        } else if (item.purchaseSetId) {
                             const set = variant.purchaseSets.id(item.purchaseSetId);
                             if (set) {
                                 set.availableStock += qty;
@@ -857,6 +942,7 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                         } else if (variant.purchaseSets.length > 0) {
                             variant.purchaseSets[0].availableStock += qty;
                         }
+
                         await variant.save({ session });
                         await syncProductStock(item.productId, session);
 
@@ -901,23 +987,35 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                     }
 
                     // Locate the Variant
-                    const variant = await Variant.findOne({ productId, name: variantName, active: true }).session(session);
-                    if (!variant) {
-                        throw new ApiError(404, `Active variant "${variantName}" not found for product "${product.fullName}".`);
+                    let variant;
+                    if (!quotation.reservedStockRestored) {
+                        variant = await Variant.findOneAndUpdate(
+                            {
+                                productId,
+                                name: variantName,
+                                active: true,
+                                availableStock: { $gte: qty }
+                            },
+                            { $inc: { availableStock: -qty } },
+                            { new: true, session }
+                        );
+                        if (!variant) {
+                            throw new ApiError(400, `Insufficient available stock for variant "${variantName}" of product "${product.fullName}".`);
+                        }
+                    } else {
+                        variant = await Variant.findOne({ productId, name: variantName, active: true }).session(session);
+                        if (!variant) {
+                            throw new ApiError(404, `Active variant "${variantName}" not found for product "${product.fullName}".`);
+                        }
                     }
 
                     // Check and reserve available stock if not restored
                     let selectedSetId = "";
                     let avgPurchasePrice = 0;
+                    const allocatedSets = [];
 
                     if (!quotation.reservedStockRestored) {
-                        if (variant.availableStock < qty) {
-                            throw new ApiError(400, `Insufficient available stock for variant "${variantName}" of product "${product.fullName}".`);
-                        }
-
-                        // Update Variant availableStock
-                        const previousAvailable = variant.availableStock;
-                        variant.availableStock -= qty;
+                        const previousAvailable = variant.availableStock + qty;
 
                         // FIFO allocation on purchaseSets availableStock
                         let remaining = qty;
@@ -933,6 +1031,11 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                             const take = Math.min(remaining, set.availableStock);
                             set.availableStock -= take;
                             totalCost += take * set.price;
+                            allocatedSets.push({
+                                purchaseSetId: String(set._id),
+                                quantity: take,
+                                price: set.price
+                            });
                             remaining -= take;
 
                             if (!selectedSetId && take > 0) {
@@ -940,6 +1043,17 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                             }
 
                             if (remaining === 0) break;
+                        }
+
+                        if (remaining > 0 && variant.purchaseSets.length > 0) {
+                            variant.purchaseSets[0].availableStock = Math.max(0, variant.purchaseSets[0].availableStock - remaining);
+                            allocatedSets.push({
+                                purchaseSetId: String(variant.purchaseSets[0]._id),
+                                quantity: remaining,
+                                price: variant.purchaseSets[0].price
+                            });
+                            selectedSetId = String(variant.purchaseSets[0]._id);
+                            totalCost += remaining * variant.purchaseSets[0].price;
                         }
 
                         avgPurchasePrice = qty > 0 ? (totalCost / qty) : 0;
@@ -984,6 +1098,11 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                         if (variant.purchaseSets && variant.purchaseSets.length > 0) {
                             avgPurchasePrice = variant.purchaseSets[0].price || 0;
                             selectedSetId = String(variant.purchaseSets[0]._id);
+                            allocatedSets.push({
+                                purchaseSetId: selectedSetId,
+                                quantity: qty,
+                                price: avgPurchasePrice
+                            });
                         }
                     }
 
@@ -994,6 +1113,7 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                         price: 0, // recalculateQuotationTotals will compute this
                         purchasePrice: avgPurchasePrice,
                         purchaseSetId: selectedSetId,
+                        purchaseSets: allocatedSets,
                         variantId: variant._id,
                         sku: String(variant._id),
                         discount: Number(itemDiscount)
@@ -1046,24 +1166,34 @@ export const addItemQuantityInQuotation = asyncHandler(async (req, res) => {
             if (!product) throw new ApiError(404, "Product not found.");
 
             let variant;
-            if (variantId) {
-                variant = await Variant.findById(variantId).session(session);
-            } else if (variantName) {
-                variant = await Variant.findOne({ productId, name: variantName, active: true }).session(session);
+            if (!quotation.reservedStockRestored) {
+                const query = variantId ? { _id: variantId } : { productId, name: variantName, active: true };
+                query.availableStock = { $gte: quantity };
+
+                variant = await Variant.findOneAndUpdate(
+                    query,
+                    { $inc: { availableStock: -quantity } },
+                    { new: true, session }
+                );
+                if (!variant) {
+                    throw new ApiError(400, `Insufficient available stock for variant.`);
+                }
+            } else {
+                if (variantId) {
+                    variant = await Variant.findById(variantId).session(session);
+                } else if (variantName) {
+                    variant = await Variant.findOne({ productId, name: variantName, active: true }).session(session);
+                }
+                if (!variant) throw new ApiError(404, `Active variant not found.`);
             }
-            if (!variant) throw new ApiError(404, `Active variant not found.`);
 
             let selectedSetId = "";
             let avgPurchasePrice = 0;
+            const allocatedSets = [];
 
             // Handle stock reservations if not restored/released
             if (!quotation.reservedStockRestored) {
-                if (variant.availableStock < quantity) {
-                    throw new ApiError(400, `Insufficient available stock for variant "${variant.name}". Requested: ${quantity}, Available: ${variant.availableStock}`);
-                }
-
-                const previousAvailable = variant.availableStock;
-                variant.availableStock -= quantity;
+                const previousAvailable = variant.availableStock + quantity;
 
                 // FIFO allocation
                 let remaining = quantity;
@@ -1078,12 +1208,28 @@ export const addItemQuantityInQuotation = asyncHandler(async (req, res) => {
                     const take = Math.min(remaining, set.availableStock);
                     set.availableStock -= take;
                     totalCost += take * set.price;
+                    allocatedSets.push({
+                        purchaseSetId: String(set._id),
+                        quantity: take,
+                        price: set.price
+                    });
                     remaining -= take;
 
                     if (!selectedSetId && take > 0) {
                         selectedSetId = String(set._id);
                     }
                     if (remaining === 0) break;
+                }
+
+                if (remaining > 0 && variant.purchaseSets.length > 0) {
+                    variant.purchaseSets[0].availableStock = Math.max(0, variant.purchaseSets[0].availableStock - remaining);
+                    allocatedSets.push({
+                        purchaseSetId: String(variant.purchaseSets[0]._id),
+                        quantity: remaining,
+                        price: variant.purchaseSets[0].price
+                    });
+                    selectedSetId = String(variant.purchaseSets[0]._id);
+                    totalCost += remaining * variant.purchaseSets[0].price;
                 }
 
                 avgPurchasePrice = quantity > 0 ? (totalCost / quantity) : 0;
@@ -1129,6 +1275,11 @@ export const addItemQuantityInQuotation = asyncHandler(async (req, res) => {
                 if (variant.purchaseSets && variant.purchaseSets.length > 0) {
                     avgPurchasePrice = variant.purchaseSets[0].price || 0;
                     selectedSetId = String(variant.purchaseSets[0]._id);
+                    allocatedSets.push({
+                        purchaseSetId: selectedSetId,
+                        quantity,
+                        price: avgPurchasePrice
+                    });
                 }
             }
 
@@ -1150,6 +1301,20 @@ export const addItemQuantityInQuotation = asyncHandler(async (req, res) => {
                     const currentPurchasePrice = existingItem.purchasePrice || 0;
                     existingItem.purchasePrice = parseFloat((((currentPurchasePrice * (newTotalQty - quantity)) + (avgPurchasePrice * quantity)) / newTotalQty).toFixed(3)) || 0;
                 }
+
+                // Merge purchaseSets array
+                if (!existingItem.purchaseSets) {
+                    existingItem.purchaseSets = [];
+                }
+                for (const alloc of allocatedSets) {
+                    const matched = existingItem.purchaseSets.find(s => s.purchaseSetId === alloc.purchaseSetId);
+                    if (matched) {
+                        matched.quantity += alloc.quantity;
+                    } else {
+                        existingItem.purchaseSets.push(alloc);
+                    }
+                }
+                existingItem.purchaseSetId = selectedSetId;
             } else {
                 quotation.items.push({
                     productId,
@@ -1158,6 +1323,7 @@ export const addItemQuantityInQuotation = asyncHandler(async (req, res) => {
                     price: 0, // recalculateQuotationTotals will compute this
                     purchasePrice: avgPurchasePrice,
                     purchaseSetId: selectedSetId,
+                    purchaseSets: allocatedSets,
                     variantId: variant._id,
                     sku: String(variant._id),
                     discount: 0
@@ -1228,51 +1394,71 @@ export const removeItemQuantityInQuotation = asyncHandler(async (req, res) => {
 
             // Restore stock reservation if not restored/released
             if (!quotation.reservedStockRestored && variant) {
-                const previousAvailable = variant.availableStock;
-                variant.availableStock += quantity;
+                const variantUpdated = await Variant.findOneAndUpdate(
+                    { _id: variant._id },
+                    { $inc: { availableStock: quantity } },
+                    { new: true, session }
+                );
 
-                // Return back to the purchase set from where it came
-                if (item.purchaseSetId) {
-                    const set = variant.purchaseSets.id(item.purchaseSetId);
-                    if (set) {
-                        set.availableStock += quantity;
-                    } else if (variant.purchaseSets.length > 0) {
-                        variant.purchaseSets[0].availableStock += quantity;
+                if (variantUpdated) {
+                    const previousAvailable = variantUpdated.availableStock - quantity;
+
+                    // Return back to the purchase sets from where it came
+                    if (item.purchaseSets && item.purchaseSets.length > 0) {
+                        let remainingToRestore = quantity;
+                        for (const alloc of item.purchaseSets) {
+                            const take = Math.min(remainingToRestore, alloc.quantity);
+                            const set = variantUpdated.purchaseSets.id(alloc.purchaseSetId);
+                            if (set) {
+                                set.availableStock += take;
+                            }
+                            alloc.quantity -= take;
+                            remainingToRestore -= take;
+                            if (remainingToRestore === 0) break;
+                        }
+                        item.purchaseSets = item.purchaseSets.filter(alloc => alloc.quantity > 0);
+                    } else if (item.purchaseSetId) {
+                        const set = variantUpdated.purchaseSets.id(item.purchaseSetId);
+                        if (set) {
+                            set.availableStock += quantity;
+                        } else if (variantUpdated.purchaseSets.length > 0) {
+                            variantUpdated.purchaseSets[0].availableStock += quantity;
+                        }
+                    } else if (variantUpdated.purchaseSets.length > 0) {
+                        variantUpdated.purchaseSets[0].availableStock += quantity;
                     }
-                } else if (variant.purchaseSets.length > 0) {
-                    variant.purchaseSets[0].availableStock += quantity;
+
+                    await variantUpdated.save({ session });
+                    await syncProductStock(productId, session);
+
+                    const parentProduct = await Product.findById(productId).session(session);
+                    const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+                    // Update Inventory
+                    const inventory = await Inventory.findOne({ product: productId }).session(session);
+                    if (inventory) {
+                        inventory.reservedStock = Math.max(0, inventory.reservedStock - quantity);
+                        await inventory.save({ session });
+                    }
+
+                    // Insert Stock Log
+                    await Stock.create([{
+                        quotationId: quotation.quotationId,
+                        quotationRef: quotation._id,
+                        type: STOCK_TYPES.REMOVE,
+                        category: "virtual",
+                        variantId: variantUpdated._id,
+                        variantName: variantUpdated.name,
+                        purchasePrice: Number(item.purchasePrice) || 0,
+                        quantity,
+                        previousStock: previousAvailable,
+                        updatedStock: variantUpdated.availableStock,
+                        previousPhysicalStock: variantUpdated.totalStock,
+                        updatedPhysicalStock: variantUpdated.totalStock,
+                        totalProductStock: currentTotalProductStock,
+                        productId
+                    }], { session });
                 }
-
-                await variant.save({ session });
-                await syncProductStock(productId, session);
-
-                const parentProduct = await Product.findById(productId).session(session);
-                const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
-
-                // Update Inventory
-                const inventory = await Inventory.findOne({ product: productId }).session(session);
-                if (inventory) {
-                    inventory.reservedStock = Math.max(0, inventory.reservedStock - quantity);
-                    await inventory.save({ session });
-                }
-
-                // Insert Stock Log
-                await Stock.create([{
-                    quotationId: quotation.quotationId,
-                    quotationRef: quotation._id,
-                    type: STOCK_TYPES.REMOVE,
-                    category: "virtual",
-                    variantId: variant._id,
-                    variantName: variant.name,
-                    purchasePrice: Number(item.purchasePrice) || 0,
-                    quantity,
-                    previousStock: previousAvailable,
-                    updatedStock: variant.availableStock,
-                    previousPhysicalStock: variant.totalStock,
-                    updatedPhysicalStock: variant.totalStock,
-                    totalProductStock: currentTotalProductStock,
-                    productId
-                }], { session });
             }
 
             // Update item quantity
