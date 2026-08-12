@@ -34,7 +34,9 @@ const getAppTabGroups = asyncHandler(async (req, res) => {
         return res.status(200).json(new ApiResponse(200, { groups: [], pagination: { totalGroups, page, limit, totalPages: Math.ceil(totalGroups / limit) } }, "Groups fetched successfully (empty page)"));
     }
 
-    const groupsRaw = await Group.find({ _id: { $in: paginatedIds }, active: true }).lean();
+    const groupsRaw = await Group.find({ _id: { $in: paginatedIds }, active: true })
+        .select("name heading groupType placement bannerLink active appBanner isAppBannerVisible appBackgroundColor isAppBgColorVisible products")
+        .lean();
     
     // Sort to match sequence order
     const idStrings = paginatedIds.map(id => id.toString());
@@ -45,14 +47,23 @@ const getAppTabGroups = asyncHandler(async (req, res) => {
             const productIds = group.products || [];
             const [products, totalProducts] = await Promise.all([
                 Product.find({ _id: { $in: productIds }, active: true })
-                    .select("fullName slug images regularPrice basePrice sellingPrice totalStock")
+                    .select("fullName slug images minPrice maxPrice regularPrice basePrice sellingPrice totalStock moq")
                     .limit(6)
                     .lean(),
                 Product.countDocuments({ _id: { $in: productIds }, active: true })
             ]);
 
             return {
-                ...group,
+                _id: group._id,
+                name: group.name,
+                heading: group.heading,
+                groupType: group.groupType,
+                placement: group.placement,
+                bannerLink: group.bannerLink,
+                appBanner: group.appBanner,
+                isAppBannerVisible: group.isAppBannerVisible,
+                appBackgroundColor: group.appBackgroundColor,
+                isAppBgColorVisible: group.isAppBgColorVisible,
                 products,
                 totalProducts
             };
@@ -76,7 +87,9 @@ const getAppGroupProductsPaginated = asyncHandler(async (req, res) => {
     const limit = parseInt(req.query.limit, 10) || 12;
     const skip = (page - 1) * limit;
 
-    const group = await Group.findById(groupId).lean();
+    const group = await Group.findById(groupId)
+        .select("name heading placement active appBanner appBackgroundColor isAppBannerVisible isAppBgColorVisible bannerLink products")
+        .lean();
     if (!group || !group.active) {
         throw new ApiError(404, "Group not found or is inactive");
     }
@@ -91,7 +104,7 @@ const getAppGroupProductsPaginated = asyncHandler(async (req, res) => {
     }
 
     const products = await Product.find({ _id: { $in: paginatedIds }, active: true })
-        .select("fullName slug images regularPrice basePrice sellingPrice totalStock")
+        .select("fullName slug images minPrice maxPrice regularPrice basePrice sellingPrice totalStock moq")
         .lean();
 
     const idStrings = paginatedIds.map(id => id.toString());
@@ -103,9 +116,10 @@ const getAppGroupProductsPaginated = asyncHandler(async (req, res) => {
             name: group.name,
             heading: group.heading,
             placement: group.placement,
-            color: group.color,
-            desktopBanner: group.desktopBanner,
-            mobileBanner: group.mobileBanner,
+            appBanner: group.appBanner,
+            isAppBannerVisible: group.isAppBannerVisible,
+            appBackgroundColor: group.appBackgroundColor,
+            isAppBgColorVisible: group.isAppBgColorVisible,
             bannerLink: group.bannerLink
         },
         products: sortedProducts,
