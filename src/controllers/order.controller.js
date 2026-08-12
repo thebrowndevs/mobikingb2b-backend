@@ -124,8 +124,9 @@ const createPosOrder = asyncHandler(async (req, res) => {
             method,
             paymentMode,
             subtotal,
-            discount,
-            deliveryCharge,
+            discount = 0,
+            discountPercent = 0,
+            deliveryCharge = 0,
             orderAmount,
             comments,
             items
@@ -134,6 +135,22 @@ const createPosOrder = asyncHandler(async (req, res) => {
         if (!userId || !name || !phoneNo || !orderAmount || !items || !method || !paymentMode) {
             throw new ApiError(400, 'Required checkout details not found.');
         }
+
+        // Auto-calculate and sync discount/discountPercent
+        const subtotalFixed = parseFloat((subtotal || 0).toFixed(2));
+        let flatDiscount = Number(discount || 0);
+        let percentDiscount = Number(discountPercent || 0);
+
+        if (percentDiscount > 0 && flatDiscount === 0) {
+            flatDiscount = parseFloat(((subtotalFixed * percentDiscount) / 100).toFixed(2));
+        } else if (flatDiscount > 0 && percentDiscount === 0) {
+            percentDiscount = subtotalFixed > 0 ? parseFloat(((flatDiscount / subtotalFixed) * 100).toFixed(2)) : 0;
+        } else if (flatDiscount > 0 && percentDiscount > 0) {
+            percentDiscount = subtotalFixed > 0 ? parseFloat(((flatDiscount / subtotalFixed) * 100).toFixed(2)) : 0;
+        }
+
+        const deliveryChargeFixed = parseFloat((deliveryCharge || 0).toFixed(2));
+        const finalOrderAmount = parseFloat((Math.max(0, subtotalFixed - flatDiscount) + deliveryChargeFixed).toFixed(2));
 
         let newQuote = new Quotation({
             userId,
@@ -147,10 +164,11 @@ const createPosOrder = asyncHandler(async (req, res) => {
             state,
             country: country || "India",
             pincode,
-            subtotal,
-            discount,
-            deliveryCharge,
-            orderAmount,
+            subtotal: subtotalFixed,
+            discount: parseFloat(flatDiscount.toFixed(2)),
+            discountPercent: parseFloat(percentDiscount.toFixed(2)),
+            deliveryCharge: deliveryChargeFixed,
+            orderAmount: finalOrderAmount,
             method,
             paymentMode,
             status: "New",
@@ -299,6 +317,7 @@ const createManualOrder = asyncHandler(async (req, res) => {
             orderAmount,
             gst,
             discount = 0,
+            discountPercent = 0,
             subtotal,
             method = 'COD',
             items,
@@ -323,6 +342,22 @@ const createManualOrder = asyncHandler(async (req, res) => {
             throw new ApiError(400, 'Required details not found.');
         }
 
+        // Auto-calculate and sync discount/discountPercent
+        const subtotalFixed = parseFloat((subtotal || 0).toFixed(2));
+        let flatDiscount = Number(discount || 0);
+        let percentDiscount = Number(discountPercent || 0);
+
+        if (percentDiscount > 0 && flatDiscount === 0) {
+            flatDiscount = parseFloat(((subtotalFixed * percentDiscount) / 100).toFixed(2));
+        } else if (flatDiscount > 0 && percentDiscount === 0) {
+            percentDiscount = subtotalFixed > 0 ? parseFloat(((flatDiscount / subtotalFixed) * 100).toFixed(2)) : 0;
+        } else if (flatDiscount > 0 && percentDiscount > 0) {
+            percentDiscount = subtotalFixed > 0 ? parseFloat(((flatDiscount / subtotalFixed) * 100).toFixed(2)) : 0;
+        }
+
+        const deliveryChargeFixed = parseFloat((deliveryCharge || 0).toFixed(2));
+        const finalOrderAmount = parseFloat((Math.max(0, subtotalFixed - flatDiscount) + deliveryChargeFixed).toFixed(2));
+
         const paymentDate = (method == "Cash" || method == "Online") ? new Date() : null;
         const newOrderDoc = new Order({
             userId,
@@ -333,17 +368,17 @@ const createManualOrder = asyncHandler(async (req, res) => {
             method,
             type: 'Regular',
             status: 'New',
-            // paymentStatus: method == 'Online' ? 'Paid' : 'Pending',
             orderState: "Confirmed",
             paymentStatus: 'Pending',
             paymentDate,
             orderId: uuidv4().split('-')[0].toUpperCase(),
             items,
-            orderAmount,
-            discount,
+            orderAmount: finalOrderAmount,
+            discount: parseFloat(flatDiscount.toFixed(2)),
+            discountPercent: parseFloat(percentDiscount.toFixed(2)),
             gst,
-            subtotal,
-            deliveryCharge: deliveryCharge || 0,
+            subtotal: subtotalFixed,
+            deliveryCharge: deliveryChargeFixed,
             address: `${address}, ${address2}, ${city}, ${state}, ${pincode}`,
             address: address?.trim(),
             address2: address2?.trim() || 0,

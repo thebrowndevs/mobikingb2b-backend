@@ -83,7 +83,7 @@ Team Mobiking.`;
     }
 
     return res.status(200).json(
-        new ApiResponse(200, { ...response?.data?.Data[0] }, 'OTP sent')
+        new ApiResponse(200, { ...response?.data?.Data[0], newOtp }, 'OTP sent')
     );
 });
 export const sendEmailOtp = asyncHandler(async (req, res) => {
@@ -865,13 +865,13 @@ const createCustomer = asyncHandler(async (req, res) => {
     // return res
 
     let {
-        name, phoneNo,
-    } = req.body
+        name, phoneNo, email, gstNumber, isPos
+    } = req.body;
 
     if (
-        [name, phoneNo].some((field) => field?.trim() === "")
+        !name?.trim() || !phoneNo?.trim()
     ) {
-        throw new ApiError(400, "All fields are required")
+        throw new ApiError(400, "Name and Phone Number are required")
     }
 
     name = name?.trim();
@@ -879,17 +879,34 @@ const createCustomer = asyncHandler(async (req, res) => {
 
     const existedUser = await User.findOne({ phoneNo });
 
-    // console.log(existedUser);
     if (existedUser) {
         throw new ApiError(409, "User with phone number already exists")
     }
 
-    const user = await User.create({
+    const userFields = {
         name,
         phoneNo,
         role: ROLES.USER,
-        email: phoneNo
-    })
+        email: email?.trim() || phoneNo
+    };
+
+    if (isPos || req.body.role === 'user') {
+        // POS or Admin customer creation auto-approves/verifies business details
+        userFields.business = {
+            active: true,
+            verified: true,
+            businessName: name,
+            businessEmail: email?.trim() || "",
+            businessPhone: phoneNo,
+            gstNumber: gstNumber?.trim() || "",
+            isApproved: true,
+            gstVerified: !!gstNumber?.trim(),
+            approvedBy: req.user?._id || null,
+            approvedAt: new Date()
+        };
+    }
+
+    const user = await User.create(userFields);
 
     if (!user) {
         throw new ApiError(500, "Something went wrong while registering the user")

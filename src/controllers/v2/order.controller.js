@@ -235,7 +235,9 @@ const createPosOrder = asyncHandler(async (req, res) => {
             orderAmount,
             gst,
             comments,
-            discount,
+            discount = 0,
+            discountPercent = 0,
+            deliveryCharge = 0,
             subtotal,
             method = 'Cash',
             items
@@ -249,6 +251,22 @@ const createPosOrder = asyncHandler(async (req, res) => {
         ) {
             throw new ApiError(400, 'Required details not found.');
         }
+
+        // Auto-calculate and sync discount/discountPercent
+        const subtotalFixed = parseFloat((subtotal || 0).toFixed(2));
+        let flatDiscount = Number(discount || 0);
+        let percentDiscount = Number(discountPercent || 0);
+
+        if (percentDiscount > 0 && flatDiscount === 0) {
+            flatDiscount = parseFloat(((subtotalFixed * percentDiscount) / 100).toFixed(2));
+        } else if (flatDiscount > 0 && percentDiscount === 0) {
+            percentDiscount = subtotalFixed > 0 ? parseFloat(((flatDiscount / subtotalFixed) * 100).toFixed(2)) : 0;
+        } else if (flatDiscount > 0 && percentDiscount > 0) {
+            percentDiscount = subtotalFixed > 0 ? parseFloat(((flatDiscount / subtotalFixed) * 100).toFixed(2)) : 0;
+        }
+
+        const deliveryChargeFixed = parseFloat((deliveryCharge || 0).toFixed(2));
+        const finalOrderAmount = parseFloat((Math.max(0, subtotalFixed - flatDiscount) + deliveryChargeFixed).toFixed(2));
 
         const nowIso = new Date().toISOString();
         const paymentDate = (method == "Cash" || method == "Online") ? new Date() : null;
@@ -264,10 +282,12 @@ const createPosOrder = asyncHandler(async (req, res) => {
             paymentStatus: method == 'Online' ? 'Pending' : 'Paid',
             paymentDate,
             orderId: uuidv4().split('-')[0].toUpperCase(),
-            orderAmount,
-            discount,
+            orderAmount: finalOrderAmount,
+            discount: parseFloat(flatDiscount.toFixed(2)),
+            discountPercent: parseFloat(percentDiscount.toFixed(2)),
+            deliveryCharge: deliveryChargeFixed,
             gst,
-            subtotal,
+            subtotal: subtotalFixed,
             items,
             comments
         });
@@ -336,7 +356,7 @@ const createPosOrder = asyncHandler(async (req, res) => {
                     });
                 } else {
                     const variant = await Variant.findOneAndUpdate(
-                        { 
+                        {
                             _id: item.variantId,
                             availableStock: { $gte: qty },
                             totalStock: { $gte: qty }

@@ -31,6 +31,7 @@ export const createQuotation = asyncHandler(async (req, res) => {
             coupon,
             subtotal,
             discount = 0,
+            discountPercent = 0,
             deliveryCharge = 0,
             orderAmount
         } = req.body;
@@ -73,6 +74,7 @@ export const createQuotation = asyncHandler(async (req, res) => {
             coupon,
             subtotal,
             discount,
+            discountPercent,
             deliveryCharge,
             orderAmount,
             status: "New",
@@ -789,7 +791,7 @@ const determineSlabForQuantity = (product, quantity) => {
     return { quantity: matchedSlab.quantity, price: matchedSlab.price };
 };
 
-const recalculateQuotationTotals = async (quotation, session) => {
+const recalculateQuotationTotals = async (quotation, session, keepReceivedPrices = false, keepDeliveryCharge = false) => {
     let subtotal = 0;
     const categoryCharges = new Map();
 
@@ -814,19 +816,43 @@ const recalculateQuotationTotals = async (quotation, session) => {
         const totalProductQty = productQuantities.get(item.productId.toString()) || item.quantity;
         const matchedSlab = determineSlabForQuantity(product, totalProductQty);
 
+        let basePrice = 0;
         if (matchedSlab) {
             const currentAppliedSlabQty = item.appliedSlab ? item.appliedSlab.quantity : null;
-
-            if (currentAppliedSlabQty === matchedSlab.quantity && item.price !== undefined) {
-                const basePrice = item.appliedSlab.price;
-                item.price = Math.max(0, basePrice - (item.discount || 0));
+            if (currentAppliedSlabQty === matchedSlab.quantity && item.appliedSlab.price !== undefined) {
+                basePrice = item.appliedSlab.price;
             } else {
                 item.appliedSlab = {
                     quantity: matchedSlab.quantity,
                     price: matchedSlab.price
                 };
-                item.price = Math.max(0, matchedSlab.price - (item.discount || 0));
+                basePrice = matchedSlab.price;
             }
+        } else {
+            basePrice = item.appliedSlab ? item.appliedSlab.price : (product.sellingPrice?.slabs?.[0]?.price || product.basePrice || 0);
+        }
+
+        // Sync item discount and discountPercent
+        let itemFlat = Number(item.discount || 0);
+        let itemPercent = Number(item.discountPercent || 0);
+
+        if (basePrice > 0) {
+            if (itemPercent > 0 && itemFlat === 0) {
+                itemFlat = parseFloat(((basePrice * itemPercent) / 100).toFixed(2));
+            } else if (itemFlat > 0 && itemPercent === 0) {
+                itemPercent = parseFloat(((itemFlat / basePrice) * 100).toFixed(2));
+            } else if (itemFlat > 0 && itemPercent > 0) {
+                itemPercent = parseFloat(((itemFlat / basePrice) * 100).toFixed(2));
+            }
+        }
+
+        item.discount = parseFloat(itemFlat.toFixed(2));
+        item.discountPercent = parseFloat(itemPercent.toFixed(2));
+
+        if (keepReceivedPrices && item.price !== undefined && item.price !== null && item.price > 0 && itemFlat === 0 && itemPercent === 0) {
+            // Keep the per-item price same as received if no discount update is requested
+        } else {
+            item.price = Math.max(0, basePrice - item.discount);
         }
 
         subtotal += item.price * item.quantity;
@@ -841,12 +867,32 @@ const recalculateQuotationTotals = async (quotation, session) => {
         }
     }
 
-    const values = Array.from(categoryCharges.values());
-    const totalDeliveryCharge = Math.max(...values, 0);
+    if (!keepDeliveryCharge) {
+        const values = Array.from(categoryCharges.values());
+        const totalDeliveryCharge = Math.max(...values, 0);
+        quotation.deliveryCharge = parseFloat(totalDeliveryCharge.toFixed(2));
+    } else {
+        quotation.deliveryCharge = parseFloat((quotation.deliveryCharge || 0).toFixed(2));
+    }
 
-    quotation.subtotal = subtotal;
-    quotation.deliveryCharge = totalDeliveryCharge;
-    quotation.orderAmount = Math.max(0, subtotal + totalDeliveryCharge - (quotation.discount || 0));
+    const subtotalFixed = parseFloat(subtotal.toFixed(2));
+    quotation.subtotal = subtotalFixed;
+
+    // Auto-sync discount and discountPercent
+    let flatDiscount = Number(quotation.discount || 0);
+    let percentDiscount = Number(quotation.discountPercent || 0);
+
+    if (percentDiscount > 0 && flatDiscount === 0) {
+        flatDiscount = parseFloat(((subtotalFixed * percentDiscount) / 100).toFixed(2));
+    } else if (flatDiscount > 0 && percentDiscount === 0) {
+        percentDiscount = subtotalFixed > 0 ? parseFloat(((flatDiscount / subtotalFixed) * 100).toFixed(2)) : 0;
+    } else if (flatDiscount > 0 && percentDiscount > 0) {
+        percentDiscount = subtotalFixed > 0 ? parseFloat(((flatDiscount / subtotalFixed) * 100).toFixed(2)) : 0;
+    }
+
+    quotation.discount = parseFloat(flatDiscount.toFixed(2));
+    quotation.discountPercent = parseFloat(percentDiscount.toFixed(2));
+    quotation.orderAmount = parseFloat((Math.max(0, subtotalFixed - quotation.discount) + quotation.deliveryCharge).toFixed(2));
 };
 
 const calculateB2BItemPrice = (product, quantity) => {
@@ -886,6 +932,7 @@ export const updateQuotation = asyncHandler(async (req, res) => {
             items, // Array of { productId, variantName, quantity, discount }
             deliveryCharge,
             discount,
+            discountPercent,
             comments,
             name,
             email,
@@ -962,7 +1009,18 @@ export const updateQuotation = asyncHandler(async (req, res) => {
             if (phoneNo !== undefined) quotation.phoneNo = phoneNo.trim();
             if (comments !== undefined) quotation.comments = comments;
             if (deliveryCharge !== undefined) quotation.deliveryCharge = Number(deliveryCharge);
-            if (discount !== undefined) quotation.discount = Number(discount);
+            if (discount !== undefined) {
+                quotation.discount = Number(discount);
+                if (discountPercent === undefined) {
+                    quotation.discountPercent = 0;
+                }
+            }
+            if (discountPercent !== undefined) {
+                quotation.discountPercent = Number(discountPercent);
+                if (discount === undefined) {
+                    quotation.discount = 0;
+                }
+            }
             if (address !== undefined) quotation.address = address;
             if (address2 !== undefined) quotation.address2 = address2;
             if (city !== undefined) quotation.city = city;
@@ -976,7 +1034,7 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                 const stockEntries = [];
 
                 for (const updatedItem of items) {
-                    const { productId, variantName, quantity, discount: itemDiscount = 0 } = updatedItem;
+                    const { productId, variantName, quantity, price, discount: itemDiscount = 0, discountPercent: itemDiscountPercent = 0 } = updatedItem;
                     const qty = Math.floor(Number(quantity));
                     if (qty <= 0) continue;
 
@@ -1106,17 +1164,21 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                         }
                     }
 
+                    const oldItem = quotation.items.find(it => it.productId.toString() === productId.toString() && it.variantName === variantName);
+                    const finalPrice = price !== undefined && price !== null ? Number(price) : (oldItem ? oldItem.price : 0);
+
                     newItems.push({
                         productId,
                         variantName,
                         quantity: qty,
-                        price: 0, // recalculateQuotationTotals will compute this
+                        price: finalPrice,
                         purchasePrice: avgPurchasePrice,
                         purchaseSetId: selectedSetId,
                         purchaseSets: allocatedSets,
                         variantId: variant._id,
                         sku: String(variant._id),
-                        discount: Number(itemDiscount)
+                        discount: Number(itemDiscount),
+                        discountPercent: Number(itemDiscountPercent)
                     });
                 }
 
@@ -1127,7 +1189,7 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                 }
             }
 
-            await recalculateQuotationTotals(quotation, session);
+            await recalculateQuotationTotals(quotation, session, true, deliveryCharge !== undefined);
             await quotation.save({ session });
         });
 
@@ -1331,7 +1393,7 @@ export const addItemQuantityInQuotation = asyncHandler(async (req, res) => {
             }
 
             // Recalculate totals
-            await recalculateQuotationTotals(quotation, session);
+            await recalculateQuotationTotals(quotation, session, true);
 
             updatedQuotation = await quotation.save({ session });
         });
@@ -1468,7 +1530,7 @@ export const removeItemQuantityInQuotation = asyncHandler(async (req, res) => {
             }
 
             // Recalculate totals
-            await recalculateQuotationTotals(quotation, session);
+            await recalculateQuotationTotals(quotation, session, true);
 
             updatedQuotation = await quotation.save({ session });
         });
