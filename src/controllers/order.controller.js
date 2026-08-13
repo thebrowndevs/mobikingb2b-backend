@@ -5,6 +5,7 @@ import crypto from 'crypto';
 import { v4 as uuidv4 } from "uuid";
 import { Order } from "../models/order.model.js";
 import { Payment } from "../models/payment.model.js";
+import { ActivityLog } from "../models/activity_log.model.js";
 import { Cart } from "../models/cart.model.js";
 import { Product } from '../models/product.model.js';   // <-- import Product
 import { Quotation } from '../models/quotation.model.js';
@@ -27,6 +28,8 @@ import { STOCK_TYPES, ORDER_TYPES } from '../constants.js';
 import { initiateRazorpayPaymentLink } from '../services/razorpay.service.js';
 import { initiatePhonepePaymentLink } from '../services/phonepe.service.js';
 import { CompanyDetails } from '../models/company_details.model.js';
+import { recalculateOrderTotals, syncItemDiscount, determineSlabForQuantity } from '../utils/pricing.js';
+import { logActivity } from "../utils/activityLogger.js";
 
 const razorpayConfig = () => {
     const razorpay = new Razorpay({
@@ -241,7 +244,7 @@ const createPosOrder = asyncHandler(async (req, res) => {
                     category: "virtual",
                     variantId: variant._id,
                     variantName: variant.name,
-                    purchasePrice: item.price,
+                    purchasePrice: item.purchasePrice || 0,
                     quantity: qty,
                     previousStock: variant.availableStock + qty,
                     updatedStock: variant.availableStock,
@@ -406,28 +409,47 @@ const createManualOrder = asyncHandler(async (req, res) => {
                     throw new ApiError(400, `Missing variantName for product ${item.productId}`);
                 }
 
-                // ✅ Single findOneAndUpdate — atomic decrement + post-update values in one op
-                const afterDecrement = await Product.findOneAndUpdate(
+                const variantResult = await Variant.findOneAndUpdate(
                     {
-                        _id: item.productId,
+                        productId: item.productId,
+                        name: variantKey,
+                        active: true,
                         totalStock: { $gte: qty },
-                        [`variants.${variantKey}`]: { $gte: qty }
+                        availableStock: { $gte: qty }
                     },
                     {
                         $inc: {
                             totalStock: -qty,
-                            [`variants.${variantKey}`]: -qty
+                            availableStock: -qty
                         }
                     },
                     { new: true, session }
-                ).select("variants totalStock");
+                );
 
-                if (!afterDecrement) {
+                if (!variantResult) {
                     throw new ApiError(400, `Insufficient stock or variant "${variantKey}" not found`);
                 }
 
-                // ✅ Accurate — derived from actual post-decrement DB values
-                const updatedStock = afterDecrement.variants.get(variantKey);
+                const productResult = await Product.findOneAndUpdate(
+                    {
+                        _id: item.productId,
+                        totalStock: { $gte: qty },
+                        availableStock: { $gte: qty }
+                    },
+                    {
+                        $inc: {
+                            totalStock: -qty,
+                            availableStock: -qty
+                        }
+                    },
+                    { new: true, session }
+                );
+
+                if (!productResult) {
+                    throw new ApiError(400, `Insufficient stock or parent product "${item.productId}" not found`);
+                }
+
+                const updatedStock = variantResult.totalStock;
                 const previousStock = updatedStock + qty;
 
                 stockEntries.push({
@@ -435,7 +457,7 @@ const createManualOrder = asyncHandler(async (req, res) => {
                     orderRef: newOrderDoc._id,
                     type: STOCK_TYPES.PURCHASE,
                     variantName: variantKey,
-                    purchasePrice: item.price,
+                    purchasePrice: item.purchasePrice || 0,
                     quantity: qty,
                     previousStock,
                     updatedStock,
@@ -715,7 +737,7 @@ const createCodOrder = asyncHandler(async (req, res) => {
                 throw new ApiError(400, `Product or category missing for ${item.productId}`);
             }
 
-            subtotal_amount += item.price * item.quantity;
+            subtotal_amount += (item.price - (item.discount || 0)) * item.quantity;
 
             const categoryId = prod.category._id.toString();
             const deliveryCharge = prod.category.deliveryCharge || 0;
@@ -792,28 +814,47 @@ const createCodOrder = asyncHandler(async (req, res) => {
                     throw new ApiError(400, `Missing variantName for product ${productId}`);
                 }
 
-                // ✅ findOneAndUpdate with new:true → one round trip, no separate read needed
-                const afterDecrement = await Product.findOneAndUpdate(
+                const variantResult = await Variant.findOneAndUpdate(
                     {
-                        _id: productId,
+                        productId: productId,
+                        name: requestedVariant,
+                        active: true,
                         totalStock: { $gte: qty },
-                        [`variants.${requestedVariant}`]: { $gte: qty }
+                        availableStock: { $gte: qty }
                     },
                     {
                         $inc: {
                             totalStock: -qty,
-                            [`variants.${requestedVariant}`]: -qty
+                            availableStock: -qty
                         }
                     },
                     { new: true, session }
-                ).select("variants totalStock");
+                );
 
-                if (!afterDecrement) {
+                if (!variantResult) {
                     throw new ApiError(400, `Insufficient stock or variant "${requestedVariant}" not found`);
                 }
 
-                // ✅ Derive from actual post-decrement DB values
-                const updatedStock = afterDecrement.variants.get(requestedVariant);
+                const productResult = await Product.findOneAndUpdate(
+                    {
+                        _id: productId,
+                        totalStock: { $gte: qty },
+                        availableStock: { $gte: qty }
+                    },
+                    {
+                        $inc: {
+                            totalStock: -qty,
+                            availableStock: -qty
+                        }
+                    },
+                    { new: true, session }
+                );
+
+                if (!productResult) {
+                    throw new ApiError(400, `Insufficient stock or parent product "${productId}" not found`);
+                }
+
+                const updatedStock = variantResult.totalStock;
                 const previousStock = updatedStock + qty;
 
                 stockEntries.push({
@@ -821,7 +862,7 @@ const createCodOrder = asyncHandler(async (req, res) => {
                     orderRef: newOrderDoc._id,
                     type: STOCK_TYPES.PURCHASE,
                     variantName: requestedVariant,
-                    purchasePrice: it.price,
+                    purchasePrice: it.purchasePrice || 0,
                     quantity: qty,
                     previousStock,
                     updatedStock,
@@ -1375,7 +1416,7 @@ const createOnlineOrder = asyncHandler(async (req, res) => {
             //     );
             // }
 
-            subtotal_amount += item.price * item.quantity;
+            subtotal_amount += (item.price - (item.discount || 0)) * item.quantity;
 
             const categoryId = prod.category._id.toString();
             const deliveryCharge = prod.category.deliveryCharge || 0;
@@ -1436,29 +1477,53 @@ const createOnlineOrder = asyncHandler(async (req, res) => {
 
                 const variantKey = String(item.variantName || "").trim();
 
-                const afterDecrement = await Product.findOneAndUpdate(
+                const variantResult = await Variant.findOneAndUpdate(
                     {
-                        _id: item.productId._id,
+                        productId: item.productId._id,
+                        name: variantKey,
+                        active: true,
                         totalStock: { $gte: qty },
-                        [`variants.${variantKey}`]: { $gte: qty }
+                        availableStock: { $gte: qty }
                     },
                     {
                         $inc: {
                             totalStock: -qty,
-                            [`variants.${variantKey}`]: -qty
+                            availableStock: -qty
                         }
                     },
                     { new: true, session }
-                ).select("variants totalStock");
+                );
 
-                if (!afterDecrement) {
+                if (!variantResult) {
                     throw new ApiError(
                         409,
                         `Insufficient stock for variant ${variantKey}`
                     );
                 }
 
-                const updatedStock = afterDecrement.variants.get(variantKey);
+                const productResult = await Product.findOneAndUpdate(
+                    {
+                        _id: item.productId._id,
+                        totalStock: { $gte: qty },
+                        availableStock: { $gte: qty }
+                    },
+                    {
+                        $inc: {
+                            totalStock: -qty,
+                            availableStock: -qty
+                        }
+                    },
+                    { new: true, session }
+                );
+
+                if (!productResult) {
+                    throw new ApiError(
+                        409,
+                        `Insufficient stock for parent product of variant ${variantKey}`
+                    );
+                }
+
+                const updatedStock = variantResult.totalStock;
                 const previousStock = updatedStock + qty;
 
                 stockEntries.push({
@@ -1466,7 +1531,7 @@ const createOnlineOrder = asyncHandler(async (req, res) => {
                     orderId: newOrder.orderId,
                     orderRef: newOrder?._id,
                     variantName: variantKey,
-                    purchasePrice: item.price,
+                    purchasePrice: item.purchasePrice || 0,
                     quantity: qty,
                     previousStock,
                     updatedStock,
@@ -2337,75 +2402,331 @@ const reviewOrder = asyncHandler(async (req, res) => {
     }
 });
 
+const calculateB2BItemPrice = (product, quantity) => {
+    if (!product.sellingPrice) return 0;
+    if (product.sellingPrice.type === "fixed") {
+        if (product.sellingPrice.slabs && product.sellingPrice.slabs.length > 0) {
+            return product.sellingPrice.slabs[0].price;
+        }
+        return product.basePrice || 0;
+    }
+
+    const slabs = product.sellingPrice.slabs || [];
+    if (slabs.length === 0) return product.basePrice || 0;
+
+    const sortedSlabs = [...slabs].sort((a, b) => a.quantity - b.quantity);
+
+    let matchedPrice = sortedSlabs[0].price;
+    for (const slab of sortedSlabs) {
+        if (quantity >= slab.quantity) {
+            matchedPrice = slab.price;
+        } else {
+            break;
+        }
+    }
+    return matchedPrice;
+};
+
+
+
 const updateOrder = asyncHandler(async (req, res) => {
+    const session = await mongoose.startSession();
     try {
         const orderId = req?.params?._id;
         const updates = req?.body;
 
-        if (
-            !orderId
-        ) {
+        if (!orderId) {
             throw new ApiError(400, 'Order Id not found.');
         }
 
-        const foundOrder = await Order.findById(orderId);
-        if (!foundOrder) {
-            throw new ApiError(400, 'Order not found.');
+        const order = await Order.findById(orderId);
+        if (!order) {
+            throw new ApiError(404, 'Order not found.');
         }
 
-        if (foundOrder?.shipmentId && foundOrder?.shippingType !== 'Manual') {
-            throw new ApiError(409, 'Order is created at shiprocket');
+        // If trying to update items/discounts/charges, validate editing timeframe constraints
+        const isEditingItems = updates && (updates.items !== undefined || updates.discount !== undefined || updates.discountPercent !== undefined || updates.discountType !== undefined || updates.deliveryCharge !== undefined);
+
+        if (isEditingItems) {
+            const canEdit = () => {
+                if (order.shippingType === 'Manual') {
+                    return !['Shipped', 'Delivered', 'Cancelled', 'Rejected', 'Returned'].includes(order.status);
+                } else {
+                    return !order.awbCode && !order.shipmentId && !order.pickupScheduled && !order.courierName && !['Shipped', 'Delivered', 'Cancelled', 'Rejected', 'Returned'].includes(order.status);
+                }
+            };
+            if (!canEdit()) {
+                throw new ApiError(400, "Order cannot be edited at this stage.");
+            }
         }
 
-        const updateData = { ...updates };
-        if (updates?.status === 'Accepted' && !foundOrder?.acceptedAt) {
-            updateData.acceptedAt = new Date();
-            updateData.acceptedReason = updates?.reason || "";
-        }
+        await session.withTransaction(async () => {
+            if (isEditingItems && updates.items) {
+                // Map existing items
+                const oldItemsMap = new Map();
+                for (const item of order.items) {
+                    const key = `${item.productId.toString()}_${item.variantName}`;
+                    oldItemsMap.set(key, item.quantity);
+                }
 
-        const updatedOrder = await Order.findByIdAndUpdate(
-            orderId,
-            updateData,
-            { new: true }
-        );
+                const newItems = [];
+                const stockEntries = [];
 
-        return res.status(201).json(
-            new ApiResponse(201, { updatedOrder }, "Order updated Successfully")
-        );
+                for (const reqItem of updates.items) {
+                    const productId = reqItem.productId;
+                    const variantName = reqItem.variantName;
+                    const qty = Math.floor(Number(reqItem.quantity || 0));
+                    const itemDiscount = Number(reqItem.discount || 0);
+                    const itemDiscountPercent = Number(reqItem.discountPercent || 0);
+
+                    if (qty <= 0) continue;
+
+                    const key = `${productId.toString()}_${variantName}`;
+                    const oldQty = oldItemsMap.get(key) || 0;
+                    const diff = qty - oldQty;
+
+                    const product = await Product.findById(productId).session(session);
+                    if (!product) throw new ApiError(404, `Product not found for ID: ${productId}`);
+
+                    // Adjust stock if quantity changed
+                    if (diff > 0) {
+                        const variantResult = await Variant.findOneAndUpdate(
+                            {
+                                productId: productId,
+                                name: variantName,
+                                active: true,
+                                totalStock: { $gte: diff },
+                                availableStock: { $gte: diff }
+                            },
+                            {
+                                $inc: {
+                                    totalStock: -diff,
+                                    availableStock: -diff
+                                }
+                            },
+                            { new: true, session }
+                        );
+
+                        if (!variantResult) {
+                            throw new ApiError(400, `Insufficient stock for product ${product.fullName} variant ${variantName}`);
+                        }
+
+                        const productResult = await Product.findOneAndUpdate(
+                            {
+                                _id: productId,
+                                totalStock: { $gte: diff },
+                                availableStock: { $gte: diff }
+                            },
+                            {
+                                $inc: {
+                                    totalStock: -diff,
+                                    availableStock: -diff
+                                }
+                            },
+                            { new: true, session }
+                        );
+
+                        if (!productResult) {
+                            throw new ApiError(400, `Failed to update parent stock for product ${product.fullName}`);
+                        }
+
+                        const updatedStock = variantResult.totalStock;
+                        const previousStock = updatedStock + diff;
+
+                        stockEntries.push({
+                            orderId: order.orderId,
+                            orderRef: order._id,
+                            type: STOCK_TYPES.PURCHASE,
+                            variantName,
+                            quantity: diff,
+                            previousStock,
+                            updatedStock,
+                            productId
+                        });
+                    } else if (diff < 0) {
+                        const restoreQty = -diff;
+                        const variantResult = await Variant.findOneAndUpdate(
+                            {
+                                productId: productId,
+                                name: variantName
+                            },
+                            {
+                                $inc: {
+                                    totalStock: restoreQty,
+                                    availableStock: restoreQty
+                                }
+                            },
+                            { new: true, session }
+                        );
+
+                        if (!variantResult) {
+                            throw new ApiError(400, `Failed to restore variant stock for product ${product.fullName}`);
+                        }
+
+                        const productResult = await Product.findOneAndUpdate(
+                            { _id: productId },
+                            {
+                                $inc: {
+                                    totalStock: restoreQty,
+                                    availableStock: restoreQty
+                                }
+                            },
+                            { new: true, session }
+                        );
+
+                        if (!productResult) {
+                            throw new ApiError(400, `Failed to restore parent product stock for ${product.fullName}`);
+                        }
+
+                        const updatedStock = variantResult.totalStock;
+                        const previousStock = updatedStock - restoreQty;
+
+                        stockEntries.push({
+                            orderId: order.orderId,
+                            orderRef: order._id,
+                            type: STOCK_TYPES.ADD,
+                            variantName,
+                            quantity: restoreQty,
+                            previousStock,
+                            updatedStock,
+                            productId
+                        });
+                    }
+
+                    // Price logic:
+                    // If it already existed in the order, keep the old item.price.
+                    // Otherwise, fetch slab price.
+                    const existingItem = order.items.find(
+                        it => it.productId.toString() === productId.toString() && it.variantName === variantName
+                    );
+
+                    let finalPrice = existingItem ? existingItem.price : calculateB2BItemPrice(product, qty);
+
+                    // If they passed a custom price from frontend, we can apply it.
+                    if (reqItem.price !== undefined && reqItem.price !== null) {
+                        finalPrice = Number(reqItem.price);
+                    }
+
+                    newItems.push({
+                        productId,
+                        variantName,
+                        quantity: qty,
+                        price: finalPrice,
+                        discount: itemDiscount,
+                        discountPercent: itemDiscountPercent
+                    });
+
+                    // Remove processed item from map so we know what was completely deleted
+                    oldItemsMap.delete(key);
+                }
+
+                // Any remaining items in oldItemsMap were completely removed
+                for (const [key, oldQty] of oldItemsMap.entries()) {
+                    const [productId, variantName] = key.split("_");
+                    const product = await Product.findById(productId).session(session);
+
+                    const variantResult = await Variant.findOneAndUpdate(
+                        {
+                            productId: productId,
+                            name: variantName
+                        },
+                        {
+                            $inc: {
+                                totalStock: oldQty,
+                                availableStock: oldQty
+                            }
+                        },
+                        { new: true, session }
+                    );
+
+                    const productResult = await Product.findOneAndUpdate(
+                        { _id: productId },
+                        {
+                            $inc: {
+                                totalStock: oldQty,
+                                availableStock: oldQty
+                            }
+                        },
+                        { new: true, session }
+                    );
+
+                    if (variantResult) {
+                        const updatedStock = variantResult.totalStock;
+                        const previousStock = updatedStock - oldQty;
+
+                        stockEntries.push({
+                            orderId: order.orderId,
+                            orderRef: order._id,
+                            type: STOCK_TYPES.ADD,
+                            variantName,
+                            quantity: oldQty,
+                            previousStock,
+                            updatedStock,
+                            productId
+                        });
+                    }
+                }
+
+                if (stockEntries.length > 0) {
+                    await Stock.insertMany(stockEntries, { session });
+                }
+
+                order.items = newItems;
+            }
+
+            // Apply other fields
+            if (updates.discount !== undefined) order.discount = Number(updates.discount);
+            if (updates.discountPercent !== undefined) order.discountPercent = Number(updates.discountPercent);
+            if (updates.discountType !== undefined) order.discountType = updates.discountType;
+            if (updates.deliveryCharge !== undefined) order.deliveryCharge = Number(updates.deliveryCharge);
+            if (updates.comments !== undefined) order.comments = updates.comments;
+            if (updates.reason !== undefined) order.reason = updates.reason;
+            if (updates.status !== undefined && updates.status !== order.status) {
+                order.status = updates.status;
+                if (updates.status === 'Accepted' && !order.acceptedAt) {
+                    order.acceptedAt = new Date();
+                    order.acceptedReason = updates.reason || "";
+                }
+            }
+
+            // Recalculate totals
+            if (updates.items !== undefined) {
+                await recalculateOrderTotals(order, session, updates.deliveryCharge !== undefined);
+            } else {
+                if (updates.orderAmount !== undefined) {
+                    order.orderAmount = Number(updates.orderAmount);
+                    order.remainingAmount = Math.max(0, order.orderAmount - (order.amountPaid || 0));
+                    if (order.remainingAmount <= 0) {
+                        order.paymentStatus = "Paid";
+                        order.paymentDate = new Date();
+                    } else {
+                        order.paymentStatus = "Pending";
+                    }
+                }
+            }
+            await order.save({ session });
+
+            if (isEditingItems) {
+                await logActivity({
+                    orderId: order._id,
+                    action: "Items Edited",
+                    remarks: "Order items, quantities, or discounts updated by admin.",
+                    req,
+                    session
+                });
+            }
+        });
+
+        const updatedOrder = await Order.findById(orderId).populate("items.productId");
+        return res.status(201).json(new ApiResponse(201, { updatedOrder }, "Order updated successfully"));
 
     } catch (err) {
         console.error('Error updating order:', err.message);
-        return res.status(500).json({ message: err.message || 'Internal server error' });
+        throw err;
+    } finally {
+        session.endSession();
     }
 });
-
-async function recalculateOrderTotals(order, session) {
-    let subtotal = 0;
-    const categoryCharges = new Map();
-
-    for (const item of order.items) {
-        const p = await Product.findById(item.productId)
-            .session(session)
-            .populate("category");
-
-        subtotal += item.price * item.quantity;
-
-        const categoryId = p.category._id.toString();
-        const deliveryCharge = p.category.deliveryCharge || 0;
-
-        if (deliveryCharge > 0 && !categoryCharges.has(categoryId)) {
-            categoryCharges.set(categoryId, deliveryCharge);
-        }
-    }
-
-    const values = Array.from(categoryCharges.values());
-    const totalDeliveryCharge = Math.max(...values, 0);
-
-    order.subtotal = subtotal;
-    order.deliveryCharge = totalDeliveryCharge;
-    order.orderAmount =
-        subtotal - (order.discount || 0) + totalDeliveryCharge;
-}
 
 const addItemQuantityInOrder = async (req, res) => {
     const session = await mongoose.startSession();
@@ -2426,7 +2747,7 @@ const addItemQuantityInOrder = async (req, res) => {
 
             const product = await Product.findById(productId)
                 .session(session)
-                .select("variants totalStock fullName sellingPrice");
+                .select("variants totalStock fullName sellingPrice basePrice");
 
             if (!product) throw new ApiError(404, "Product not found");
 
@@ -2480,10 +2801,13 @@ const addItemQuantityInOrder = async (req, res) => {
             if (existingItem) {
                 existingItem.quantity += quantity;
             } else {
+                const matchedSlab = determineSlabForQuantity(product, quantity);
+                const itemPrice = matchedSlab ? matchedSlab.price : (product.basePrice || 0);
+
                 order.items.push({
                     productId,
                     name: product.fullName,
-                    price: product.sellingPrice.at(-1)?.price || 0,
+                    price: itemPrice,
                     variantName,
                     quantity
                 });
@@ -3153,6 +3477,13 @@ const acceptOrder = asyncHandler(async (req, res, next) => {
             .populate('addressId')
             .exec();
 
+        await logActivity({
+            orderId: updatedOrder._id,
+            action: "Accepted",
+            remarks: `Order accepted by admin. Reason/remarks: ${reason || "N/A"}`,
+            req
+        });
+
         req.order = updatedOrder;
         next();
         // return res.status(200).json(
@@ -3183,6 +3514,14 @@ const holdAbandonedOrder = asyncHandler(async (req, res, next) => {
     if (!savedOrder) {
         throw new ApiError(500, "Could not hold order");
     }
+
+    await logActivity({
+        orderId: order._id,
+        action: "Hold",
+        remarks: reason || "Order placed on hold by admin.",
+        req
+    });
+
     return res.json({ message: 'Order put on Hold' });
 });
 
@@ -3699,9 +4038,16 @@ const getOrderById = asyncHandler(async (req, res) => {
         throw new ApiError(409, "Could not find order");
     }
 
+    const activityLogs = await ActivityLog.find({ orderId: order._id })
+        .populate("performedBy", "name email role")
+        .sort({ createdAt: -1 });
+
+    const orderJson = order.toJSON();
+    orderJson.activityLogs = activityLogs || [];
+
     return res.status(200).json(
-        new ApiResponse(200, order, "Order fetched Successfully")
-    )
+        new ApiResponse(200, orderJson, "Order fetched Successfully")
+    );
 });
 
 const getAllOrders = asyncHandler(async (req, res) => {
@@ -4021,6 +4367,14 @@ const preShiprocketReject = async (req, res, next) => {
                 await order.save({ session });
 
                 await adjustStock(order, { type: STOCK_TYPES.REJECT, session });
+
+                await logActivity({
+                    orderId: order._id,
+                    action: "Rejected",
+                    remarks: reason || "Order rejected by admin.",
+                    req,
+                    session
+                });
             });
         } finally {
             session.endSession();
@@ -4056,6 +4410,14 @@ const createdReject = async (req, res, next) => {
                 await order.save({ session });
 
                 await adjustStock(order, { type: STOCK_TYPES.REJECT, session });
+
+                await logActivity({
+                    orderId: order._id,
+                    action: "Rejected",
+                    remarks: reason || "Order rejected by admin.",
+                    req,
+                    session
+                });
             });
         } finally {
             session.endSession();
@@ -4095,6 +4457,14 @@ const awbReject = async (req, res) => {
                 await order.save({ session });
 
                 await adjustStock(order, { type: STOCK_TYPES.REJECT, session });
+
+                await logActivity({
+                    orderId: order._id,
+                    action: "Rejected",
+                    remarks: reason || "Order rejected by admin.",
+                    req,
+                    session
+                });
             });
         } finally {
             session.endSession();
@@ -4664,6 +5034,13 @@ const markAsDeliveredManually = asyncHandler(async (req, res) => {
     order.deliveredAt = new Date();
     await order.save();
 
+    await logActivity({
+        orderId: order._id,
+        action: "Delivered",
+        remarks: "Order marked as Delivered manually.",
+        req
+    });
+
     return res.status(200).json(new ApiResponse(200, { order }, "Order marked as delivered manually"));
 });
 
@@ -4701,6 +5078,13 @@ const recordCallAttempt = asyncHandler(async (req, res) => {
 
     await order.save();
 
+    await logActivity({
+        orderId: order._id,
+        action: "Call Attempt",
+        remarks: `Call attempt #${nextAttemptNo} recorded. Remarks: "${remarks?.trim() || "N/A"}"`,
+        req
+    });
+
     const updatedOrder = await Order.findById(_id)
         .populate({
             path: 'userId',
@@ -4725,9 +5109,18 @@ const addOrderPayment = asyncHandler(async (req, res) => {
         throw new ApiError(400, "orderId, amount, and method are required.");
     }
 
+    if (method === "COD") {
+        throw new ApiError(400, "COD is not a valid manual payment transaction method.");
+    }
+
     const order = await Order.findById(orderId);
     if (!order) {
         throw new ApiError(404, "Order not found.");
+    }
+
+    let finalStatus = status;
+    if (req.user?.role?.toLowerCase() !== "admin") {
+        finalStatus = "Pending";
     }
 
     const session = await mongoose.startSession();
@@ -4739,9 +5132,9 @@ const addOrderPayment = asyncHandler(async (req, res) => {
                 orderRef: order._id,
                 amount: Number(amount),
                 method,
-                status,
+                status: finalStatus,
                 notes: notes || "",
-                paidAt: status === "Paid" ? (paidAt ? new Date(paidAt) : new Date()) : undefined
+                paidAt: finalStatus === "Paid" ? (paidAt ? new Date(paidAt) : new Date()) : undefined
             }], { session });
 
             // Fetch all paid payments for this order to recalculate
@@ -4759,6 +5152,14 @@ const addOrderPayment = asyncHandler(async (req, res) => {
             }
 
             await order.save({ session });
+
+            await logActivity({
+                orderId: order._id,
+                action: "Payment Received",
+                remarks: `Payment transaction of ₹${amount} via ${method} recorded as ${finalStatus}. Notes: ${notes || "N/A"}`,
+                req,
+                session
+            });
         });
 
         return res.status(200).json(new ApiResponse(200, { payment: paymentDoc[0], order }, "Payment added and order totals updated successfully."));
@@ -4783,9 +5184,22 @@ const editOrderPayment = asyncHandler(async (req, res) => {
         throw new ApiError(404, "Payment transaction not found.");
     }
 
+    if (payment.status === "Paid") {
+        throw new ApiError(400, "This payment record is Paid and locked. It cannot be edited.");
+    }
+
+    if (method === "COD") {
+        throw new ApiError(400, "COD is not a valid manual payment transaction method.");
+    }
+
     const order = await Order.findById(payment.orderRef);
     if (!order) {
         throw new ApiError(404, "Order associated with payment not found.");
+    }
+
+    let finalStatus = status || payment.status;
+    if (req.user?.role?.toLowerCase() !== "admin") {
+        finalStatus = "Pending";
     }
 
     const session = await mongoose.startSession();
@@ -4793,12 +5207,12 @@ const editOrderPayment = asyncHandler(async (req, res) => {
         await session.withTransaction(async () => {
             payment.amount = amount !== undefined ? Number(amount) : payment.amount;
             payment.method = method || payment.method;
-            payment.status = status || payment.status;
+            payment.status = finalStatus;
             payment.notes = notes !== undefined ? notes : payment.notes;
 
-            if (status === "Paid") {
+            if (finalStatus === "Paid") {
                 payment.paidAt = paidAt ? new Date(paidAt) : (payment.paidAt || new Date());
-            } else if (status === "Pending") {
+            } else if (finalStatus === "Pending") {
                 payment.paidAt = undefined;
             }
 
@@ -4819,6 +5233,14 @@ const editOrderPayment = asyncHandler(async (req, res) => {
             }
 
             await order.save({ session });
+
+            await logActivity({
+                orderId: order._id,
+                action: "Payment Updated",
+                remarks: `Payment transaction #${payment._id} updated. Method: ${payment.method}, Status: ${payment.status}, Amount: ₹${payment.amount}`,
+                req,
+                session
+            });
         });
 
         return res.status(200).json(new ApiResponse(200, { payment, order }, "Payment updated and order totals updated successfully."));
@@ -4867,6 +5289,10 @@ const generatePaymentRecordLink = asyncHandler(async (req, res) => {
     const payment = await Payment.findById(paymentId);
     if (!payment) {
         throw new ApiError(404, "Payment transaction not found.");
+    }
+
+    if (payment.status === "Paid") {
+        throw new ApiError(400, "Cannot generate payment link for a paid record.");
     }
 
     if (payment.method !== "Online") {
@@ -4941,7 +5367,8 @@ const manualShipOrder = asyncHandler(async (req, res) => {
         schedulePickup,
         pickupScheduledAt,
         pickupTokenNumber,
-        expectedDeliveryDate
+        expectedDeliveryDate,
+        trackingUrl
     } = req.body;
 
     if (!orderId) {
@@ -4953,11 +5380,17 @@ const manualShipOrder = asyncHandler(async (req, res) => {
         throw new ApiError(404, "Order not found.");
     }
 
+    const pendingPayments = await Payment.find({ orderRef: order._id, status: "Pending" });
+    if (pendingPayments.length > 0) {
+        throw new ApiError(400, "Cannot ship order. Payments not verified yet.");
+    }
+
     order.shippingType = "Manual";
     order.awbCode = awbCode || "";
     order.courierName = courierName || "";
     order.shippingPartner = shippingPartner || "";
     order.courierAssignedAt = new Date();
+    order.trackingUrl = trackingUrl || "";
 
     if (address) order.address = address;
     if (address2 !== undefined) order.address2 = address2;
@@ -4989,6 +5422,13 @@ const manualShipOrder = asyncHandler(async (req, res) => {
 
     order.markModified("scans");
     await order.save();
+
+    await logActivity({
+        orderId: order._id,
+        action: "Shipped",
+        remarks: `Order manually shipped with courier ${courierName || "N/A"}. AWB: ${awbCode || "N/A"}.`,
+        req
+    });
 
     return res.status(200).json(new ApiResponse(200, order, "Manual shipping details saved successfully."));
 });
@@ -5034,6 +5474,13 @@ const updateManualShippingStatus = asyncHandler(async (req, res) => {
     order.markModified("scans");
     await order.save();
 
+    await logActivity({
+        orderId: order._id,
+        action: "Status Update",
+        remarks: `Manual shipping status updated to "${shippingStatus}". Activity: "${description || "N/A"}"`,
+        req
+    });
+
     return res.status(200).json(new ApiResponse(200, order, "Manual shipping status updated successfully."));
 });
 
@@ -5056,11 +5503,15 @@ const syncProductStock = async (productId, session) => {
         { session }
     );
 
-    const inventory = await Inventory.findOne({ product: productId }).session(session);
-    if (inventory) {
-        inventory.physicalStock = totalStockSum;
-        await inventory.save({ session });
-    }
+    await Inventory.findOneAndUpdate(
+        { product: productId },
+        {
+            $set: {
+                physicalStock: totalStockSum
+            }
+        },
+        { new: true, session }
+    );
 };
 
 async function adjustStockV3(order, options = {}) {
@@ -5089,6 +5540,14 @@ const systemCreatedCancel = asyncHandler(async (req, res) => {
             await order.save({ session });
 
             await adjustStockV3(order, { type: STOCK_TYPES.CANCEL, session });
+
+            await logActivity({
+                orderId: order._id,
+                action: "Cancelled",
+                remarks: reason || "Order cancelled by admin.",
+                req,
+                session
+            });
         });
     } finally {
         session.endSession();
@@ -5189,3 +5648,305 @@ const legacy_updateOrder = asyncHandler(async (req, res) => {
         return res.status(500).json({ message: err.message || 'Internal server error' });
     }
 });
+
+export const updateOrderItems = asyncHandler(async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+        const { id } = req.params;
+        const { items, discount, discountPercent, deliveryCharge } = req.body;
+
+        if (!id) {
+            throw new ApiError(400, "Order ID is required.");
+        }
+
+        const order = await Order.findById(id);
+        if (!order) {
+            throw new ApiError(404, "Order not found.");
+        }
+
+        // Validate editing timeframe constraints
+        const canEdit = () => {
+            if (order.shippingType === 'Manual') {
+                return !['Shipped', 'Delivered', 'Cancelled', 'Rejected', 'Returned'].includes(order.status);
+            } else {
+                return !order.awbCode && !order.shipmentId && !order.pickupScheduled && !order.courierName && !['Shipped', 'Delivered', 'Cancelled', 'Rejected', 'Returned'].includes(order.status);
+            }
+        };
+        if (!canEdit()) {
+            throw new ApiError(400, "Order cannot be edited at this stage.");
+        }
+
+        await session.withTransaction(async () => {
+            const oldItemsMap = new Map();
+            for (const item of order.items) {
+                const key = item.variantId ? item.variantId.toString() : `${item.productId.toString()}_${item.variantName}`;
+                oldItemsMap.set(key, { quantity: item.quantity, stockIds: item.stockIds || [], price: item.price, discount: item.discount, variantId: item.variantId });
+            }
+
+            const newItems = [];
+            const itemChanges = [];
+
+            if (items && Array.isArray(items)) {
+                for (const reqItem of items) {
+                    const productId = reqItem.productId;
+                    const variantId = reqItem.variantId;
+                    const variantName = reqItem.variantName;
+                    const qty = Math.floor(Number(reqItem.quantity || 0));
+                    const itemDiscount = Number(reqItem.discount || 0);
+                    const itemDiscountPercent = Number(reqItem.discountPercent || 0);
+
+                    if (qty <= 0) continue;
+
+                    const key = variantId ? variantId.toString() : `${productId.toString()}_${variantName}`;
+                    const oldInfo = oldItemsMap.get(key) || { quantity: 0, stockIds: [], price: 0, discount: 0, variantId: null };
+                    const oldQty = oldInfo.quantity;
+                    const diff = qty - oldQty;
+
+                    const product = await Product.findById(productId).session(session);
+                    if (!product) throw new ApiError(404, `Product not found for ID: ${productId}`);
+
+                    let itemStockIds = [...oldInfo.stockIds];
+
+                    // Adjust stock if quantity changed
+                    if (diff > 0) {
+                        const query = reqItem.variantId
+                            ? { _id: reqItem.variantId, active: true, totalStock: { $gte: diff }, availableStock: { $gte: diff } }
+                            : { productId: productId, name: variantName, active: true, totalStock: { $gte: diff }, availableStock: { $gte: diff } };
+                        const variantResult = await Variant.findOneAndUpdate(
+                            query,
+                            { $inc: { totalStock: -diff, availableStock: -diff } },
+                            { new: true, session }
+                        );
+
+                        if (!variantResult) {
+                            throw new ApiError(400, `Insufficient stock for product ${product.fullName} variant ${variantName}`);
+                        }
+
+                        await syncProductStock(productId, session);
+
+                        const parentProduct = await Product.findById(productId).session(session);
+                        const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+                        // Create Stock entry
+                        const newStockLog = await Stock.create([{
+                            orderId: order.orderId,
+                            orderRef: order._id,
+                            type: "add-item", // sign: -
+                            category: "physical",
+                            variantId: variantResult._id,
+                            variantName: variantResult.name,
+                            purchasePrice: variantResult.purchaseSets?.[0]?.price || 0,
+                            sellingPrice: Number(reqItem.price) - (itemDiscount / qty),
+                            quantity: diff,
+                            previousStock: variantResult.availableStock + diff,
+                            updatedStock: variantResult.availableStock,
+                            previousPhysicalStock: variantResult.totalStock + diff,
+                            updatedPhysicalStock: variantResult.totalStock,
+                            totalProductStock: currentTotalProductStock,
+                            productId: productId
+                        }], { session });
+
+                        itemStockIds.push(newStockLog[0]._id);
+
+                    } else if (diff < 0) {
+                        const restoreQty = -diff;
+                        const query = reqItem.variantId
+                            ? { _id: reqItem.variantId }
+                            : { productId: productId, name: variantName };
+                        const variantResult = await Variant.findOneAndUpdate(
+                            query,
+                            { $inc: { totalStock: restoreQty, availableStock: restoreQty } },
+                            { new: true, session }
+                        );
+
+                        if (!variantResult) {
+                            throw new ApiError(400, `Failed to restore variant stock for product ${product.fullName}`);
+                        }
+
+                        await syncProductStock(productId, session);
+
+                        const parentProduct = await Product.findById(productId).session(session);
+                        const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+                        const newStockLog = await Stock.create([{
+                            orderId: order.orderId,
+                            orderRef: order._id,
+                            type: "remove-item", // sign: +
+                            category: "physical",
+                            variantId: variantResult._id,
+                            variantName: variantResult.name,
+                            purchasePrice: variantResult.purchaseSets?.[0]?.price || 0,
+                            sellingPrice: Number(reqItem.price) - (itemDiscount / qty),
+                            quantity: restoreQty,
+                            previousStock: variantResult.availableStock - restoreQty,
+                            updatedStock: variantResult.availableStock,
+                            previousPhysicalStock: variantResult.totalStock - restoreQty,
+                            updatedPhysicalStock: variantResult.totalStock,
+                            totalProductStock: currentTotalProductStock,
+                            productId: productId
+                        }], { session });
+
+                        itemStockIds.push(newStockLog[0]._id);
+                    }
+
+                    // Price/discount update (recalculate sellingPrice in existing logs if price/discount changed)
+                    const finalPrice = reqItem.price !== undefined && reqItem.price !== null ? Number(reqItem.price) : oldInfo.price;
+                    const itemDiscountType = reqItem.discountType !== undefined ? reqItem.discountType : (oldInfo.discountType || "flat");
+                    const syncedDiscount = syncItemDiscount(itemDiscount, itemDiscountPercent, finalPrice, itemDiscountType);
+                    const finalDiscount = syncedDiscount.discount;
+                    const finalDiscountPercent = syncedDiscount.discountPercent;
+                    const finalUnitSellingPrice = finalPrice - finalDiscount;
+
+                    if (itemStockIds.length > 0) {
+                        await Stock.updateMany(
+                            { _id: { $in: itemStockIds } },
+                            { $set: { sellingPrice: finalUnitSellingPrice } },
+                            { session }
+                        );
+                    }
+
+                    const changes = [];
+                    if (qty !== oldQty) {
+                        changes.push(`Qty: ${oldQty} -> ${qty}`);
+                    }
+                    if (finalPrice !== oldInfo.price) {
+                        changes.push(`Price: ₹${oldInfo.price} -> ₹${finalPrice}`);
+                    }
+                    if (finalDiscount !== oldInfo.discount) {
+                        changes.push(`Discount: ₹${oldInfo.discount} -> ₹${finalDiscount}`);
+                    }
+                    if (changes.length > 0) {
+                        itemChanges.push(`${variantName} (${changes.join(", ")})`);
+                    }
+
+                    newItems.push({
+                        productId,
+                        variantName,
+                        quantity: qty,
+                        price: finalPrice,
+                        discount: finalDiscount,
+                        discountPercent: finalDiscountPercent,
+                        discountType: itemDiscountType,
+                        stockIds: itemStockIds,
+                        variantId: oldInfo.variantId || (await Variant.findOne({ productId, name: variantName }).session(session))?._id
+                    });
+
+                    oldItemsMap.delete(key);
+                }
+
+                // Restore any completely deleted items
+                for (const [key, oldInfo] of oldItemsMap.entries()) {
+                    const oldQty = oldInfo.quantity;
+
+                    // Resolve the query: prefer variantId, fall back to productId+name from composite key
+                    const variantQuery = oldInfo.variantId
+                        ? { _id: oldInfo.variantId }
+                        : (() => { const [pid, vname] = key.split("_"); return { productId: pid, name: vname }; })();
+
+                    const variantResult = await Variant.findOneAndUpdate(
+                        variantQuery,
+                        { $inc: { totalStock: oldQty, availableStock: oldQty } },
+                        { new: true, session }
+                    );
+
+                    if (!variantResult) {
+                        console.warn(`[updateOrderItems] Could not find variant to restore stock for key: ${key}`);
+                        continue;
+                    }
+
+                    await syncProductStock(variantResult.productId, session);
+
+                    const parentProduct = await Product.findById(variantResult.productId).session(session);
+                    const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+                    await Stock.create([{
+                        orderId: order.orderId,
+                        orderRef: order._id,
+                        type: "remove-item", // sign: +
+                        category: "physical",
+                        variantId: variantResult._id,
+                        variantName: variantResult.name,
+                        purchasePrice: variantResult.purchaseSets?.[0]?.price || 0,
+                        sellingPrice: oldInfo.price - (oldInfo.discount / oldQty),
+                        quantity: oldQty,
+                        previousStock: variantResult.availableStock - oldQty,
+                        updatedStock: variantResult.availableStock,
+                        previousPhysicalStock: variantResult.totalStock - oldQty,
+                        updatedPhysicalStock: variantResult.totalStock,
+                        totalProductStock: currentTotalProductStock,
+                        productId: variantResult.productId
+                    }], { session });
+
+                    itemChanges.push(`Removed item ${variantResult.name || key} (Qty: ${oldQty})`);
+                }
+
+                order.items = newItems;
+            }
+
+            // Recalculate totals
+            let subtotal = 0;
+            for (const item of order.items) {
+                const qty = item.quantity;
+                const price = item.price;
+                subtotal += qty * (price - (item.discount || 0));
+            }
+            order.subtotal = subtotal;
+
+            let flatDiscount = Number(discount !== undefined ? discount : order.discount);
+            let percentDiscount = Number(discountPercent !== undefined ? discountPercent : order.discountPercent);
+            // Use the saved discountType to decide which value is the anchor
+            const globalDiscountType = req.body.discountType || order.discountType || 'flat';
+            if (subtotal > 0) {
+                if (globalDiscountType === 'percentage') {
+                    // Percentage is the anchor — recompute flat from new subtotal
+                    flatDiscount = parseFloat(((subtotal * percentDiscount) / 100).toFixed(2));
+                } else {
+                    // Flat is the anchor — keep flat constant, recompute percent for display
+                    percentDiscount = parseFloat(((flatDiscount / subtotal) * 100).toFixed(2));
+                }
+            }
+            order.discount = flatDiscount;
+            order.discountPercent = percentDiscount;
+
+            const delCharge = deliveryCharge !== undefined ? Number(deliveryCharge) : order.deliveryCharge;
+            order.deliveryCharge = delCharge;
+
+            order.orderAmount = Math.max(0, subtotal - flatDiscount + delCharge);
+            order.remainingAmount = Math.max(0, order.orderAmount - order.amountPaid);
+
+            if (order.remainingAmount <= 0) {
+                order.paymentStatus = "Paid";
+            } else {
+                order.paymentStatus = "Pending";
+            }
+
+            await order.save({ session });
+
+            const remarks = itemChanges.length > 0 ? `Updated items: ${itemChanges.join("; ")}` : "Order items, pricing, or quantities updated.";
+
+            await logActivity({
+                orderId: order._id,
+                action: "Items Edited",
+                remarks,
+                req,
+                session
+            });
+        });
+
+        const updatedOrder = await Order.findById(id).populate("items.productId");
+        return res.status(200).json(new ApiResponse(200, { order: updatedOrder }, "Order items updated successfully."));
+    } catch (error) {
+        console.error("Error in updateOrderItems:", error);
+        throw error;
+    } finally {
+        session.endSession();
+    }
+});
+
+export const getOrderActivity = asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const activityLogs = await ActivityLog.find({ orderId: id })
+        .sort({ createdAt: -1 });
+    return res.status(200).json(new ApiResponse(200, activityLogs, "Order activity logs fetched successfully."));
+});
+

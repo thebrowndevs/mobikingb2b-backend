@@ -209,6 +209,7 @@ export const verifyGstPos = asyncHandler(async (req, res) => {
                 user: {
                     _id: existingUser._id,
                     name: existingUser.name || "",
+                    businessName: existingUser.business?.businessName || "",
                     phoneNo: existingUser.phoneNo || "",
                     email: existingUser.email || "",
                     gstNumber: existingUser.business?.gstNumber || "",

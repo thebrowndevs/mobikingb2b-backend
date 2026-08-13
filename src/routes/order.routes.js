@@ -20,6 +20,7 @@ import {
     getOrdersByDate,
     getOrderById,
     updateOrder,
+    updateOrderItems,
     addItemQuantityInOrder,
     removeItemQuantityInOrder,
     getFilteredOrdersByDate,
@@ -37,7 +38,8 @@ import {
     generatePaymentRecordLink,
     manualShipOrder,
     updateManualShippingStatus,
-    systemCreatedCancel
+    systemCreatedCancel,
+    getOrderActivity
 } from "../controllers/order.controller.js";
 import {
     raisePartialReturnRequest,
@@ -87,6 +89,8 @@ router.route("/payments/generate-link").post(verifyJWT, generatePaymentRecordLin
 router.route("/manual-ship").post(verifyJWT, manualShipOrder);
 router.route("/manual-ship/status").post(verifyJWT, updateManualShippingStatus);
 
+router.route("/:id/update-items").put(verifyJWT, updateOrderItems);
+router.route("/:id/activity").get(verifyJWT, getOrderActivity);
 router.route("/:_id").put(verifyJWT, updateOrder);
 router.route("/items/add").post(verifyJWT, addItemQuantityInOrder);
 router.route("/items/remove").post(verifyJWT, removeItemQuantityInOrder);

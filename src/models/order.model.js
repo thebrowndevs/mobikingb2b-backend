@@ -113,6 +113,10 @@ const orderSchema = new mongoose.Schema(
         awbCode: String,  // Air‑way bill
         courierName: String,
         courierAssignedAt: Date,
+        trackingUrl: {
+            type: String,
+            default: ""
+        },
 
         pickupScheduled: {
             type: Boolean,
@@ -253,6 +257,11 @@ const orderSchema = new mongoose.Schema(
         deliveryCharge: { type: Number, default: 0 },
         discount: { type: Number, default: 0 },
         discountPercent: { type: Number, default: 0 },
+        discountType: {
+            type: String,
+            enum: ["flat", "percentage"],
+            default: "flat"
+        },
         gst: { type: String },
         subtotal: Number,
 

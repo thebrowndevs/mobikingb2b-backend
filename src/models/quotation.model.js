@@ -56,6 +56,11 @@ const quotationSchema = new mongoose.Schema(
         deliveryCharge: { type: Number, default: 0 },
         discount: { type: Number, default: 0 },
         discountPercent: { type: Number, default: 0 },
+        discountType: {
+            type: String,
+            enum: ["flat", "percentage"],
+            default: "flat"
+        },
         gst: { type: String },
         subtotal: Number,
 
@@ -113,6 +118,21 @@ const quotationSchema = new mongoose.Schema(
         weight: {
             type: Number,
             default: 0.5
+        },
+        callAttempts: {
+            noOfAttempts: {
+                type: Number,
+                default: 0
+            },
+            history: [{
+                attemptNo: Number,
+                date: Date,
+                employeeId: {
+                    type: mongoose.Schema.Types.ObjectId,
+                    ref: "User"
+                },
+                remarks: String
+            }]
         }
     },
     { timestamps: true }

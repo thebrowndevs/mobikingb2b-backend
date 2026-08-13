@@ -8,11 +8,19 @@ import { Inventory } from "../models/inventory.model.js";
 import { Stock } from "../models/stock.model.js";
 import { Product } from "../models/product.model.js";
 import { Payment } from "../models/payment.model.js";
+import { ActivityLog } from "../models/activity_log.model.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { STOCK_TYPES } from "../constants.js";
 import { Address } from "../models/address.model.js";
+import { logActivity } from "../utils/activityLogger.js";
+import {
+    determineSlabForQuantity,
+    syncItemDiscount,
+    recalculateQuotationTotalsWebsite,
+    recalculateQuotationTotalsAdmin
+} from "../utils/pricing.js";
 
 /**
  * Creates a new B2B Quotation from the user's cart.
@@ -97,8 +105,7 @@ export const createQuotation = asyncHandler(async (req, res) => {
                 // 1. Atomically decrement availableStock on the Variant collection
                 const variant = await Variant.findOneAndUpdate(
                     {
-                        productId: item.productId._id,
-                        name: item.variantName,
+                        _id: item.variantId,
                         active: true,
                         availableStock: { $gte: qty }
                     },
@@ -185,7 +192,7 @@ export const createQuotation = asyncHandler(async (req, res) => {
                 } else {
                     await Inventory.create([{
                         product: item.productId._id,
-                        physicalStock: qty,
+                        physicalStock: currentTotalProductStock,
                         reservedStock: qty,
                         version: 0
                     }], { session });
@@ -210,13 +217,27 @@ export const createQuotation = asyncHandler(async (req, res) => {
                 });
             }
 
-            // Save Quotation item updates
-            await newQuote.save({ session });
+            await logActivity({
+                quotationId: newQuote._id,
+                action: "Created",
+                remarks: "Quotation created successfully.",
+                req,
+                session
+            });
 
-            // Write Stock logs
+            // Write Stock logs and link IDs
             if (stockEntries.length > 0) {
-                await Stock.insertMany(stockEntries, { session });
+                const insertedLogs = await Stock.insertMany(stockEntries, { session });
+                for (const item of newQuote.items) {
+                    const matchedLogs = insertedLogs.filter(
+                        log => log.variantId && item.variantId && String(log.variantId) === String(item.variantId)
+                    );
+                    item.stockIds = matchedLogs.map(log => log._id);
+                }
             }
+
+            // Save Quotation item updates (including stockIds)
+            await newQuote.save({ session });
 
             // Clear Cart
             cart.items = [];
@@ -453,6 +474,14 @@ export const updateQuotationStatus = asyncHandler(async (req, res) => {
             if (stockEntries.length > 0) {
                 await Stock.insertMany(stockEntries, { session });
             }
+
+            await logActivity({
+                quotationId: quotation._id,
+                action: status,
+                remarks: reason || `Quotation status updated from ${oldStatus} to ${status}.`,
+                req,
+                session
+            });
         });
 
         return res.json(new ApiResponse(200, { quotation }, `Quotation status updated to ${status}.`));
@@ -686,13 +715,26 @@ export const bookQuotation = asyncHandler(async (req, res) => {
                 }
             }
 
+            // Write Stock logs and link IDs
+            if (stockEntries.length > 0) {
+                const insertedLogs = await Stock.insertMany(stockEntries, { session });
+                for (const item of newOrder.items) {
+                    const matchedLogs = insertedLogs.filter(
+                        log => log.variantId && item.variantId && String(log.variantId) === String(item.variantId)
+                    );
+                    item.stockIds = matchedLogs.map(log => log._id);
+                }
+                for (const item of quotation.items) {
+                    const matchedLogs = insertedLogs.filter(
+                        log => log.variantId && item.variantId && String(log.variantId) === String(item.variantId)
+                    );
+                    item.stockIds = matchedLogs.map(log => log._id);
+                }
+            }
+
             // Save updated order and quotation items
             await newOrder.save({ session });
             await quotation.save({ session });
-
-            if (stockEntries.length > 0) {
-                await Stock.insertMany(stockEntries, { session });
-            }
         });
 
         return res.json(new ApiResponse(200, { quotation, order: newOrder }, "Quotation booked successfully. Physical order generated."));
@@ -759,141 +801,18 @@ const syncProductStock = async (productId, session) => {
         { session }
     );
 
-    const inventory = await Inventory.findOne({ product: productId }).session(session);
-    if (inventory) {
-        inventory.physicalStock = totalStockSum;
-        await inventory.save({ session });
-    }
+    await Inventory.findOneAndUpdate(
+        { product: productId },
+        {
+            $set: {
+                physicalStock: totalStockSum
+            }
+        },
+        { new: true, session }
+    );
 };
 
-const determineSlabForQuantity = (product, quantity) => {
-    if (!product.sellingPrice) return null;
-    if (product.sellingPrice.type === "fixed") {
-        if (product.sellingPrice.slabs && product.sellingPrice.slabs.length > 0) {
-            return { quantity: product.sellingPrice.slabs[0].quantity, price: product.sellingPrice.slabs[0].price };
-        }
-        return { quantity: 1, price: product.basePrice || 0 };
-    }
 
-    const slabs = product.sellingPrice.slabs || [];
-    if (slabs.length === 0) return { quantity: 1, price: product.basePrice || 0 };
-
-    const sortedSlabs = [...slabs].sort((a, b) => a.quantity - b.quantity);
-
-    let matchedSlab = sortedSlabs[0];
-    for (const slab of sortedSlabs) {
-        if (quantity >= slab.quantity) {
-            matchedSlab = slab;
-        } else {
-            break;
-        }
-    }
-    return { quantity: matchedSlab.quantity, price: matchedSlab.price };
-};
-
-const recalculateQuotationTotals = async (quotation, session, keepReceivedPrices = false, keepDeliveryCharge = false) => {
-    let subtotal = 0;
-    const categoryCharges = new Map();
-
-    // Group items by productId to find total product quantity
-    const productQuantities = new Map();
-    for (const item of quotation.items) {
-        const prodIdStr = item.productId.toString();
-        productQuantities.set(prodIdStr, (productQuantities.get(prodIdStr) || 0) + item.quantity);
-    }
-
-    // Now recalculate pricing for each item
-    for (const item of quotation.items) {
-        const product = await Product.findById(item.productId)
-            .session(session)
-            .populate("category")
-            .exec();
-
-        if (!product) {
-            throw new ApiError(404, `Product not found for item: ${item.productId}`);
-        }
-
-        const totalProductQty = productQuantities.get(item.productId.toString()) || item.quantity;
-        const matchedSlab = determineSlabForQuantity(product, totalProductQty);
-
-        let basePrice = 0;
-        if (matchedSlab) {
-            const currentAppliedSlabQty = item.appliedSlab ? item.appliedSlab.quantity : null;
-            if (currentAppliedSlabQty === matchedSlab.quantity && item.appliedSlab.price !== undefined) {
-                basePrice = item.appliedSlab.price;
-            } else {
-                item.appliedSlab = {
-                    quantity: matchedSlab.quantity,
-                    price: matchedSlab.price
-                };
-                basePrice = matchedSlab.price;
-            }
-        } else {
-            basePrice = item.appliedSlab ? item.appliedSlab.price : (product.sellingPrice?.slabs?.[0]?.price || product.basePrice || 0);
-        }
-
-        // Sync item discount and discountPercent
-        let itemFlat = Number(item.discount || 0);
-        let itemPercent = Number(item.discountPercent || 0);
-
-        if (basePrice > 0) {
-            if (itemPercent > 0 && itemFlat === 0) {
-                itemFlat = parseFloat(((basePrice * itemPercent) / 100).toFixed(2));
-            } else if (itemFlat > 0 && itemPercent === 0) {
-                itemPercent = parseFloat(((itemFlat / basePrice) * 100).toFixed(2));
-            } else if (itemFlat > 0 && itemPercent > 0) {
-                itemPercent = parseFloat(((itemFlat / basePrice) * 100).toFixed(2));
-            }
-        }
-
-        item.discount = parseFloat(itemFlat.toFixed(2));
-        item.discountPercent = parseFloat(itemPercent.toFixed(2));
-
-        if (keepReceivedPrices && item.price !== undefined && item.price !== null && item.price > 0 && itemFlat === 0 && itemPercent === 0) {
-            // Keep the per-item price same as received if no discount update is requested
-        } else {
-            item.price = Math.max(0, basePrice - item.discount);
-        }
-
-        subtotal += item.price * item.quantity;
-
-        // Delivery Charge calculation (max delivery charge of all item categories)
-        if (product.category) {
-            const categoryId = product.category._id.toString();
-            const deliveryCharge = product.category.deliveryCharge || 0;
-            if (deliveryCharge > 0 && !categoryCharges.has(categoryId)) {
-                categoryCharges.set(categoryId, deliveryCharge);
-            }
-        }
-    }
-
-    if (!keepDeliveryCharge) {
-        const values = Array.from(categoryCharges.values());
-        const totalDeliveryCharge = Math.max(...values, 0);
-        quotation.deliveryCharge = parseFloat(totalDeliveryCharge.toFixed(2));
-    } else {
-        quotation.deliveryCharge = parseFloat((quotation.deliveryCharge || 0).toFixed(2));
-    }
-
-    const subtotalFixed = parseFloat(subtotal.toFixed(2));
-    quotation.subtotal = subtotalFixed;
-
-    // Auto-sync discount and discountPercent
-    let flatDiscount = Number(quotation.discount || 0);
-    let percentDiscount = Number(quotation.discountPercent || 0);
-
-    if (percentDiscount > 0 && flatDiscount === 0) {
-        flatDiscount = parseFloat(((subtotalFixed * percentDiscount) / 100).toFixed(2));
-    } else if (flatDiscount > 0 && percentDiscount === 0) {
-        percentDiscount = subtotalFixed > 0 ? parseFloat(((flatDiscount / subtotalFixed) * 100).toFixed(2)) : 0;
-    } else if (flatDiscount > 0 && percentDiscount > 0) {
-        percentDiscount = subtotalFixed > 0 ? parseFloat(((flatDiscount / subtotalFixed) * 100).toFixed(2)) : 0;
-    }
-
-    quotation.discount = parseFloat(flatDiscount.toFixed(2));
-    quotation.discountPercent = parseFloat(percentDiscount.toFixed(2));
-    quotation.orderAmount = parseFloat((Math.max(0, subtotalFixed - quotation.discount) + quotation.deliveryCharge).toFixed(2));
-};
 
 const calculateB2BItemPrice = (product, quantity) => {
     if (!product.sellingPrice) return 0;
@@ -933,6 +852,7 @@ export const updateQuotation = asyncHandler(async (req, res) => {
             deliveryCharge,
             discount,
             discountPercent,
+            discountType,
             comments,
             name,
             email,
@@ -1009,6 +929,7 @@ export const updateQuotation = asyncHandler(async (req, res) => {
             if (phoneNo !== undefined) quotation.phoneNo = phoneNo.trim();
             if (comments !== undefined) quotation.comments = comments;
             if (deliveryCharge !== undefined) quotation.deliveryCharge = Number(deliveryCharge);
+            if (discountType !== undefined) quotation.discountType = discountType;
             if (discount !== undefined) {
                 quotation.discount = Number(discount);
                 if (discountPercent === undefined) {
@@ -1189,8 +1110,20 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                 }
             }
 
-            await recalculateQuotationTotals(quotation, session, true, deliveryCharge !== undefined);
+            if (items && Array.isArray(items)) {
+                await recalculateQuotationTotalsAdmin(quotation, session, true, deliveryCharge !== undefined);
+            } else if (req.body.orderAmount !== undefined) {
+                quotation.orderAmount = Number(req.body.orderAmount);
+            }
             await quotation.save({ session });
+
+            await logActivity({
+                quotationId: quotation._id,
+                action: "Items Edited",
+                remarks: "Quotation items and charges updated by admin.",
+                req,
+                session
+            });
         });
 
         const updatedQuotation = await Quotation.findById(quotationId).populate("items.productId");
@@ -1378,24 +1311,39 @@ export const addItemQuantityInQuotation = asyncHandler(async (req, res) => {
                 }
                 existingItem.purchaseSetId = selectedSetId;
             } else {
+                const matchedSlab = determineSlabForQuantity(product, quantity);
+                const slabPrice = matchedSlab ? matchedSlab.price : (product.basePrice || 0);
+
                 quotation.items.push({
                     productId,
                     variantName: variant.name,
                     quantity,
-                    price: 0, // recalculateQuotationTotals will compute this
+                    price: slabPrice,
                     purchasePrice: avgPurchasePrice,
                     purchaseSetId: selectedSetId,
                     purchaseSets: allocatedSets,
                     variantId: variant._id,
                     sku: String(variant._id),
-                    discount: 0
+                    discount: 0,
+                    appliedSlab: matchedSlab ? {
+                        quantity: matchedSlab.quantity,
+                        price: matchedSlab.price
+                    } : undefined
                 });
             }
 
             // Recalculate totals
-            await recalculateQuotationTotals(quotation, session, true);
+            await recalculateQuotationTotalsAdmin(quotation, session, true);
 
             updatedQuotation = await quotation.save({ session });
+
+            await logActivity({
+                quotationId: quotation._id,
+                action: "Item Added",
+                remarks: `Added ${quantity} of ${variantName || "item"} to quotation.`,
+                req,
+                session
+            });
         });
 
         const populated = await Quotation.findById(updatedQuotation._id).populate("items.productId");
@@ -1530,9 +1478,17 @@ export const removeItemQuantityInQuotation = asyncHandler(async (req, res) => {
             }
 
             // Recalculate totals
-            await recalculateQuotationTotals(quotation, session, true);
+            await recalculateQuotationTotalsAdmin(quotation, session, true);
 
             updatedQuotation = await quotation.save({ session });
+
+            await logActivity({
+                quotationId: quotation._id,
+                action: "Item Removed",
+                remarks: `Removed ${quantity} of ${variantName || "item"} from quotation.`,
+                req,
+                session
+            });
         });
 
         const populated = await Quotation.findById(updatedQuotation._id).populate("items.productId");
@@ -1544,3 +1500,504 @@ export const removeItemQuantityInQuotation = asyncHandler(async (req, res) => {
         session.endSession();
     }
 });
+
+export const recordQuotationCallAttempt = asyncHandler(async (req, res) => {
+    const { _id } = req.params;
+    const { remarks } = req.body;
+
+    if (!_id) {
+        throw new ApiError(400, "Quotation Id is required");
+    }
+
+    const quotation = await Quotation.findById(_id);
+    if (!quotation) {
+        throw new ApiError(404, "Quotation not found");
+    }
+
+    const currentAttempts = quotation.callAttempts?.noOfAttempts || 0;
+    if (currentAttempts >= 3) {
+        throw new ApiError(400, "Maximum 3 call attempts allowed for a quotation");
+    }
+
+    const nextAttemptNo = currentAttempts + 1;
+
+    if (!quotation.callAttempts) {
+        quotation.callAttempts = { noOfAttempts: 0, history: [] };
+    }
+
+    quotation.callAttempts.noOfAttempts = nextAttemptNo;
+    quotation.callAttempts.history.push({
+        attemptNo: nextAttemptNo,
+        date: new Date(),
+        employeeId: req?.user?._id,
+        remarks: remarks?.trim() || ""
+    });
+
+    await quotation.save();
+
+    await logActivity({
+        quotationId: quotation._id,
+        action: "Call Attempt",
+        remarks: `Call attempt #${nextAttemptNo} recorded. Remarks: "${remarks?.trim() || "N/A"}"`,
+        req
+    });
+
+    const updatedQuotation = await Quotation.findById(_id)
+        .populate("items.productId")
+        .populate({
+            path: "callAttempts.history.employeeId",
+            model: "User",
+            select: "name email role"
+        });
+
+    return res
+        .status(200)
+        .json(new ApiResponse(200, updatedQuotation, "Call attempt recorded successfully"));
+});
+
+export const getQuotationById = asyncHandler(async (req, res) => {
+    const { _id } = req.params;
+    if (!_id) {
+        throw new ApiError(400, "Quotation ID is required.");
+    }
+
+    const quotation = await Quotation.findById(_id)
+        .populate("userId", "name phoneNo email role")
+        .populate("items.productId")
+        .populate({
+            path: "callAttempts.history.employeeId",
+            model: "User",
+            select: "name email role"
+        });
+
+    if (!quotation) {
+        throw new ApiError(404, "Quotation not found.");
+    }
+
+    const activityLogs = await ActivityLog.find({ quotationId: quotation._id })
+        .populate("performedBy", "name email role")
+        .sort({ createdAt: -1 });
+
+    const quotationJson = quotation.toJSON();
+    quotationJson.activityLogs = activityLogs || [];
+
+    return res.status(200).json(new ApiResponse(200, quotationJson, "Quotation fetched successfully."));
+});
+
+export const updateQuotationItems = asyncHandler(async (req, res) => {
+    const session = await mongoose.startSession();
+    try {
+        const { id } = req.params;
+        const { items, discount, discountPercent, deliveryCharge } = req.body;
+
+        if (!id) {
+            throw new ApiError(400, "Quotation ID is required.");
+        }
+
+        const quotation = await Quotation.findById(id);
+        if (!quotation) {
+            throw new ApiError(404, "Quotation not found.");
+        }
+
+        if (["Booked", "Rejected", "Cancelled"].includes(quotation.status)) {
+            throw new ApiError(400, `Cannot edit a quotation in ${quotation.status} status.`);
+        }
+
+        await session.withTransaction(async () => {
+            const oldItemsMap = new Map();
+            for (const item of quotation.items) {
+                const key = item.variantId ? item.variantId.toString() : `${item.productId.toString()}_${item.variantName}`;
+                oldItemsMap.set(key, {
+                    quantity: item.quantity,
+                    stockIds: item.stockIds || [],
+                    price: item.price,
+                    discount: item.discount,
+                    purchasePrice: item.purchasePrice,
+                    purchaseSetId: item.purchaseSetId,
+                    purchaseSets: item.purchaseSets || [],
+                    variantId: item.variantId
+                });
+            }
+
+            const newItems = [];
+            const itemChanges = [];
+
+            if (items && Array.isArray(items)) {
+                for (const reqItem of items) {
+                    const productId = reqItem.productId;
+                    const variantId = reqItem.variantId;
+                    const variantName = reqItem.variantName;
+                    const qty = Math.floor(Number(reqItem.quantity || 0));
+                    const itemDiscount = Number(reqItem.discount || 0);
+                    const itemDiscountPercent = Number(reqItem.discountPercent || 0);
+
+                    if (qty <= 0) continue;
+
+                    const key = variantId ? variantId.toString() : `${productId.toString()}_${variantName}`;
+                    const oldInfo = oldItemsMap.get(key) || { quantity: 0, stockIds: [], price: 0, discount: 0, purchasePrice: 0, purchaseSetId: "", purchaseSets: [], variantId: null };
+                    const oldQty = oldInfo.quantity;
+                    const diff = qty - oldQty;
+
+                    const product = await Product.findById(productId).session(session);
+                    if (!product) throw new ApiError(404, `Product not found for ID: ${productId}`);
+
+                    let variant;
+                    if (reqItem.variantId) {
+                        variant = await Variant.findOne({ _id: reqItem.variantId, active: true }).session(session);
+                    } else {
+                        variant = await Variant.findOne({ productId, name: variantName, active: true }).session(session);
+                    }
+                    if (!variant) throw new ApiError(404, `Active variant "${variantName}" not found for product "${product.fullName}".`);
+
+                    let itemStockIds = [...oldInfo.stockIds];
+                    let allocatedSets = [...oldInfo.purchaseSets];
+                    let selectedSetId = oldInfo.purchaseSetId;
+                    let avgPurchasePrice = oldInfo.purchasePrice || 0;
+
+                    // Adjust virtual stock reservations if quantity changed
+                    if (diff > 0) {
+                        const query = reqItem.variantId
+                            ? { _id: reqItem.variantId, active: true, availableStock: { $gte: diff } }
+                            : { productId, name: variantName, active: true, availableStock: { $gte: diff } };
+                        const variantResult = await Variant.findOneAndUpdate(
+                            query,
+                            { $inc: { availableStock: -diff } },
+                            { new: true, session }
+                        );
+
+                        if (!variantResult) {
+                            throw new ApiError(400, `Insufficient available stock for variant "${variantName}" of product "${product.fullName}".`);
+                        }
+
+                        await Inventory.findOneAndUpdate(
+                            { product: productId },
+                            { $inc: { reservedStock: diff } },
+                            { new: true, session }
+                        );
+
+                        // FIFO batch allocation
+                        let remaining = diff;
+                        const sortedSets = variantResult.purchaseSets
+                            .map((set, idx) => ({ set, idx }))
+                            .filter(itemObj => itemObj.set.availableStock > 0)
+                            .sort((a, b) => a.set.price - b.set.price);
+
+                        let totalCost = 0;
+                        for (const itemObj of sortedSets) {
+                            const set = variantResult.purchaseSets[itemObj.idx];
+                            const take = Math.min(remaining, set.availableStock);
+                            set.availableStock -= take;
+                            totalCost += take * set.price;
+
+                            const existingSet = allocatedSets.find(s => s.purchaseSetId === String(set._id));
+                            if (existingSet) {
+                                existingSet.quantity += take;
+                            } else {
+                                allocatedSets.push({
+                                    purchaseSetId: String(set._id),
+                                    quantity: take,
+                                    price: set.price
+                                });
+                            }
+                            remaining -= take;
+                            if (!selectedSetId && take > 0) {
+                                selectedSetId = String(set._id);
+                            }
+                            if (remaining === 0) break;
+                        }
+
+                        if (remaining > 0 && variantResult.purchaseSets.length > 0) {
+                            variantResult.purchaseSets[0].availableStock = Math.max(0, variantResult.purchaseSets[0].availableStock - remaining);
+                            const existingSet = allocatedSets.find(s => s.purchaseSetId === String(variantResult.purchaseSets[0]._id));
+                            if (existingSet) {
+                                existingSet.quantity += remaining;
+                            } else {
+                                allocatedSets.push({
+                                    purchaseSetId: String(variantResult.purchaseSets[0]._id),
+                                    quantity: remaining,
+                                    price: variantResult.purchaseSets[0].price
+                                });
+                            }
+                            selectedSetId = String(variantResult.purchaseSets[0]._id);
+                            totalCost += remaining * variantResult.purchaseSets[0].price;
+                        }
+
+                        // Save only the purchaseSets changes, never re-write availableStock via save()
+                        await Variant.updateOne(
+                            { _id: variantResult._id },
+                            { $set: { purchaseSets: variantResult.purchaseSets } },
+                            { session }
+                        );
+                        await syncProductStock(productId, session);
+
+                        const parentProduct = await Product.findById(productId).session(session);
+                        const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+                        // Create virtual stock log
+                        const newStockLog = await Stock.create([{
+                            quotationId: quotation.quotationId,
+                            quotationRef: quotation._id,
+                            type: "add-item", // sign: -
+                            category: "virtual",
+                            variantId: variantResult._id,
+                            variantName: variantResult.name,
+                            purchasePrice: diff > 0 ? (totalCost / diff) : 0,
+                            sellingPrice: Number(reqItem.price) - (itemDiscount / qty),
+                            quantity: diff,
+                            previousStock: variantResult.availableStock + diff,
+                            updatedStock: variantResult.availableStock,
+                            previousPhysicalStock: variantResult.totalStock,
+                            updatedPhysicalStock: variantResult.totalStock,
+                            totalProductStock: currentTotalProductStock,
+                            productId: productId
+                        }], { session });
+
+                        itemStockIds.push(newStockLog[0]._id);
+
+                    } else if (diff < 0) {
+                        const restoreQty = -diff;
+                        const query = reqItem.variantId ? { _id: reqItem.variantId } : { productId, name: variantName };
+                        const variantResult = await Variant.findOneAndUpdate(
+                            query,
+                            { $inc: { availableStock: restoreQty } },
+                            { new: true, session }
+                        );
+
+                        await Inventory.findOneAndUpdate(
+                            { product: productId },
+                            { $inc: { reservedStock: -restoreQty } },
+                            { new: true, session }
+                        );
+
+                        // FIFO batch restoration
+                        let remaining = restoreQty;
+                        for (const alloc of allocatedSets) {
+                            const set = variantResult.purchaseSets.id(alloc.purchaseSetId);
+                            if (set) {
+                                const restoreBatch = Math.min(remaining, alloc.quantity);
+                                set.availableStock += restoreBatch;
+                                alloc.quantity -= restoreBatch;
+                                remaining -= restoreBatch;
+                            }
+                            if (remaining === 0) break;
+                        }
+
+                        if (remaining > 0 && variantResult.purchaseSets.length > 0) {
+                            variantResult.purchaseSets[0].availableStock += remaining;
+                        }
+
+                        if (!variantResult) {
+                            throw new ApiError(400, `Could not find variant to restore stock for "${variantName}".`);
+                        }
+
+                        // Save only the purchaseSets changes, never re-write availableStock via save()
+                        await Variant.updateOne(
+                            { _id: variantResult._id },
+                            { $set: { purchaseSets: variantResult.purchaseSets } },
+                            { session }
+                        );
+                        await syncProductStock(productId, session);
+
+                        const parentProduct = await Product.findById(productId).session(session);
+                        const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+                        // Create virtual stock log
+                        const newStockLog = await Stock.create([{
+                            quotationId: quotation.quotationId,
+                            quotationRef: quotation._id,
+                            type: "remove-item", // sign: +
+                            category: "virtual",
+                            variantId: variantResult._id,
+                            variantName: variantResult.name,
+                            purchasePrice: variantResult.purchaseSets?.[0]?.price || 0,
+                            sellingPrice: Number(reqItem.price) - (itemDiscount / qty),
+                            quantity: restoreQty,
+                            previousStock: variantResult.availableStock - restoreQty,
+                            updatedStock: variantResult.availableStock,
+                            previousPhysicalStock: variantResult.totalStock,
+                            updatedPhysicalStock: variantResult.totalStock,
+                            totalProductStock: currentTotalProductStock,
+                            productId: productId
+                        }], { session });
+
+                        itemStockIds.push(newStockLog[0]._id);
+                    }
+
+                    // Price/discount update (recalculate sellingPrice in existing logs if price/discount changed)
+                    const finalPrice = reqItem.price !== undefined && reqItem.price !== null ? Number(reqItem.price) : oldInfo.price;
+                    const itemDiscountType = reqItem.discountType !== undefined ? reqItem.discountType : (oldInfo.discountType || "flat");
+                    const syncedDiscount = syncItemDiscount(itemDiscount, itemDiscountPercent, finalPrice, itemDiscountType);
+                    const finalDiscount = syncedDiscount.discount;
+                    const finalDiscountPercent = syncedDiscount.discountPercent;
+                    const finalUnitSellingPrice = finalPrice - finalDiscount;
+
+                    if (itemStockIds.length > 0) {
+                        await Stock.updateMany(
+                            { _id: { $in: itemStockIds } },
+                            { $set: { sellingPrice: finalUnitSellingPrice } },
+                            { session }
+                        );
+                    }
+
+                    const changes = [];
+                    if (qty !== oldQty) {
+                        changes.push(`Qty: ${oldQty} -> ${qty}`);
+                    }
+                    if (finalPrice !== oldInfo.price) {
+                        changes.push(`Price: ₹${oldInfo.price} -> ₹${finalPrice}`);
+                    }
+                    if (finalDiscount !== oldInfo.discount) {
+                        changes.push(`Discount: ₹${oldInfo.discount} -> ₹${finalDiscount}`);
+                    }
+                    if (changes.length > 0) {
+                        itemChanges.push(`${variantName} (${changes.join(", ")})`);
+                    }
+
+                    newItems.push({
+                        productId,
+                        variantName,
+                        quantity: qty,
+                        price: finalPrice,
+                        discount: finalDiscount,
+                        discountPercent: finalDiscountPercent,
+                        discountType: itemDiscountType,
+                        stockIds: itemStockIds,
+                        purchasePrice: avgPurchasePrice,
+                        purchaseSetId: selectedSetId,
+                        purchaseSets: allocatedSets.filter(s => s.quantity > 0),
+                        variantId: variant._id,
+                        sku: String(variant._id)
+                    });
+
+                    oldItemsMap.delete(key);
+                }
+
+                // Restore any completely deleted items
+                for (const [key, oldInfo] of oldItemsMap.entries()) {
+                    const oldQty = oldInfo.quantity;
+
+                    // Resolve the query: prefer variantId, fall back to productId+name from composite key
+                    const variantQuery = oldInfo.variantId
+                        ? { _id: oldInfo.variantId }
+                        : (() => { const [pid, vname] = key.split("_"); return { productId: pid, name: vname }; })();
+
+                    const variantResult = await Variant.findOneAndUpdate(
+                        variantQuery,
+                        { $inc: { availableStock: oldQty } },
+                        { new: true, session }
+                    );
+
+                    if (!variantResult) {
+                        console.warn(`[updateQuotationItems] Could not find variant to restore stock for key: ${key}`);
+                        continue;
+                    }
+
+                    await Inventory.findOneAndUpdate(
+                        { product: variantResult.productId },
+                        { $inc: { reservedStock: -oldQty } },
+                        { new: true, session }
+                    );
+
+                    for (const alloc of oldInfo.purchaseSets) {
+                        const set = variantResult.purchaseSets.id(alloc.purchaseSetId);
+                        if (set) {
+                            set.availableStock += alloc.quantity;
+                        }
+                    }
+
+                    // Save only purchaseSets, never re-write availableStock via save()
+                    await Variant.updateOne(
+                        { _id: variantResult._id },
+                        { $set: { purchaseSets: variantResult.purchaseSets } },
+                        { session }
+                    );
+                    await syncProductStock(variantResult.productId, session);
+
+                    const parentProduct = await Product.findById(variantResult.productId).session(session);
+                    const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+                    await Stock.create([{
+                        quotationId: quotation.quotationId,
+                        quotationRef: quotation._id,
+                        type: "remove-item", // sign: +
+                        category: "virtual",
+                        variantId: variantResult._id,
+                        variantName: variantResult.name,
+                        purchasePrice: oldInfo.purchasePrice,
+                        sellingPrice: oldInfo.price - (oldInfo.discount / oldQty),
+                        quantity: oldQty,
+                        previousStock: variantResult.availableStock - oldQty,
+                        updatedStock: variantResult.availableStock,
+                        previousPhysicalStock: variantResult.totalStock,
+                        updatedPhysicalStock: variantResult.totalStock,
+                        totalProductStock: currentTotalProductStock,
+                        productId: variantResult.productId
+                    }], { session });
+
+                    itemChanges.push(`Removed item ${variantResult.name || key} (Qty: ${oldQty})`);
+                }
+
+                quotation.items = newItems;
+            }
+
+            // Recalculate totals
+            let subtotal = 0;
+            for (const item of quotation.items) {
+                const qty = item.quantity;
+                const price = item.price;
+                subtotal += qty * (price - (item.discount || 0));
+            }
+            quotation.subtotal = subtotal;
+
+            let flatDiscount = Number(discount !== undefined ? discount : quotation.discount);
+            let percentDiscount = Number(discountPercent !== undefined ? discountPercent : quotation.discountPercent);
+            // Use the saved discountType to decide which value is the anchor
+            const globalDiscountType = req.body.discountType || quotation.discountType || 'flat';
+            if (subtotal > 0) {
+                if (globalDiscountType === 'percentage') {
+                    // Percentage is the anchor — recompute flat from new subtotal
+                    flatDiscount = parseFloat(((subtotal * percentDiscount) / 100).toFixed(2));
+                } else {
+                    // Flat is the anchor — keep flat constant, recompute percent for display
+                    percentDiscount = parseFloat(((flatDiscount / subtotal) * 100).toFixed(2));
+                }
+            }
+            quotation.discount = flatDiscount;
+            quotation.discountPercent = percentDiscount;
+
+            const delCharge = deliveryCharge !== undefined ? Number(deliveryCharge) : quotation.deliveryCharge;
+            quotation.deliveryCharge = delCharge;
+
+            quotation.orderAmount = Math.max(0, subtotal - flatDiscount + delCharge);
+
+            await quotation.save({ session });
+
+            const remarks = itemChanges.length > 0 ? `Updated items: ${itemChanges.join("; ")}` : "Quotation items, pricing, or quantities updated.";
+
+            await logActivity({
+                quotationId: quotation._id,
+                action: "Items Edited",
+                remarks,
+                req,
+                session
+            });
+        });
+
+        const updatedQuotation = await Quotation.findById(id).populate("items.productId");
+        return res.status(200).json(new ApiResponse(200, { quotation: updatedQuotation }, "Quotation items updated successfully."));
+    } catch (error) {
+        console.error("Error in updateQuotationItems:", error);
+        throw error;
+    } finally {
+        session.endSession();
+    }
+});
+
+export const getQuotationActivity = asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const activityLogs = await ActivityLog.find({ quotationId: id })
+        .sort({ createdAt: -1 });
+    return res.status(200).json(new ApiResponse(200, activityLogs, "Quotation activity logs fetched successfully."));
+});
+
+

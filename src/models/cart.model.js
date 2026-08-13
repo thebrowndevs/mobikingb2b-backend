@@ -12,6 +12,10 @@ export const itemsSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Variant'
     },
+    stockIds: [{
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Stock'
+    }],
     sku: {
         type: String,
     },
@@ -48,6 +52,11 @@ export const itemsSchema = new mongoose.Schema({
     discountPercent: {
         type: Number,
         default: 0
+    },
+    discountType: {
+        type: String,
+        enum: ["flat", "percentage"],
+        default: "flat"
     },
     appliedSlab: {
         quantity: Number,

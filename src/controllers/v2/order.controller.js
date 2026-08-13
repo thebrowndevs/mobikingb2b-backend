@@ -722,7 +722,7 @@ const createOnlineOrderV2 = asyncHandler(async (req, res) => {
                 throw new ApiError(400, `Insufficient stock for ${variantKey}`);
             }
 
-            subtotal_amount += item.price * item.quantity;
+            subtotal_amount += (item.price - (item.discount || 0)) * item.quantity;
             const categoryId = prod.category._id.toString();
             const deliveryCharge = prod.category.deliveryCharge || 0;
 
@@ -820,7 +820,7 @@ const createOnlineOrderV2 = asyncHandler(async (req, res) => {
                     orderId: newOrder.orderId,
                     orderRef: newOrder?._id,
                     variantName: variantKey,
-                    purchasePrice: item.price,
+                    purchasePrice: item.purchasePrice || 0,
                     quantity: qty,
                     previousStock,
                     updatedStock,
