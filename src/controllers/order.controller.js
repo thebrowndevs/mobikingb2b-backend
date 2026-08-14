@@ -5677,10 +5677,25 @@ export const updateOrderItems = asyncHandler(async (req, res) => {
         }
 
         await session.withTransaction(async () => {
+            const clonePurchaseSets = (sets = []) => sets.map(s => ({
+                purchaseSetId: String(s.purchaseSetId),
+                quantity: Number(s.quantity || 0),
+                price: Number(s.price || 0)
+            }));
+
             const oldItemsMap = new Map();
             for (const item of order.items) {
                 const key = item.variantId ? item.variantId.toString() : `${item.productId.toString()}_${item.variantName}`;
-                oldItemsMap.set(key, { quantity: item.quantity, stockIds: item.stockIds || [], price: item.price, discount: item.discount, variantId: item.variantId });
+                oldItemsMap.set(key, {
+                    quantity: item.quantity,
+                    stockIds: item.stockIds || [],
+                    price: item.price,
+                    discount: item.discount,
+                    variantId: item.variantId,
+                    purchasePrice: item.purchasePrice || 0,
+                    purchaseSetId: item.purchaseSetId || "",
+                    purchaseSets: item.purchaseSets || []
+                });
             }
 
             const newItems = [];
@@ -5698,14 +5713,35 @@ export const updateOrderItems = asyncHandler(async (req, res) => {
                     if (qty <= 0) continue;
 
                     const key = variantId ? variantId.toString() : `${productId.toString()}_${variantName}`;
-                    const oldInfo = oldItemsMap.get(key) || { quantity: 0, stockIds: [], price: 0, discount: 0, variantId: null };
+                    const oldInfo = oldItemsMap.get(key) || {
+                        quantity: 0,
+                        stockIds: [],
+                        price: 0,
+                        discount: 0,
+                        variantId: null,
+                        purchasePrice: 0,
+                        purchaseSetId: "",
+                        purchaseSets: []
+                    };
                     const oldQty = oldInfo.quantity;
                     const diff = qty - oldQty;
+
+                    const finalPrice = reqItem.price !== undefined && reqItem.price !== null ? Number(reqItem.price) : oldInfo.price;
+                    const itemDiscountType = reqItem.discountType !== undefined ? reqItem.discountType : (oldInfo.discountType || "flat");
+                    const syncedDiscount = syncItemDiscount(itemDiscount, itemDiscountPercent, finalPrice, itemDiscountType);
+                    const finalDiscount = syncedDiscount.discount;
+                    const finalDiscountPercent = syncedDiscount.discountPercent;
+                    const finalUnitSellingPrice = finalPrice - finalDiscount;
 
                     const product = await Product.findById(productId).session(session);
                     if (!product) throw new ApiError(404, `Product not found for ID: ${productId}`);
 
                     let itemStockIds = [...oldInfo.stockIds];
+                    let allocatedSets = clonePurchaseSets(oldInfo.purchaseSets);
+                    let selectedSetId = oldInfo.purchaseSetId || "";
+                    let avgPurchasePrice = Number(oldInfo.purchasePrice || 0);
+                    let incrementalPurchasePrice = 0;
+                    let restoredPurchasePrice = 0;
 
                     // Adjust stock if quantity changed
                     if (diff > 0) {
@@ -5722,6 +5758,84 @@ export const updateOrderItems = asyncHandler(async (req, res) => {
                             throw new ApiError(400, `Insufficient stock for product ${product.fullName} variant ${variantName}`);
                         }
 
+                        // FIFO allocation on purchaseSets
+                        let remaining = diff;
+                        const sortedSets = variantResult.purchaseSets
+                            .map((set, idx) => ({ set, idx }))
+                            .filter(itemObj => itemObj.set.availableStock > 0)
+                            .sort((a, b) => a.set.price - b.set.price);
+
+                        let totalCost = 0;
+                        const newlyAllocated = [];
+
+                        for (const itemObj of sortedSets) {
+                            const set = variantResult.purchaseSets[itemObj.idx];
+                            const take = Math.min(remaining, set.availableStock);
+                            if (take <= 0) continue;
+                            set.availableStock -= take;
+                            set.remainingStock = Math.max(0, set.remainingStock - take);
+                            totalCost += take * set.price;
+                            newlyAllocated.push({
+                                purchaseSetId: String(set._id),
+                                quantity: take,
+                                price: set.price
+                            });
+                            remaining -= take;
+
+                            if (!selectedSetId) {
+                                selectedSetId = String(set._id);
+                            }
+
+                            if (remaining === 0) break;
+                        }
+
+                        if (remaining > 0 && variantResult.purchaseSets.length > 0) {
+                            const firstSet = variantResult.purchaseSets[0];
+                            firstSet.availableStock = Math.max(0, firstSet.availableStock - remaining);
+                            firstSet.remainingStock = Math.max(0, firstSet.remainingStock - remaining);
+                            newlyAllocated.push({
+                                purchaseSetId: String(firstSet._id),
+                                quantity: remaining,
+                                price: firstSet.price
+                            });
+                            if (!selectedSetId) {
+                                selectedSetId = String(firstSet._id);
+                            }
+                            totalCost += remaining * firstSet.price;
+                        }
+
+                        incrementalPurchasePrice = diff > 0 ? (totalCost / diff) : 0;
+
+                        // Fallback populating allocatedSets if it was empty from bad/old data
+                        if (allocatedSets.length === 0 && oldQty > 0) {
+                            const fallbackSetId = oldInfo.purchaseSetId || (variantResult.purchaseSets[0] ? String(variantResult.purchaseSets[0]._id) : "");
+                            if (fallbackSetId) {
+                                allocatedSets = [{
+                                    purchaseSetId: fallbackSetId,
+                                    quantity: oldQty,
+                                    price: Number(oldInfo.purchasePrice || 0)
+                                }];
+                            }
+                        }
+
+                        // Merge into the item's purchaseSets
+                        for (const alloc of newlyAllocated) {
+                            const matched = allocatedSets.find(s => s.purchaseSetId === alloc.purchaseSetId);
+                            if (matched) {
+                                matched.quantity += alloc.quantity;
+                            } else {
+                                allocatedSets.push(alloc);
+                            }
+                        }
+
+                        // Calculate weighted average purchase price
+                        if (avgPurchasePrice > 0 || incrementalPurchasePrice > 0) {
+                            avgPurchasePrice = parseFloat((((oldInfo.purchasePrice * oldQty) + (incrementalPurchasePrice * diff)) / qty).toFixed(3)) || 0;
+                        } else {
+                            avgPurchasePrice = incrementalPurchasePrice;
+                        }
+
+                        await variantResult.save({ session });
                         await syncProductStock(productId, session);
 
                         const parentProduct = await Product.findById(productId).session(session);
@@ -5735,8 +5849,8 @@ export const updateOrderItems = asyncHandler(async (req, res) => {
                             category: "physical",
                             variantId: variantResult._id,
                             variantName: variantResult.name,
-                            purchasePrice: variantResult.purchaseSets?.[0]?.price || 0,
-                            sellingPrice: Number(reqItem.price) - (itemDiscount / qty),
+                            purchasePrice: incrementalPurchasePrice,
+                            sellingPrice: finalUnitSellingPrice,
                             quantity: diff,
                             previousStock: variantResult.availableStock + diff,
                             updatedStock: variantResult.availableStock,
@@ -5763,6 +5877,59 @@ export const updateOrderItems = asyncHandler(async (req, res) => {
                             throw new ApiError(400, `Failed to restore variant stock for product ${product.fullName}`);
                         }
 
+                        // Fallback populating allocatedSets if it was empty from bad/old data
+                        if (allocatedSets.length === 0 && oldQty > 0) {
+                            const fallbackSetId = oldInfo.purchaseSetId || (variantResult.purchaseSets[0] ? String(variantResult.purchaseSets[0]._id) : "");
+                            if (fallbackSetId) {
+                                allocatedSets = [{
+                                    purchaseSetId: fallbackSetId,
+                                    quantity: oldQty,
+                                    price: Number(oldInfo.purchasePrice || 0)
+                                }];
+                            }
+                        }
+
+                        let remainingToRestore = restoreQty;
+                        let restoredCost = 0;
+                        let restoredQty = 0;
+
+                        for (const alloc of allocatedSets) {
+                            const take = Math.min(remainingToRestore, alloc.quantity);
+                            if (take <= 0) continue;
+
+                            const set = variantResult.purchaseSets.find(s => String(s._id) === String(alloc.purchaseSetId));
+                            if (set) {
+                                set.availableStock += take;
+                                set.remainingStock += take;
+                            }
+                            alloc.quantity -= take;
+                            remainingToRestore -= take;
+                            restoredCost += take * alloc.price;
+                            restoredQty += take;
+
+                            if (remainingToRestore === 0) break;
+                        }
+
+                        // Fallback if we couldn't restore everything (desynced)
+                        if (remainingToRestore > 0 && variantResult.purchaseSets.length > 0) {
+                            const firstSet = variantResult.purchaseSets[0];
+                            firstSet.availableStock += remainingToRestore;
+                            firstSet.remainingStock += remainingToRestore;
+                            restoredCost += remainingToRestore * firstSet.price;
+                            restoredQty += remainingToRestore;
+                        }
+
+                        const remainingAllocations = allocatedSets.filter(alloc => alloc.quantity > 0);
+                        const remainingQty = remainingAllocations.reduce((sum, a) => sum + a.quantity, 0);
+                        const remainingCost = remainingAllocations.reduce((sum, a) => sum + (a.quantity * a.price), 0);
+
+                        avgPurchasePrice = remainingQty > 0 ? parseFloat((remainingCost / remainingQty).toFixed(3)) : 0;
+                        selectedSetId = remainingAllocations.length > 0 ? remainingAllocations[0].purchaseSetId : "";
+                        allocatedSets = remainingAllocations;
+
+                        restoredPurchasePrice = restoredQty > 0 ? parseFloat((restoredCost / restoredQty).toFixed(3)) : 0;
+
+                        await variantResult.save({ session });
                         await syncProductStock(productId, session);
 
                         const parentProduct = await Product.findById(productId).session(session);
@@ -5775,8 +5942,8 @@ export const updateOrderItems = asyncHandler(async (req, res) => {
                             category: "physical",
                             variantId: variantResult._id,
                             variantName: variantResult.name,
-                            purchasePrice: variantResult.purchaseSets?.[0]?.price || 0,
-                            sellingPrice: Number(reqItem.price) - (itemDiscount / qty),
+                            purchasePrice: restoredPurchasePrice,
+                            sellingPrice: finalUnitSellingPrice,
                             quantity: restoreQty,
                             previousStock: variantResult.availableStock - restoreQty,
                             updatedStock: variantResult.availableStock,
@@ -5789,18 +5956,16 @@ export const updateOrderItems = asyncHandler(async (req, res) => {
                         itemStockIds.push(newStockLog[0]._id);
                     }
 
-                    // Price/discount update (recalculate sellingPrice in existing logs if price/discount changed)
-                    const finalPrice = reqItem.price !== undefined && reqItem.price !== null ? Number(reqItem.price) : oldInfo.price;
-                    const itemDiscountType = reqItem.discountType !== undefined ? reqItem.discountType : (oldInfo.discountType || "flat");
-                    const syncedDiscount = syncItemDiscount(itemDiscount, itemDiscountPercent, finalPrice, itemDiscountType);
-                    const finalDiscount = syncedDiscount.discount;
-                    const finalDiscountPercent = syncedDiscount.discountPercent;
-                    const finalUnitSellingPrice = finalPrice - finalDiscount;
 
                     if (itemStockIds.length > 0) {
                         await Stock.updateMany(
                             { _id: { $in: itemStockIds } },
-                            { $set: { sellingPrice: finalUnitSellingPrice } },
+                            {
+                                $set: {
+                                    sellingPrice: finalUnitSellingPrice,
+                                    purchasePrice: avgPurchasePrice
+                                }
+                            },
                             { session }
                         );
                     }
@@ -5828,7 +5993,10 @@ export const updateOrderItems = asyncHandler(async (req, res) => {
                         discountPercent: finalDiscountPercent,
                         discountType: itemDiscountType,
                         stockIds: itemStockIds,
-                        variantId: oldInfo.variantId || (await Variant.findOne({ productId, name: variantName }).session(session))?._id
+                        variantId: oldInfo.variantId || (await Variant.findOne({ productId, name: variantName }).session(session))?._id,
+                        purchasePrice: avgPurchasePrice,
+                        purchaseSetId: selectedSetId,
+                        purchaseSets: allocatedSets
                     });
 
                     oldItemsMap.delete(key);
@@ -5854,6 +6022,50 @@ export const updateOrderItems = asyncHandler(async (req, res) => {
                         continue;
                     }
 
+                    let allocatedSets = clonePurchaseSets(oldInfo.purchaseSets);
+                    // Fallback populating allocatedSets if it was empty from bad/old data
+                    if (allocatedSets.length === 0 && oldQty > 0) {
+                        const fallbackSetId = oldInfo.purchaseSetId || (variantResult.purchaseSets[0] ? String(variantResult.purchaseSets[0]._id) : "");
+                        if (fallbackSetId) {
+                            allocatedSets = [{
+                                purchaseSetId: fallbackSetId,
+                                quantity: oldQty,
+                                price: Number(oldInfo.purchasePrice || 0)
+                            }];
+                        }
+                    }
+
+                    let remainingToRestore = oldQty;
+                    let restoredCost = 0;
+                    let restoredQty = 0;
+
+                    for (const alloc of allocatedSets) {
+                        const take = Math.min(remainingToRestore, alloc.quantity);
+                        if (take <= 0) continue;
+
+                        const set = variantResult.purchaseSets.find(s => String(s._id) === String(alloc.purchaseSetId));
+                        if (set) {
+                            set.availableStock += take;
+                            set.remainingStock += take;
+                        }
+                        remainingToRestore -= take;
+                        restoredCost += take * alloc.price;
+                        restoredQty += take;
+
+                        if (remainingToRestore === 0) break;
+                    }
+
+                    if (remainingToRestore > 0 && variantResult.purchaseSets.length > 0) {
+                        const firstSet = variantResult.purchaseSets[0];
+                        firstSet.availableStock += remainingToRestore;
+                        firstSet.remainingStock += remainingToRestore;
+                        restoredCost += remainingToRestore * firstSet.price;
+                        restoredQty += remainingToRestore;
+                    }
+
+                    const restoredPurchasePrice = restoredQty > 0 ? parseFloat((restoredCost / restoredQty).toFixed(3)) : 0;
+
+                    await variantResult.save({ session });
                     await syncProductStock(variantResult.productId, session);
 
                     const parentProduct = await Product.findById(variantResult.productId).session(session);
@@ -5866,7 +6078,7 @@ export const updateOrderItems = asyncHandler(async (req, res) => {
                         category: "physical",
                         variantId: variantResult._id,
                         variantName: variantResult.name,
-                        purchasePrice: variantResult.purchaseSets?.[0]?.price || 0,
+                        purchasePrice: restoredPurchasePrice,
                         sellingPrice: oldInfo.price - (oldInfo.discount / oldQty),
                         quantity: oldQty,
                         previousStock: variantResult.availableStock - oldQty,
