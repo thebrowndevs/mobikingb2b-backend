@@ -356,14 +356,11 @@ export const updateQuotationStatus = asyncHandler(async (req, res) => {
                     const qty = Math.floor(Number(item.quantity));
                     if (qty <= 0) continue;
 
-                    const variant = await Variant.findOneAndUpdate(
-                        { _id: item.variantId },
-                        { $inc: { availableStock: qty } },
-                        { new: true, session }
-                    );
+                    const variant = await Variant.findById(item.variantId).session(session);
 
                     if (variant) {
-                        const previousAvailable = variant.availableStock - qty;
+                        const previousAvailable = variant.availableStock;
+                        variant.availableStock += qty;
 
                         // Restore availableStock to the specific purchaseSets
                         if (item.purchaseSets && item.purchaseSets.length > 0) {
@@ -415,6 +412,7 @@ export const updateQuotationStatus = asyncHandler(async (req, res) => {
                             variantId: variant._id,
                             variantName: variant.name,
                             purchasePrice: item.purchasePrice || 0,
+                            sellingPrice: Number(item.price || 0) - Number(item.discount || 0),
                             quantity: qty,
                             previousStock: previousAvailable,
                             updatedStock: variant.availableStock,
@@ -434,20 +432,14 @@ export const updateQuotationStatus = asyncHandler(async (req, res) => {
                     const qty = Math.floor(Number(item.quantity));
                     if (qty <= 0) continue;
 
-                    const variant = await Variant.findOneAndUpdate(
-                        {
-                            _id: item.variantId,
-                            availableStock: { $gte: qty }
-                        },
-                        { $inc: { availableStock: -qty } },
-                        { new: true, session }
-                    );
+                    const variant = await Variant.findById(item.variantId).session(session);
 
-                    if (!variant) {
+                    if (!variant || variant.availableStock < qty) {
                         throw new ApiError(400, `Insufficient available stock to re-reserve variant "${item.variantName}".`);
                     }
 
-                    const previousAvailable = variant.availableStock + qty;
+                    const previousAvailable = variant.availableStock;
+                    variant.availableStock -= qty;
 
                     // Deduct availableStock from specific purchaseSets
                     if (item.purchaseSets && item.purchaseSets.length > 0) {
@@ -495,6 +487,7 @@ export const updateQuotationStatus = asyncHandler(async (req, res) => {
                         variantId: variant._id,
                         variantName: variant.name,
                         purchasePrice: item.purchasePrice || 0,
+                        sellingPrice: Number(item.price || 0) - Number(item.discount || 0),
                         quantity: qty,
                         previousStock: previousAvailable,
                         updatedStock: variant.availableStock,
