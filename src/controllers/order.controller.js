@@ -5957,9 +5957,25 @@ export const updateOrderItems = asyncHandler(async (req, res) => {
                     }
 
 
-                    if (itemStockIds.length > 0) {
+                    const queryConditions = [];
+                    if (order._id) {
+                        const cond = { orderRef: order._id };
+                        const vId = reqItem.variantId || oldInfo.variantId;
+                        if (vId) {
+                            cond.variantId = vId;
+                        } else {
+                            if (productId) cond.productId = productId;
+                            if (variantName) cond.variantName = variantName;
+                        }
+                        queryConditions.push(cond);
+                    }
+                    if (itemStockIds && itemStockIds.length > 0) {
+                        queryConditions.push({ _id: { $in: itemStockIds } });
+                    }
+
+                    if (queryConditions.length > 0) {
                         await Stock.updateMany(
-                            { _id: { $in: itemStockIds } },
+                            { $or: queryConditions },
                             {
                                 $set: {
                                     sellingPrice: finalUnitSellingPrice,

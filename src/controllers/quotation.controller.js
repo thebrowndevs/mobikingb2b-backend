@@ -1432,6 +1432,7 @@ export const addItemQuantityInQuotation = asyncHandler(async (req, res) => {
 
             await syncStockLogSellingPrices({
                 items: quotation.items,
+                quotationRef: quotation._id,
                 session
             });
 
@@ -1590,6 +1591,7 @@ export const removeItemQuantityInQuotation = asyncHandler(async (req, res) => {
 
             await syncStockLogSellingPrices({
                 items: quotation.items,
+                quotationRef: quotation._id,
                 session
             });
 
@@ -2508,6 +2510,8 @@ export const updateQuotationItems =
                         {
                             items:
                                 quotation.items,
+                            quotationRef:
+                                quotation._id,
                             session
                         }
                     );

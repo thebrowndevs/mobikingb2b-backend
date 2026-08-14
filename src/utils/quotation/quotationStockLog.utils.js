@@ -154,25 +154,45 @@ export const insertPendingStockLogs =
 export const syncStockLogSellingPrices =
     async ({
         items,
+        quotationRef,
         session
     }) => {
         for (const item of items) {
-            if (
-                !item.stockIds ||
-                item.stockIds.length === 0
-            ) {
-                continue;
-            }
-
             const finalUnitSellingPrice =
                 Number(item.price || 0) -
                 Number(item.discount || 0);
 
-            await Stock.updateMany(
-                {
+            const queryConditions = [];
+            if (quotationRef) {
+                const cond = { quotationRef };
+                if (item.variantId) {
+                    cond.variantId = item.variantId;
+                } else {
+                    if (item.productId) {
+                        cond.productId = item.productId;
+                    }
+                    if (item.variantName) {
+                        cond.variantName = item.variantName;
+                    }
+                }
+                queryConditions.push(cond);
+            }
+
+            if (item.stockIds && item.stockIds.length > 0) {
+                queryConditions.push({
                     _id: {
                         $in: item.stockIds
                     }
+                });
+            }
+
+            if (queryConditions.length === 0) {
+                continue;
+            }
+
+            await Stock.updateMany(
+                {
+                    $or: queryConditions
                 },
                 {
                     $set: {
