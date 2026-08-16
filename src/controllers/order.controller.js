@@ -218,7 +218,6 @@ const createPosOrder = asyncHandler(async (req, res) => {
             for (const item of newQuote.items) {
                 const qty = Math.floor(Number(item.quantity));
                 if (qty <= 0) continue;
-
                 // 1. Atomically find and decrement availableStock on the Variant collection
                 const variant = await Variant.findOneAndUpdate(
                     {
@@ -236,6 +235,51 @@ const createPosOrder = asyncHandler(async (req, res) => {
                 if (!variant) {
                     throw new ApiError(400, `Insufficient available stock for variant "${item.variantName}".`);
                 }
+
+                // FIFO allocation on purchaseSets availableStock
+                let remaining = qty;
+                const sortedSets = variant.purchaseSets
+                    .map((set, idx) => ({ set, idx }))
+                    .filter(itemObj => itemObj.set.availableStock > 0)
+                    .sort((a, b) => a.set.price - b.set.price);
+
+                let selectedSetId = "";
+                let totalCost = 0;
+                const allocatedSets = [];
+
+                for (const itemObj of sortedSets) {
+                    const set = variant.purchaseSets[itemObj.idx];
+                    const take = Math.min(remaining, set.availableStock);
+                    set.availableStock -= take;
+                    totalCost += take * set.price;
+                    allocatedSets.push({
+                        purchaseSetId: String(set._id),
+                        quantity: take,
+                        price: set.price
+                    });
+                    remaining -= take;
+
+                    if (!selectedSetId && take > 0) {
+                        selectedSetId = String(set._id);
+                    }
+
+                    if (remaining === 0) break;
+                }
+
+                if (remaining > 0 && variant.purchaseSets.length > 0) {
+                    variant.purchaseSets[0].availableStock = Math.max(0, variant.purchaseSets[0].availableStock - remaining);
+                    allocatedSets.push({
+                        purchaseSetId: String(variant.purchaseSets[0]._id),
+                        quantity: remaining,
+                        price: variant.purchaseSets[0].price
+                    });
+                    selectedSetId = String(variant.purchaseSets[0]._id);
+                    totalCost += remaining * variant.purchaseSets[0].price;
+                }
+
+                await variant.save({ session });
+
+                const avgPurchasePrice = qty > 0 ? (totalCost / qty) : 0;
 
                 // 2. Atomically find and decrement availableStock on parent Product
                 const parentProduct = await Product.findOneAndUpdate(
@@ -260,10 +304,15 @@ const createPosOrder = asyncHandler(async (req, res) => {
                 // Sync variant ids & avg purchase price on Quotation items
                 const quoteItem = newQuote.items.find(i => String(i.productId) === String(item.productId) && i.variantName === item.variantName);
                 if (quoteItem) {
-                    quoteItem.purchasePrice = item.price; // directly use items price (prefilled from slab)
+                    quoteItem.purchasePrice = avgPurchasePrice;
+                    quoteItem.purchaseSetId = selectedSetId;
+                    quoteItem.purchaseSets = allocatedSets;
                     quoteItem.variantId = variant._id;
                     quoteItem.sku = String(variant._id);
                 }
+
+                // Calculate safe unit selling price
+                const unitSellingPrice = Math.max(0, Number(item.price || 0) - (qty > 0 ? (Number(item.discount || 0) / qty) : 0));
 
                 // Queue Stock Log (Virtual Category - reserved)
                 stockEntries.push({
@@ -273,7 +322,8 @@ const createPosOrder = asyncHandler(async (req, res) => {
                     category: "virtual",
                     variantId: variant._id,
                     variantName: variant.name,
-                    purchasePrice: item.purchasePrice || 0,
+                    purchasePrice: avgPurchasePrice,
+                    sellingPrice: unitSellingPrice,
                     quantity: qty,
                     previousStock: variant.availableStock + qty,
                     updatedStock: variant.availableStock,
@@ -284,13 +334,19 @@ const createPosOrder = asyncHandler(async (req, res) => {
                 });
             }
 
+            // Write Stock logs and link IDs
+            if (stockEntries.length > 0) {
+                const insertedLogs = await Stock.insertMany(stockEntries, { session });
+                for (const qItem of newQuote.items) {
+                    const matchedLogs = insertedLogs.filter(
+                        log => log.variantId && qItem.variantId && String(log.variantId) === String(qItem.variantId)
+                    );
+                    qItem.stockIds = matchedLogs.map(log => log._id);
+                }
+            }
+
             // Save Quotation item updates
             await newQuote.save({ session });
-
-            // Write Stock logs
-            if (stockEntries.length > 0) {
-                await Stock.insertMany(stockEntries, { session });
-            }
 
             // Finding unique product ids and then add quotation ref
             const uniqueProductIds = new Set();
@@ -4512,7 +4568,7 @@ async function performAdjustStock(
                         "physical",
                     isScratchy: true,
                     purchasePrice: Number(item.purchasePrice || 0),
-                    sellingPrice: Number(item.price || 0) - Number(item.discount || 0)
+                    sellingPrice: Math.max(0, Number(item.price || 0) - (qty > 0 ? (Number(item.discount || 0) / qty) : 0))
                 });
 
                 continue;
@@ -4682,7 +4738,7 @@ async function performAdjustStock(
                 productId,
                 isScratchy: false,
                 purchasePrice: Number(item.purchasePrice || (variant.purchaseSets[0]?.price || 0)),
-                sellingPrice: Number(item.price || 0) - Number(item.discount || 0)
+                sellingPrice: Math.max(0, Number(item.price || 0) - (qty > 0 ? (Number(item.discount || 0) / qty) : 0))
             });
         }
 
