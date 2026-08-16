@@ -755,6 +755,27 @@ export const getPaginatedUsers = asyncHandler(async (req, res) => {
     const usersWithOrdersIds = usersWithOrders.map(u => u._id);
     filter._id = { $nin: usersWithOrdersIds };
   }
+  else if (type === "accountCreated") {
+    // No business details added yet
+    filter["business.active"] = { $ne: true };
+  } else if (type === "pendingVerification") {
+    // Business details added but not approved and not rejected
+    filter["business.active"] = true;
+    filter["business.isApproved"] = { $ne: true };
+    filter.$or = [
+      { "business.rejectionReason": { $exists: false } },
+      { "business.rejectionReason": "" },
+      { "business.rejectionReason": null }
+    ];
+  } else if (type === "verified") {
+    // Business approved (GST auto-approved or admin approved)
+    filter["business.isApproved"] = true;
+  } else if (type === "rejected") {
+    // Admin rejected business
+    filter["business.active"] = true;
+    filter["business.isApproved"] = { $ne: true };
+    filter["business.rejectionReason"] = { $exists: true, $ne: "" };
+  }
 
   /* ========== Fetch Users with Pagination ========== */
   const [users, totalCount] = await Promise.all([

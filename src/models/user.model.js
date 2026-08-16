@@ -81,6 +81,9 @@ const userSchema = new mongoose.Schema({
         approvedAt: {
             type: Date
         },
+        rejectionReason: { type: String, default: "" },
+        rejectedAt: { type: Date },
+        rejectedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
         regsiteredAddress: {
             street: {
                 type: String,

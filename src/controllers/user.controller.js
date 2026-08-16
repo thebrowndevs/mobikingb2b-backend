@@ -1198,10 +1198,10 @@ const createEmployee = asyncHandler(async (req, res) => {
 const editEmployee = asyncHandler(async (req, res) => {
     // const { _id } = req.user;
     const { _id } = req.params;
-    let { name, email, phoneNo, role, permissions, departments } = req.body
+    let { name, email, phoneNo, role, permissions, departments, business } = req.body
 
     if (
-        [name, email, phoneNo, role].some((field) => field?.trim() === "")
+        [name, phoneNo, role].some((field) => field?.trim() === "")
     ) {
         throw new ApiError(400, "All fields are required")
     }
@@ -1210,12 +1210,6 @@ const editEmployee = asyncHandler(async (req, res) => {
     email = email?.trim();
     phoneNo = phoneNo?.trim();
     role = role?.trim();
-
-    // if (role === ROLES.EMPLOYEE && (!permissions || !(departments))) {
-    //     throw new ApiError(400, "Permissions and departments required for employee")
-    // }
-
-    //console.log(req.files);
 
     // const avatarLocalPath = req.files?.avatar[0]?.path;
     //const coverImageLocalPath = req.files?.coverImage[0]?.path;
@@ -1252,11 +1246,40 @@ const editEmployee = asyncHandler(async (req, res) => {
         updates.departments = departments;
     }
 
+    // ✅ Business fields — expand to dot-notation to safely merge sub-doc
+    if (business && typeof business === "object") {
+        const {
+            businessName, businessPhone, businessEmail,
+            gstNumber, gstVerified, isApproved,
+            regsiteredAddress
+        } = business;
+
+        const hasBusinessDetails = (businessName?.trim()) || (businessPhone?.trim()) || (businessEmail?.trim()) || (gstNumber?.trim()) ||
+            (regsiteredAddress?.street?.trim()) || (regsiteredAddress?.city?.trim()) || (regsiteredAddress?.state?.trim()) || (regsiteredAddress?.pinCode?.trim());
+
+        updates["business.active"] = !!hasBusinessDetails;
+
+        if (businessName !== undefined) updates["business.businessName"] = businessName?.trim() ?? "";
+        if (businessPhone !== undefined) updates["business.businessPhone"] = businessPhone?.trim() ?? "";
+        if (businessEmail !== undefined) updates["business.businessEmail"] = businessEmail?.trim() ?? "";
+        if (gstNumber !== undefined) updates["business.gstNumber"] = gstNumber?.trim().toUpperCase() ?? "";
+        if (gstVerified !== undefined) updates["business.gstVerified"] = Boolean(gstVerified);
+        if (isApproved !== undefined) updates["business.isApproved"] = Boolean(isApproved);
+
+        if (regsiteredAddress && typeof regsiteredAddress === "object") {
+            const addr = regsiteredAddress;
+            if (addr.street !== undefined) updates["business.regsiteredAddress.street"] = addr.street ?? "";
+            if (addr.street2 !== undefined) updates["business.regsiteredAddress.street2"] = addr.street2 ?? "";
+            if (addr.city !== undefined) updates["business.regsiteredAddress.city"] = addr.city ?? "";
+            if (addr.state !== undefined) updates["business.regsiteredAddress.state"] = addr.state ?? "";
+            if (addr.pinCode !== undefined) updates["business.regsiteredAddress.pinCode"] = addr.pinCode ?? "";
+            if (addr.country !== undefined) updates["business.regsiteredAddress.country"] = addr.country ?? "India";
+        }
+    }
+
     let updatedUser = await User.findByIdAndUpdate(
         { _id },
-        {
-            ...updates
-        },
+        { $set: updates },
         { new: true }
     ).select(
         "-password -refreshToken"
@@ -1939,6 +1962,47 @@ const rejectWarrantyRequest = asyncHandler(async (req, res) => {
         .json(new ApiResponse(200, updatedOrder, "Warranty request rejected successfully"));
 });
 
+const verifyCustomerBusiness = asyncHandler(async (req, res) => {
+    const { _id } = req.params;
+    const { action, rejectionReason } = req.body;
+
+    if (!mongoose.Types.ObjectId.isValid(_id)) {
+        throw new ApiError(400, "Invalid customer ID");
+    }
+
+    const user = await User.findById(_id);
+    if (!user) {
+        throw new ApiError(404, "Customer not found");
+    }
+
+    if (action === "approve") {
+        user.business.isApproved = true;
+        user.business.approvedBy = req.user?._id || null;
+        user.business.approvedAt = new Date();
+        user.business.rejectionReason = "";
+        user.business.rejectedBy = null;
+        user.business.rejectedAt = null;
+    } else if (action === "reject") {
+        if (!rejectionReason?.trim()) {
+            throw new ApiError(400, "Rejection reason is required");
+        }
+        user.business.isApproved = false;
+        user.business.rejectionReason = rejectionReason.trim();
+        user.business.rejectedBy = req.user?._id || null;
+        user.business.rejectedAt = new Date();
+        user.business.approvedBy = null;
+        user.business.approvedAt = null;
+    } else {
+        throw new ApiError(400, "Invalid action, must be approve or reject");
+    }
+
+    await user.save();
+
+    return res.status(200).json(
+        new ApiResponse(200, user, "Business verification status updated successfully")
+    );
+});
+
 export {
     loginUser,
     signupUser,
@@ -1964,5 +2028,5 @@ export {
     rejectReturnRequest,
     placeWarrantyRequest,
     rejectWarrantyRequest,
-
+    verifyCustomerBusiness,
 }

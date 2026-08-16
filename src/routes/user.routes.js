@@ -30,7 +30,8 @@ import {
     forgotPasswordTokenRequest,
     resetPasswordWithToken,
     getUserCart,
-    getMyProfile
+    getMyProfile,
+    verifyCustomerBusiness
 } from "../controllers/user.controller.js";
 import { verifyJWT } from "../middlewares/auth.middlewares.js";
 import {
@@ -91,5 +92,8 @@ router.route("/request/warranty").post(verifyJWT, placeWarrantyRequest);
 router.route("/request/warranty/reject").post(verifyJWT, rejectWarrantyRequest);
 router.route("/request/return").post(verifyJWT, placeReturnRequest);
 router.route("/request/return/reject").post(verifyJWT, rejectReturnRequest);
+
+//Business Verification Route
+router.route("/:_id/business/verify").patch(verifyJWT, verifyCustomerBusiness);
 
 export default router

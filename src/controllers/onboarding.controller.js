@@ -315,6 +315,8 @@ export const saveBusinessDetails = asyncHandler(async (req, res) => {
             pinCode: registeredAddress.pinCode,
             country: registeredAddress.country || "India",
         },
+        // ✅ Sync business name → user.name (website → user name only, one-way)
+        "name": businessName.trim(),
     };
 
     if (isGstPath) {
@@ -322,6 +324,9 @@ export const saveBusinessDetails = asyncHandler(async (req, res) => {
         businessUpdate["business.gstVerified"] = true;
         businessUpdate["business.verified"] = true;
         businessUpdate["business.gstData"] = gstData || null;
+        businessUpdate["business.isApproved"] = true;
+        businessUpdate["business.approvedBy"] = null;
+        businessUpdate["business.approvedAt"] = new Date();
     }
 
     const updatedUser = await User.findByIdAndUpdate(
