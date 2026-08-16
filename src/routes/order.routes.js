@@ -39,6 +39,7 @@ import {
     manualShipOrder,
     updateManualShippingStatus,
     systemCreatedCancel,
+    systemCreatedReject,
     getOrderActivity
 } from "../controllers/order.controller.js";
 import {
@@ -126,10 +127,7 @@ router.route("/schedulePickup").post(
 
 router.route("/reject").post(
     verifyJWT,
-    shiprocketAuth,
-    preShiprocketReject,
-    createdReject,
-    awbReject
+    systemCreatedReject
 )
 
 router.route("/cancel").post(

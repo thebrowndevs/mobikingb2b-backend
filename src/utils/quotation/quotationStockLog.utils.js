@@ -1,56 +1,130 @@
 import { Stock } from "../../models/stock.model.js";
 
+// export const buildPendingStockLog = ({
+//     quotation,
+//     variant,
+//     productId,
+//     type,
+//     quantity,
+//     purchasePrice,
+//     previousStock,
+//     updatedStock,
+//     price,
+//     discount,
+//     itemQuantity
+// }) => ({
+//     quotationId:
+//         quotation.quotationId,
+//     quotationRef:
+//         quotation._id,
+//     type,
+//     category: "virtual",
+//     variantId:
+//         variant._id,
+//     variantName:
+//         variant.name,
+//     purchasePrice:
+//         Number(purchasePrice || 0),
+//     quantity:
+//         Number(quantity || 0),
+//     previousStock:
+//         Number(previousStock || 0),
+//     updatedStock:
+//         Number(updatedStock || 0),
+//     previousPhysicalStock:
+//         Number(
+//             variant.totalStock || 0
+//         ),
+//     updatedPhysicalStock:
+//         Number(
+//             variant.totalStock || 0
+//         ),
+//     productId,
+
+//     /*
+//      * Keep current application's selling-price
+//      * contract untouched until frontend/backend
+//      * discount semantics have been verified.
+//      */
+//     priceContext: {
+//         price,
+//         discount,
+//         quantity: itemQuantity
+//     }
+// });
+
+
 export const buildPendingStockLog = ({
     quotation,
+    orderId,
+    orderRef,
     variant,
     productId,
     type,
+    category = "virtual",
     quantity,
     purchasePrice,
     previousStock,
     updatedStock,
     price,
     discount,
-    itemQuantity
+    itemQuantity,
+    itemStockIdsRef = null
 }) => ({
-    quotationId:
-        quotation.quotationId,
-    quotationRef:
-        quotation._id,
+    ...(orderId !== undefined && {
+        orderId
+    }),
+
+    ...(orderRef !== undefined && {
+        orderRef
+    }),
+
+    ...(quotation?.quotationId && {
+        quotationId:
+            quotation.quotationId
+    }),
+
+    ...(quotation?._id && {
+        quotationRef:
+            quotation._id
+    }),
+
     type,
-    category: "virtual",
+    category,
+
     variantId:
         variant._id,
+
     variantName:
         variant.name,
+
     purchasePrice:
         Number(purchasePrice || 0),
+
     quantity:
         Number(quantity || 0),
+
     previousStock:
         Number(previousStock || 0),
+
     updatedStock:
         Number(updatedStock || 0),
+
     previousPhysicalStock:
-        Number(
-            variant.totalStock || 0
-        ),
+        Number(variant.totalStock || 0),
+
     updatedPhysicalStock:
-        Number(
-            variant.totalStock || 0
-        ),
+        Number(variant.totalStock || 0),
+
     productId,
 
-    /*
-     * Keep current application's selling-price
-     * contract untouched until frontend/backend
-     * discount semantics have been verified.
-     */
     priceContext: {
         price,
         discount,
         quantity: itemQuantity
-    }
+    },
+
+    itemStockIdsRef
 });
 
 export const insertPendingStockLogs =
@@ -151,58 +225,155 @@ export const insertPendingStockLogs =
  * have the correct sellingPrice set at insertion time, so
  * this updateMany is a harmless overwrite for those entries.
  */
-export const syncStockLogSellingPrices =
-    async ({
-        items,
-        quotationRef,
-        session
-    }) => {
-        for (const item of items) {
-            const finalUnitSellingPrice =
-                Number(item.price || 0) -
-                Number(item.discount || 0);
 
-            const queryConditions = [];
-            if (quotationRef) {
-                const cond = { quotationRef };
-                if (item.variantId) {
-                    cond.variantId = item.variantId;
-                } else {
-                    if (item.productId) {
-                        cond.productId = item.productId;
-                    }
-                    if (item.variantName) {
-                        cond.variantName = item.variantName;
-                    }
+export const syncStockLogSellingPrices = async ({
+    items,
+    quotationRef,
+    orderRef,
+    session
+}) => {
+    for (const item of items) {
+        const finalUnitSellingPrice =
+            Number(item.price || 0) -
+            Number(item.discount || 0);
+
+        const queryConditions = [];
+
+        if (quotationRef) {
+            const cond = {
+                quotationRef
+            };
+
+            if (item.variantId) {
+                cond.variantId =
+                    item.variantId;
+            } else {
+                if (item.productId) {
+                    cond.productId =
+                        item.productId;
                 }
-                queryConditions.push(cond);
+
+                if (item.variantName) {
+                    cond.variantName =
+                        item.variantName;
+                }
             }
 
-            if (item.stockIds && item.stockIds.length > 0) {
-                queryConditions.push({
-                    _id: {
-                        $in: item.stockIds
-                    }
-                });
-            }
-
-            if (queryConditions.length === 0) {
-                continue;
-            }
-
-            await Stock.updateMany(
-                {
-                    $or: queryConditions
-                },
-                {
-                    $set: {
-                        sellingPrice:
-                            finalUnitSellingPrice,
-                        purchasePrice:
-                            Number(item.purchasePrice || 0)
-                    }
-                },
-                { session }
-            );
+            queryConditions.push(cond);
         }
-    };
+
+        if (orderRef) {
+            const cond = {
+                orderRef
+            };
+
+            if (item.variantId) {
+                cond.variantId =
+                    item.variantId;
+            } else {
+                if (item.productId) {
+                    cond.productId =
+                        item.productId;
+                }
+
+                if (item.variantName) {
+                    cond.variantName =
+                        item.variantName;
+                }
+            }
+
+            queryConditions.push(cond);
+        }
+
+        if (
+            item.stockIds &&
+            item.stockIds.length > 0
+        ) {
+            queryConditions.push({
+                _id: {
+                    $in: item.stockIds
+                }
+            });
+        }
+
+        if (queryConditions.length === 0) {
+            continue;
+        }
+
+        await Stock.updateMany(
+            {
+                $or: queryConditions
+            },
+            {
+                $set: {
+                    sellingPrice: finalUnitSellingPrice
+                    //     finalUnitSellingPrice,
+                    // purchasePrice:
+                    //     Number(
+                    //         item.purchasePrice ||
+                    //         0
+                    //     )
+                }
+            },
+            {
+                session
+            }
+        );
+    }
+};
+
+// export const syncStockLogSellingPrices =
+//     async ({
+//         items,
+//         quotationRef,
+//         session
+//     }) => {
+//         for (const item of items) {
+//             const finalUnitSellingPrice =
+//                 Number(item.price || 0) -
+//                 Number(item.discount || 0);
+
+//             const queryConditions = [];
+//             if (quotationRef) {
+//                 const cond = { quotationRef };
+//                 if (item.variantId) {
+//                     cond.variantId = item.variantId;
+//                 } else {
+//                     if (item.productId) {
+//                         cond.productId = item.productId;
+//                     }
+//                     if (item.variantName) {
+//                         cond.variantName = item.variantName;
+//                     }
+//                 }
+//                 queryConditions.push(cond);
+//             }
+
+//             if (item.stockIds && item.stockIds.length > 0) {
+//                 queryConditions.push({
+//                     _id: {
+//                         $in: item.stockIds
+//                     }
+//                 });
+//             }
+
+//             if (queryConditions.length === 0) {
+//                 continue;
+//             }
+
+//             await Stock.updateMany(
+//                 {
+//                     $or: queryConditions
+//                 },
+//                 {
+//                     $set: {
+//                         sellingPrice:
+//                             finalUnitSellingPrice,
+//                         purchasePrice:
+//                             Number(item.purchasePrice || 0)
+//                     }
+//                 },
+//                 { session }
+//             );
+//         }
+//     };

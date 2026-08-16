@@ -31,6 +31,35 @@ import { CompanyDetails } from '../models/company_details.model.js';
 import { recalculateOrderTotals, syncItemDiscount, determineSlabForQuantity } from '../utils/pricing.js';
 import { logActivity } from "../utils/activityLogger.js";
 
+
+import {
+    buildOldItemsMap,
+    validateAndGetItemKey,
+    calculateItemDelta
+} from "../utils/quotation/quotationUpdate.utils.js";
+
+import {
+    clonePurchaseSets,
+    calculateWeightedPurchasePrice,
+    savePurchaseSets
+} from "../utils/quotation/quotationPurchaseSet.utils.js";
+
+import {
+    syncProductStock2
+} from "../utils/quotation/quotationStock.utils.js";
+
+import {
+    buildPendingStockLog,
+    insertPendingStockLogs,
+    syncStockLogSellingPrices
+} from "../utils/quotation/quotationStockLog.utils.js";
+
+import {
+    allocateOrderPurchaseSets,
+    restoreOrderPurchaseSets
+} from "../utils/order/orderPurchaseSet.utils.js";
+
+
 const razorpayConfig = () => {
     const razorpay = new Razorpay({
         key_id: process.env.RAZORPAY_KEY_ID,
@@ -4142,11 +4171,189 @@ const createAbandonedOrderFromCart = async (cartId, userId, address) => {
    Caller apna session pass kar sakta hai — order.save() ke saath atomic
    Fix: _restockDone: { $ne: true } — purane orders bhi correctly handle
 ───────────────────────────────────────────────────────────────────── */
+// async function performAdjustStock(
+//     order,
+//     {
+//         type = STOCK_TYPES.CANCEL,
+//         session: externalSession = null,
+//     } = {}
+// ) {
+//     if (
+//         !order ||
+//         order.abondonedOrder ||
+//         !Array.isArray(order.items) ||
+//         order.items.length === 0
+//     ) {
+//         return null;
+//     }
+
+//     const ownSession = !externalSession;
+//     const session = externalSession ?? await mongoose.startSession();
+
+//     const run = async () => {
+//         const lockedOrder = await Order.findOneAndUpdate(
+//             {
+//                 _id: order._id,
+//                 _restockDone: { $ne: true }
+//             },
+//             { $set: { _restockDone: true } },
+//             { new: true, session }
+//         );
+
+//         if (!lockedOrder) {
+//             console.warn(
+//                 `[adjustStock] Skipped — _restockDone already true ` +
+//                 `for order ${order._id} (type: ${type})`
+//             );
+//             return null;
+//         }
+
+//         const stockEntries = [];
+
+//         for (const item of lockedOrder.items) {
+//             const qty = Math.floor(Number(item.quantity));
+//             if (qty <= 0) continue;
+
+//             const productId = item.productId?._id
+//                 ? String(item.productId._id)
+//                 : String(item.productId);
+
+//             const variantKey = String(item.variantName || "").trim();
+//             if (!variantKey) {
+//                 throw new ApiError(400, `Missing variantName for product ${productId}`);
+//             }
+
+//             const isScratchy = !!item.isScratchy;
+
+//             if (isScratchy) {
+//                 // Scratchy variants are stored inside Product document's scratchyVariants map
+//                 const afterRestore = await Product.findOneAndUpdate(
+//                     { _id: productId },
+//                     {
+//                         $inc: {
+//                             totalStock: qty,
+//                             scratchyStock: qty,
+//                             [`scratchyVariants.${variantKey}`]: qty
+//                         }
+//                     },
+//                     { new: true, session }
+//                 ).select("scratchyVariants totalStock scratchyStock");
+
+//                 if (!afterRestore) {
+//                     throw new ApiError(404, `Product "${productId}" not found — restore failed`);
+//                 }
+
+//                 const updatedStock = afterRestore.scratchyVariants.get(variantKey);
+//                 const previousStock = updatedStock - qty;
+
+//                 stockEntries.push({
+//                     orderId: lockedOrder.orderId,
+//                     type,
+//                     variantName: variantKey,
+//                     quantity: qty,
+//                     previousStock,
+//                     updatedStock,
+//                     productId,
+//                     category: "physical",
+//                     isScratchy: true
+//                 });
+//             } else {
+//                 const variantQuery = item.variantId
+//                     ? { _id: item.variantId }
+//                     : { productId, name: variantKey };
+
+//                 const variant = await Variant.findOneAndUpdate(
+//                     variantQuery,
+//                     { $inc: { availableStock: qty, totalStock: qty } },
+//                     { new: true, session }
+//                 );
+
+//                 if (variant) {
+//                     const previousAvailable = variant.availableStock - qty;
+//                     const previousPhysical = variant.totalStock - qty;
+
+//                     if (!item.purchaseSets || item.purchaseSets.length === 0) {
+//                         const fallbackSetId = item.purchaseSetId || (variant.purchaseSets[0] ? String(variant.purchaseSets[0]._id) : "");
+//                         item.purchaseSets = [{
+//                             purchaseSetId: fallbackSetId,
+//                             quantity: qty,
+//                             price: item.purchasePrice || (variant.purchaseSets[0]?.price || 0)
+//                         }];
+//                         item.purchaseSetId = fallbackSetId;
+//                     }
+
+//                     for (const alloc of item.purchaseSets) {
+//                         if (alloc.purchaseSetId) {
+//                             const set = variant.purchaseSets.id(alloc.purchaseSetId);
+//                             if (set) {
+//                                 set.remainingStock += alloc.quantity;
+//                                 set.availableStock += alloc.quantity;
+//                             }
+//                         } else if (variant.purchaseSets.length > 0) {
+//                             variant.purchaseSets[0].remainingStock += alloc.quantity;
+//                             variant.purchaseSets[0].availableStock += alloc.quantity;
+//                         }
+//                     }
+
+//                     await variant.save({ session });
+
+//                     // Sync parent product and inventory stock levels
+//                     await syncProductStock(productId, session);
+
+//                     // Fetch parent product to get updated totalProductStock for logging
+//                     const parentProduct = await Product.findById(productId).session(session);
+//                     const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+//                     stockEntries.push({
+//                         orderId: lockedOrder.orderId,
+//                         orderRef: lockedOrder._id,
+//                         type,
+//                         category: "physical",
+//                         variantId: variant._id,
+//                         variantName: variant.name,
+//                         quantity: qty,
+//                         previousStock: previousAvailable,
+//                         updatedStock: variant.availableStock,
+//                         previousPhysicalStock: previousPhysical,
+//                         updatedPhysicalStock: variant.totalStock,
+//                         totalProductStock: currentTotalProductStock,
+//                         productId,
+//                         isScratchy: false
+//                     });
+//                 }
+//             }
+//         }
+
+//         if (stockEntries.length > 0) {
+//             await Stock.insertMany(stockEntries, { session });
+//         }
+
+//         return { restored: true };
+//     };
+
+//     try {
+//         if (ownSession) {
+//             let result = null;
+//             await session.withTransaction(async () => {
+//                 result = await run();
+//             });
+//             return result;
+//         } else {
+//             return await run();
+//         }
+//     } catch (err) {
+//         console.error("[adjustStock] failed:", err);
+//         throw err;
+//     } finally {
+//         if (ownSession) session.endSession();
+//     }
+// }
+
 async function performAdjustStock(
     order,
     {
         type = STOCK_TYPES.CANCEL,
-        session: externalSession = null,
+        session: externalSession = null
     } = {}
 ) {
     if (
@@ -4159,160 +4366,432 @@ async function performAdjustStock(
     }
 
     const ownSession = !externalSession;
-    const session = externalSession ?? await mongoose.startSession();
+    const session =
+        externalSession ??
+        await mongoose.startSession();
 
     const run = async () => {
-        const lockedOrder = await Order.findOneAndUpdate(
-            {
-                _id: order._id,
-                _restockDone: { $ne: true }
-            },
-            { $set: { _restockDone: true } },
-            { new: true, session }
-        );
+        /*
+         * Atomically claim the stock restoration.
+         *
+         * IMPORTANT:
+         * _restockDone is changed inside the same transaction
+         * as the actual stock restoration.
+         *
+         * If another request has already restored this order,
+         * this update returns null and the transaction must fail.
+         */
+        const lockedOrder =
+            await Order.findOneAndUpdate(
+                {
+                    _id: order._id,
+                    _restockDone: {
+                        $ne: true
+                    }
+                },
+                {
+                    $set: {
+                        _restockDone: true
+                    }
+                },
+                {
+                    new: true,
+                    session
+                }
+            );
 
         if (!lockedOrder) {
-            console.warn(
-                `[adjustStock] Skipped — _restockDone already true ` +
-                `for order ${order._id} (type: ${type})`
+            throw new ApiError(
+                409,
+                `Stock has already been restored for order ${order._id}.`
             );
-            return null;
         }
 
         const stockEntries = [];
 
         for (const item of lockedOrder.items) {
-            const qty = Math.floor(Number(item.quantity));
-            if (qty <= 0) continue;
+            const qty = Math.floor(
+                Number(item.quantity)
+            );
 
-            const productId = item.productId?._id
-                ? String(item.productId._id)
-                : String(item.productId);
-
-            const variantKey = String(item.variantName || "").trim();
-            if (!variantKey) {
-                throw new ApiError(400, `Missing variantName for product ${productId}`);
+            if (qty <= 0) {
+                continue;
             }
 
-            const isScratchy = !!item.isScratchy;
+            const productId =
+                item.productId?._id
+                    ? String(
+                        item.productId._id
+                    )
+                    : String(
+                        item.productId
+                    );
 
+            const variantKey = String(
+                item.variantName || ""
+            ).trim();
+
+            if (!variantKey) {
+                throw new ApiError(
+                    400,
+                    `Missing variantName for product ${productId}.`
+                );
+            }
+
+            const isScratchy =
+                !!item.isScratchy;
+
+            /*
+             * ==========================================================
+             * SCRATCHY PRODUCT STOCK
+             * ==========================================================
+             */
             if (isScratchy) {
-                // Scratchy variants are stored inside Product document's scratchyVariants map
-                const afterRestore = await Product.findOneAndUpdate(
-                    { _id: productId },
-                    {
-                        $inc: {
-                            totalStock: qty,
-                            scratchyStock: qty,
-                            [`scratchyVariants.${variantKey}`]: qty
+                const afterRestore =
+                    await Product.findOneAndUpdate(
+                        {
+                            _id: productId
+                        },
+                        {
+                            $inc: {
+                                totalStock: qty,
+                                scratchyStock:
+                                    qty,
+                                [`scratchyVariants.${variantKey}`]:
+                                    qty
+                            }
+                        },
+                        {
+                            new: true,
+                            session
                         }
-                    },
-                    { new: true, session }
-                ).select("scratchyVariants totalStock scratchyStock");
+                    ).select(
+                        "scratchyVariants totalStock scratchyStock"
+                    );
 
                 if (!afterRestore) {
-                    throw new ApiError(404, `Product "${productId}" not found — restore failed`);
+                    throw new ApiError(
+                        404,
+                        `Product "${productId}" not found — scratchy stock restore failed.`
+                    );
                 }
 
-                const updatedStock = afterRestore.scratchyVariants.get(variantKey);
-                const previousStock = updatedStock - qty;
+                const updatedStock =
+                    afterRestore
+                        .scratchyVariants
+                        ?.get(
+                            variantKey
+                        );
+
+                if (
+                    typeof updatedStock !==
+                    "number"
+                ) {
+                    throw new ApiError(
+                        500,
+                        `Scratchy variant "${variantKey}" could not be restored for product ${productId}.`
+                    );
+                }
+
+                const previousStock =
+                    updatedStock - qty;
 
                 stockEntries.push({
-                    orderId: lockedOrder.orderId,
+                    orderId:
+                        lockedOrder.orderId,
+                    orderRef:
+                        lockedOrder._id,
                     type,
-                    variantName: variantKey,
+                    variantName:
+                        variantKey,
                     quantity: qty,
                     previousStock,
                     updatedStock,
                     productId,
-                    category: "physical",
-                    isScratchy: true
+                    category:
+                        "physical",
+                    isScratchy: true,
+                    purchasePrice: Number(item.purchasePrice || 0),
+                    sellingPrice: Number(item.price || 0) - Number(item.discount || 0)
                 });
-            } else {
-                const variant = await Variant.findOneAndUpdate(
-                    { _id: item.variantId },
-                    { $inc: { availableStock: qty, totalStock: qty } },
-                    { new: true, session }
+
+                continue;
+            }
+
+            /*
+             * ==========================================================
+             * NORMAL VARIANT STOCK
+             * ==========================================================
+             */
+
+            const variantQuery =
+                item.variantId
+                    ? {
+                        _id:
+                            item.variantId,
+                        active: true
+                    }
+                    : {
+                        productId,
+                        name:
+                            variantKey,
+                        active: true
+                    };
+
+            /*
+             * Restore BOTH:
+             *   availableStock
+             *   totalStock
+             *
+             * atomically.
+             */
+            const variant =
+                await Variant.findOneAndUpdate(
+                    variantQuery,
+                    {
+                        $inc: {
+                            availableStock:
+                                qty,
+                            totalStock:
+                                qty
+                        }
+                    },
+                    {
+                        new: true,
+                        session
+                    }
                 );
 
-                if (variant) {
-                    const previousAvailable = variant.availableStock - qty;
-                    const previousPhysical = variant.totalStock - qty;
+            if (!variant) {
+                throw new ApiError(
+                    500,
+                    `Variant "${variantKey}" was not found while restoring stock for order ${lockedOrder.orderId}.`
+                );
+            }
 
-                    if (!item.purchaseSets || item.purchaseSets.length === 0) {
-                        const fallbackSetId = item.purchaseSetId || (variant.purchaseSets[0] ? String(variant.purchaseSets[0]._id) : "");
-                        item.purchaseSets = [{
-                            purchaseSetId: fallbackSetId,
-                            quantity: qty,
-                            price: item.purchasePrice || (variant.purchaseSets[0]?.price || 0)
-                        }];
-                        item.purchaseSetId = fallbackSetId;
-                    }
+            const previousAvailableStock =
+                variant.availableStock -
+                qty;
 
-                    for (const alloc of item.purchaseSets) {
-                        if (alloc.purchaseSetId) {
-                            const set = variant.purchaseSets.id(alloc.purchaseSetId);
-                            if (set) {
-                                set.remainingStock += alloc.quantity;
-                                set.availableStock += alloc.quantity;
-                            }
-                        } else if (variant.purchaseSets.length > 0) {
-                            variant.purchaseSets[0].remainingStock += alloc.quantity;
-                            variant.purchaseSets[0].availableStock += alloc.quantity;
-                        }
-                    }
+            const previousPhysicalStock =
+                variant.totalStock -
+                qty;
 
-                    await variant.save({ session });
+            /*
+             * ==========================================================
+             * PURCHASE SET RESTORATION
+             * ==========================================================
+             *
+             * Do NOT fabricate an allocation.
+             *
+             * The order's stored purchaseSets are the historical
+             * allocation that tells us which batches were consumed.
+             */
+            const purchaseSetsArray = Array.isArray(item.purchaseSets) ? item.purchaseSets : [];
 
-                    // Sync parent product and inventory stock levels
-                    await syncProductStock(productId, session);
+            let remaining = qty;
+            let totalRestoreQuantity = 0;
 
-                    // Fetch parent product to get updated totalProductStock for logging
-                    const parentProduct = await Product.findById(productId).session(session);
-                    const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+            for (const allocation of purchaseSetsArray) {
+                const allocationQty = Number(allocation.quantity || 0);
+                if (allocationQty <= 0) continue;
+                if (!allocation.purchaseSetId) continue;
 
-                    stockEntries.push({
-                        orderId: lockedOrder.orderId,
-                        orderRef: lockedOrder._id,
-                        type,
-                        category: "physical",
-                        variantId: variant._id,
-                        variantName: variant.name,
-                        quantity: qty,
-                        previousStock: previousAvailable,
-                        updatedStock: variant.availableStock,
-                        previousPhysicalStock: previousPhysical,
-                        updatedPhysicalStock: variant.totalStock,
-                        totalProductStock: currentTotalProductStock,
-                        productId,
-                        isScratchy: false
-                    });
+                const purchaseSet = variant.purchaseSets.id(allocation.purchaseSetId);
+                if (purchaseSet) {
+                    const restoreQty = Math.min(remaining, allocationQty);
+                    purchaseSet.remainingStock += restoreQty;
+                    purchaseSet.availableStock += restoreQty;
+                    totalRestoreQuantity += restoreQty;
+                    remaining -= restoreQty;
                 }
+            }
+
+            // Fallback for remaining quantity (if allocations were missing/desynced/legacy)
+            if (remaining > 0) {
+                if (variant.purchaseSets.length > 0) {
+                    const purchaseSet = variant.purchaseSets[0];
+                    purchaseSet.remainingStock += remaining;
+                    purchaseSet.availableStock += remaining;
+                    totalRestoreQuantity += remaining;
+                    remaining = 0;
+                } else {
+                    variant.purchaseSets.push({
+                        quantity: remaining,
+                        price: item.purchasePrice || 0,
+                        availableStock: remaining,
+                        remainingStock: remaining
+                    });
+                    totalRestoreQuantity += remaining;
+                    remaining = 0;
+                }
+            }
+
+            /*
+             * Save ONLY purchaseSets.
+             * totalStock/availableStock were already updated atomically
+             * by $inc above.
+             */
+            const purchaseSetUpdate =
+                await Variant.updateOne(
+                    {
+                        _id: variant._id
+                    },
+                    {
+                        $set: {
+                            purchaseSets:
+                                variant.purchaseSets
+                        }
+                    },
+                    {
+                        session
+                    }
+                );
+
+            if (
+                purchaseSetUpdate.matchedCount ===
+                0
+            ) {
+                throw new ApiError(
+                    500,
+                    `Failed to restore purchase sets for variant "${variantKey}".`
+                );
+            }
+
+            stockEntries.push({
+                orderId:
+                    lockedOrder.orderId,
+                orderRef:
+                    lockedOrder._id,
+                type,
+                category:
+                    "physical",
+                variantId:
+                    variant._id,
+                variantName:
+                    variant.name,
+                quantity: qty,
+                previousStock:
+                    previousAvailableStock,
+                updatedStock:
+                    variant.availableStock,
+                previousPhysicalStock:
+                    previousPhysicalStock,
+                updatedPhysicalStock:
+                    variant.totalStock,
+                productId,
+                isScratchy: false,
+                purchasePrice: Number(item.purchasePrice || (variant.purchaseSets[0]?.price || 0)),
+                sellingPrice: Number(item.price || 0) - Number(item.discount || 0)
+            });
+        }
+
+        /*
+         * ==========================================================
+         * SYNC PRODUCT / INVENTORY AFTER ALL VARIANT RESTORATIONS
+         * ==========================================================
+         *
+         * Sync once per affected product instead of once per item.
+         */
+        const affectedProductIds =
+            new Set();
+
+        for (const item of lockedOrder.items) {
+            if (!item.productId) {
+                continue;
+            }
+
+            const productId =
+                item.productId?._id
+                    ? String(
+                        item.productId._id
+                    )
+                    : String(
+                        item.productId
+                    );
+
+            if (item.isScratchy) {
+                affectedProductIds.add(
+                    productId
+                );
+            } else {
+                affectedProductIds.add(
+                    productId
+                );
             }
         }
 
-        if (stockEntries.length > 0) {
-            await Stock.insertMany(stockEntries, { session });
+        /*
+         * syncProductStock is the existing local helper.
+         *
+         * Keep the existing behavior, but execute it after all
+         * variant mutations are complete.
+         */
+        for (const productId of affectedProductIds) {
+            await syncProductStock(
+                new mongoose.Types.ObjectId(
+                    productId
+                ),
+                session
+            );
         }
 
-        return { restored: true };
+        /*
+         * If Inventory does not exist, the improved syncProductStock
+         * should throw. Therefore the transaction will rollback.
+         */
+
+        /*
+         * ==========================================================
+         * STOCK LOGS
+         * ==========================================================
+         */
+        if (
+            stockEntries.length > 0
+        ) {
+            await Stock.insertMany(
+                stockEntries,
+                {
+                    session
+                }
+            );
+        }
+
+        /*
+         * Return the transaction-local order document whose
+         * _restockDone flag is already true.
+         */
+        return {
+            restored: true,
+            order: lockedOrder
+        };
     };
 
     try {
         if (ownSession) {
             let result = null;
-            await session.withTransaction(async () => {
-                result = await run();
-            });
+
+            await session.withTransaction(
+                async () => {
+                    result =
+                        await run();
+                }
+            );
+
             return result;
-        } else {
-            return await run();
         }
+
+        return await run();
     } catch (err) {
-        console.error("[adjustStock] failed:", err);
+        console.error(
+            "[adjustStock] failed:",
+            err
+        );
         throw err;
     } finally {
-        if (ownSession) session.endSession();
+        if (ownSession) {
+            await session.endSession();
+        }
     }
 }
 
@@ -5484,79 +5963,1557 @@ const updateManualShippingStatus = asyncHandler(async (req, res) => {
     return res.status(200).json(new ApiResponse(200, order, "Manual shipping status updated successfully."));
 });
 
-const syncProductStock = async (productId, session) => {
-    const variants = await Variant.find({ productId }).session(session);
+// const syncProductStock = async (productId, session) => {
+//     const variants = await Variant.find({ productId }).session(session);
+//     let totalStockSum = 0;
+//     let availableStockSum = 0;
+//     for (const v of variants) {
+//         totalStockSum += v.totalStock || 0;
+//         availableStockSum += v.availableStock || 0;
+//     }
+
+//     await Product.findByIdAndUpdate(
+//         productId,
+//         {
+//             totalStock: totalStockSum,
+//             totalProductStock: totalStockSum,
+//             availableStock: availableStockSum
+//         },
+//         { session }
+//     );
+
+//     await Inventory.findOneAndUpdate(
+//         { product: productId },
+//         {
+//             $set: {
+//                 physicalStock: totalStockSum
+//             }
+//         },
+//         { new: true, session }
+//     );
+// };
+
+const syncProductStock = async (
+    productId,
+    session
+) => {
+    const variants =
+        await Variant.find({
+            productId
+        }).session(session);
+
     let totalStockSum = 0;
     let availableStockSum = 0;
-    for (const v of variants) {
-        totalStockSum += v.totalStock || 0;
-        availableStockSum += v.availableStock || 0;
+
+    for (const variant of variants) {
+        totalStockSum += Number(
+            variant.totalStock || 0
+        );
+
+        availableStockSum += Number(
+            variant.availableStock || 0
+        );
+    }
+
+    const product =
+        await Product.findById(
+            productId
+        ).session(session);
+
+    if (!product) {
+        throw new ApiError(
+            404,
+            `Product ${productId} not found while synchronizing stock.`
+        );
+    }
+
+    const inventory =
+        await Inventory.findOne({
+            product: productId
+        }).session(session);
+
+    if (!inventory) {
+        throw new ApiError(
+            500,
+            `Inventory record not found while synchronizing product ${productId}.`
+        );
+    }
+
+    /*
+     * Defensive consistency check.
+     */
+    if (
+        Number(
+            inventory.reservedStock || 0
+        ) > totalStockSum
+    ) {
+        throw new ApiError(
+            500,
+            `Reserved stock exceeds physical stock for product ${productId}.`
+        );
     }
 
     await Product.findByIdAndUpdate(
         productId,
         {
-            totalStock: totalStockSum,
-            totalProductStock: totalStockSum,
-            availableStock: availableStockSum
-        },
-        { session }
-    );
-
-    await Inventory.findOneAndUpdate(
-        { product: productId },
-        {
             $set: {
-                physicalStock: totalStockSum
+                totalStock:
+                    totalStockSum,
+                totalProductStock:
+                    totalStockSum,
+                availableStock:
+                    availableStockSum
             }
         },
-        { new: true, session }
+        {
+            session
+        }
     );
+
+    const updatedInventory =
+        await Inventory.findOneAndUpdate(
+            {
+                product: productId
+            },
+            {
+                $set: {
+                    physicalStock:
+                        totalStockSum
+                }
+            },
+            {
+                new: true,
+                session
+            }
+        );
+
+    if (!updatedInventory) {
+        throw new ApiError(
+            500,
+            `Failed to synchronize physical inventory for product ${productId}.`
+        );
+    }
+
+    return {
+        totalStock:
+            totalStockSum,
+        availableStock:
+            availableStockSum
+    };
 };
 
 async function adjustStockV3(order, options = {}) {
     return performAdjustStock(order, options);
 }
 
-const systemCreatedCancel = asyncHandler(async (req, res) => {
-    const { orderId, reason } = req.body;
 
-    const order = await Order.findById(orderId);
-    if (!order) {
-        throw new ApiError(404, "Order not found");
+
+export const updateOrderItems = asyncHandler(
+    async (req, res) => {
+        const session =
+            await mongoose.startSession();
+
+        try {
+            const { id } =
+                req.params;
+
+            const {
+                items,
+                discount,
+                discountPercent,
+                deliveryCharge
+            } = req.body;
+
+            if (!id) {
+                throw new ApiError(
+                    400,
+                    "Order ID is required."
+                );
+            }
+
+            await session.withTransaction(
+                async () => {
+                    /*
+                     * IMPORTANT:
+                     * Order must be read INSIDE the transaction.
+                     */
+                    const order =
+                        await Order.findById(
+                            id
+                        ).session(
+                            session
+                        );
+
+                    if (!order) {
+                        throw new ApiError(
+                            404,
+                            "Order not found."
+                        );
+                    }
+
+                    /*
+                     * Validate editing timeframe using the
+                     * transaction-local order.
+                     */
+                    const canEdit =
+                        order.shippingType ===
+                            "Manual"
+                            ? ![
+                                "Shipped",
+                                "Delivered",
+                                "Cancelled",
+                                "Rejected",
+                                "Returned"
+                            ].includes(
+                                order.status
+                            )
+                            : !order.awbCode &&
+                            !order.shipmentId &&
+                            !order.pickupScheduled &&
+                            !order.courierName &&
+                            ![
+                                "Shipped",
+                                "Delivered",
+                                "Cancelled",
+                                "Rejected",
+                                "Returned"
+                            ].includes(
+                                order.status
+                            );
+
+                    if (!canEdit) {
+                        throw new ApiError(
+                            400,
+                            "Order cannot be edited at this stage."
+                        );
+                    }
+
+                    const oldItemsMap =
+                        buildOldItemsMap(
+                            order
+                        );
+
+                    const affectedProductIds =
+                        new Set();
+
+                    const seenVariantKeys =
+                        new Set();
+
+                    const newItems = [];
+
+                    const itemChanges = [];
+
+                    /*
+                     * Stock logs are prepared first and inserted only
+                     * after all Variant changes and final Product sync.
+                     */
+                    const pendingStockLogs = [];
+
+                    if (
+                        items &&
+                        Array.isArray(
+                            items
+                        )
+                    ) {
+                        /*
+                         * ============================================
+                         * PROCESS REQUESTED ITEMS
+                         * ============================================
+                         */
+                        for (
+                            const reqItem of items
+                        ) {
+                            const key =
+                                validateAndGetItemKey(
+                                    {
+                                        reqItem,
+                                        seenVariantKeys
+                                    }
+                                );
+
+                            const qty =
+                                Math.floor(
+                                    Number(
+                                        reqItem.quantity ||
+                                        0
+                                    )
+                                );
+
+                            if (qty <= 0) {
+                                continue;
+                            }
+
+                            const productId =
+                                reqItem.productId;
+
+                            const variantId =
+                                reqItem.variantId;
+
+                            const variantName =
+                                reqItem.variantName;
+
+                            const oldInfo =
+                                oldItemsMap.get(
+                                    key
+                                ) || {
+                                    quantity: 0,
+                                    stockIds: [],
+                                    price: 0,
+                                    discount: 0,
+                                    discountPercent: 0,
+                                    discountType:
+                                        "flat",
+                                    purchasePrice:
+                                        0,
+                                    purchaseSetId:
+                                        "",
+                                    purchaseSets:
+                                        [],
+                                    variantId:
+                                        null
+                                };
+
+                            const {
+                                oldQuantity,
+                                diff
+                            } =
+                                calculateItemDelta(
+                                    {
+                                        oldInfo,
+                                        quantity:
+                                            qty
+                                    }
+                                );
+
+                            const finalPrice =
+                                reqItem.price !==
+                                    undefined &&
+                                    reqItem.price !==
+                                    null
+                                    ? Number(
+                                        reqItem.price
+                                    )
+                                    : Number(
+                                        oldInfo.price ||
+                                        0
+                                    );
+
+                            const itemDiscount =
+                                Number(
+                                    reqItem.discount ||
+                                    0
+                                );
+
+                            const itemDiscountPercent =
+                                Number(
+                                    reqItem.discountPercent ||
+                                    0
+                                );
+
+                            const itemDiscountType =
+                                reqItem.discountType !==
+                                    undefined
+                                    ? reqItem.discountType
+                                    : oldInfo.discountType ||
+                                    "flat";
+
+                            const syncedDiscount =
+                                syncItemDiscount(
+                                    itemDiscount,
+                                    itemDiscountPercent,
+                                    finalPrice,
+                                    itemDiscountType
+                                );
+
+                            const finalDiscount =
+                                Number(
+                                    syncedDiscount.discount ||
+                                    0
+                                );
+
+                            const finalDiscountPercent =
+                                Number(
+                                    syncedDiscount.discountPercent ||
+                                    0
+                                );
+
+                            const product =
+                                await Product.findById(
+                                    productId
+                                ).session(
+                                    session
+                                );
+
+                            if (!product) {
+                                throw new ApiError(
+                                    404,
+                                    `Product not found for ID: ${productId}`
+                                );
+                            }
+
+                            let itemStockIds = [
+                                ...oldInfo.stockIds
+                            ];
+
+                            let allocatedSets =
+                                clonePurchaseSets(
+                                    oldInfo.purchaseSets
+                                );
+
+                            const variantQuery = variantId
+                                ? { _id: variantId, active: true }
+                                : { productId, name: variantName, active: true };
+
+                            const variant = await Variant.findOne(variantQuery).session(session);
+                            if (!variant) {
+                                throw new ApiError(
+                                    404,
+                                    `Active variant "${variantName}" not found for product "${product.fullName}".`
+                                );
+                            }
+
+                            // Auto-fill fallback if allocatedSets is empty/partially desynced compared to oldQuantity
+                            const currentAllocatedQty = allocatedSets.reduce((sum, s) => sum + Number(s.quantity || 0), 0);
+                            if (currentAllocatedQty < oldQuantity) {
+                                const diffToCover = oldQuantity - currentAllocatedQty;
+                                const fallbackSetId = oldInfo.purchaseSetId || (variant.purchaseSets[0] ? String(variant.purchaseSets[0]._id) : "");
+                                if (fallbackSetId) {
+                                    const existing = allocatedSets.find(
+                                        s => String(s.purchaseSetId) === String(fallbackSetId)
+                                    );
+                                    if (existing) {
+                                        existing.quantity += diffToCover;
+                                    } else {
+                                        allocatedSets.push({
+                                            purchaseSetId: fallbackSetId,
+                                            quantity: diffToCover,
+                                            price: Number(oldInfo.purchasePrice || 0)
+                                        });
+                                    }
+                                }
+                            }
+
+                            let selectedSetId =
+                                oldInfo.purchaseSetId ||
+                                "";
+
+                            let avgPurchasePrice =
+                                Number(
+                                    oldInfo.purchasePrice ||
+                                    0
+                                );
+
+                            /*
+                             * =========================================
+                             * DIFF > 0
+                             * ORDER QUANTITY INCREASE
+                             *
+                             * Physical stock is consumed:
+                             * totalStock      -= diff
+                             * availableStock  -= diff
+                             *
+                             * This is ONE atomic MongoDB update.
+                             * =========================================
+                             */
+                            if (diff > 0) {
+                                const variantResult =
+                                    await Variant.findOneAndUpdate(
+                                        {
+                                            _id: variant._id,
+                                            totalStock: { $gte: diff },
+                                            availableStock: { $gte: diff }
+                                        },
+                                        {
+                                            $inc: {
+                                                totalStock:
+                                                    -diff,
+                                                availableStock:
+                                                    -diff
+                                            }
+                                        },
+                                        {
+                                            new:
+                                                true,
+                                            session
+                                        }
+                                    );
+
+                                if (!variantResult) {
+                                    throw new ApiError(
+                                        400,
+                                        `Insufficient physical stock for product ${product.fullName} variant ${variantName}.`
+                                    );
+                                }
+
+                                // Update in-memory variant stock values
+                                variant.totalStock = variantResult.totalStock;
+                                variant.availableStock = variantResult.availableStock;
+
+                                const previousAvailableStock =
+                                    variant.availableStock +
+                                    diff;
+
+                                const updatedAvailableStock =
+                                    variant.availableStock;
+
+                                const productStockBefore =
+                                    variant.totalStock +
+                                    diff;
+
+                                const allocation =
+                                    allocateOrderPurchaseSets(
+                                        {
+                                            variant:
+                                                variant,
+                                            allocatedSets,
+                                            quantity:
+                                                diff,
+                                            selectedSetId
+                                        }
+                                    );
+
+                                allocatedSets =
+                                    allocation.allocatedSets;
+
+                                selectedSetId =
+                                    allocation.selectedSetId;
+
+                                const incrementalPurchasePrice =
+                                    allocation.totalCost /
+                                    diff;
+
+                                avgPurchasePrice =
+                                    calculateWeightedPurchasePrice(
+                                        {
+                                            oldPurchasePrice:
+                                                Number(
+                                                    oldInfo.purchasePrice ||
+                                                    0
+                                                ),
+                                            oldQuantity,
+                                            newPurchasePrice:
+                                                incrementalPurchasePrice,
+                                            newQuantity:
+                                                diff
+                                        }
+                                    );
+
+                                await savePurchaseSets(
+                                    {
+                                        variantId:
+                                            variant._id,
+                                        purchaseSets:
+                                            variant.purchaseSets,
+                                        session
+                                    }
+                                );
+
+                                affectedProductIds.add(
+                                    String(
+                                        productId
+                                    )
+                                );
+
+                                const pendingLog =
+                                    buildPendingStockLog(
+                                        {
+                                            orderId:
+                                                order.orderId,
+                                            orderRef:
+                                                order._id,
+                                            variant:
+                                                variant,
+                                            productId,
+                                            type:
+                                                "add-item",
+                                            category:
+                                                "physical",
+                                            quantity:
+                                                diff,
+                                            purchasePrice:
+                                                incrementalPurchasePrice,
+                                            previousStock:
+                                                previousAvailableStock,
+                                            updatedStock:
+                                                updatedAvailableStock,
+                                            price:
+                                                finalPrice,
+                                            discount:
+                                                finalDiscount,
+                                            itemQuantity:
+                                                qty,
+                                            itemStockIdsRef:
+                                                itemStockIds
+                                        }
+                                    );
+
+                                /*
+                                 * The atomic update already established
+                                 * the before/after physical stock values.
+                                 * Keep them explicitly correct on the log.
+                                 */
+                                pendingLog.previousPhysicalStock =
+                                    productStockBefore;
+
+                                pendingLog.updatedPhysicalStock =
+                                    variant.totalStock;
+
+                                pendingStockLogs.push(
+                                    pendingLog
+                                );
+                            }
+
+                            /*
+                             * =========================================
+                             * DIFF < 0
+                             * ORDER QUANTITY DECREASE
+                             *
+                             * Physical stock is returned:
+                             * totalStock      += restoreQty
+                             * availableStock  += restoreQty
+                             *
+                             * Both are updated atomically.
+                             * =========================================
+                             */
+                            else if (
+                                diff < 0
+                            ) {
+                                const restoreQty =
+                                    Math.abs(
+                                        diff
+                                    );
+
+                                const variantResult =
+                                    await Variant.findOneAndUpdate(
+                                        { _id: variant._id },
+                                        {
+                                            $inc: {
+                                                totalStock:
+                                                    restoreQty,
+                                                availableStock:
+                                                    restoreQty
+                                            }
+                                        },
+                                        {
+                                            new:
+                                                true,
+                                            session
+                                        }
+                                    );
+
+                                if (!variantResult) {
+                                    throw new ApiError(
+                                        400,
+                                        `Failed to restore stock for product ${product.fullName} variant ${variantName}.`
+                                    );
+                                }
+
+                                // Update in-memory variant stock values
+                                variant.totalStock = variantResult.totalStock;
+                                variant.availableStock = variantResult.availableStock;
+
+                                const previousAvailableStock =
+                                    variant.availableStock -
+                                    restoreQty;
+
+                                const updatedAvailableStock =
+                                    variant.availableStock;
+
+                                const previousPhysicalStock =
+                                    variant.totalStock -
+                                    restoreQty;
+
+                                const restoration =
+                                    restoreOrderPurchaseSets(
+                                        {
+                                            variant:
+                                                variant,
+                                            allocatedSets,
+                                            quantity:
+                                                restoreQty
+                                        }
+                                    );
+
+                                allocatedSets =
+                                    restoration.allocatedSets;
+
+                                selectedSetId =
+                                    restoration.selectedSetId;
+
+                                avgPurchasePrice =
+                                    restoration.purchasePrice;
+
+                                await savePurchaseSets(
+                                    {
+                                        variantId:
+                                            variant._id,
+                                        purchaseSets:
+                                            variant.purchaseSets,
+                                        session
+                                    }
+                                );
+
+                                affectedProductIds.add(
+                                    String(
+                                        productId
+                                    )
+                                );
+
+                                const pendingLog =
+                                    buildPendingStockLog(
+                                        {
+                                            orderId:
+                                                order.orderId,
+                                            orderRef:
+                                                order._id,
+                                            variant:
+                                                variant,
+                                            productId,
+                                            type:
+                                                "remove-item",
+                                            category:
+                                                "physical",
+                                            quantity:
+                                                restoreQty,
+                                            purchasePrice:
+                                                restoration.restoredPurchasePrice,
+                                            previousStock:
+                                                previousAvailableStock,
+                                            updatedStock:
+                                                updatedAvailableStock,
+                                            price:
+                                                finalPrice,
+                                            discount:
+                                                finalDiscount,
+                                            itemQuantity:
+                                                qty,
+                                            itemStockIdsRef:
+                                                itemStockIds
+                                        }
+                                    );
+
+                                pendingLog.previousPhysicalStock =
+                                    previousPhysicalStock;
+
+                                pendingLog.updatedPhysicalStock =
+                                    variantResult.totalStock;
+
+                                pendingStockLogs.push(
+                                    pendingLog
+                                );
+                            }
+
+                            /*
+                             * diff === 0:
+                             * no inventory movement.
+                             *
+                             * Existing Stock logs can still be
+                             * updated for price/discount changes.
+                             */
+
+                            const changes = [];
+
+                            if (
+                                qty !==
+                                oldQuantity
+                            ) {
+                                changes.push(
+                                    `Qty: ${oldQuantity} -> ${qty}`
+                                );
+                            }
+
+                            if (
+                                finalPrice !==
+                                oldInfo.price
+                            ) {
+                                changes.push(
+                                    `Price: ₹${oldInfo.price} -> ₹${finalPrice}`
+                                );
+                            }
+
+                            if (
+                                finalDiscount !==
+                                oldInfo.discount
+                            ) {
+                                changes.push(
+                                    `Discount: ₹${oldInfo.discount} -> ₹${finalDiscount}`
+                                );
+                            }
+
+                            if (
+                                changes.length >
+                                0
+                            ) {
+                                itemChanges.push(
+                                    `${variantName} (${changes.join(
+                                        ", "
+                                    )})`
+                                );
+                            }
+
+                            newItems.push({
+                                productId,
+                                variantName,
+                                quantity:
+                                    qty,
+                                price:
+                                    finalPrice,
+                                discount:
+                                    finalDiscount,
+                                discountPercent:
+                                    finalDiscountPercent,
+                                discountType:
+                                    itemDiscountType,
+                                stockIds:
+                                    itemStockIds,
+                                variantId:
+                                    variant._id,
+                                purchasePrice:
+                                    avgPurchasePrice,
+                                purchaseSetId:
+                                    selectedSetId,
+                                purchaseSets:
+                                    allocatedSets.filter(
+                                        allocation =>
+                                            Number(
+                                                allocation.quantity ||
+                                                0
+                                            ) > 0
+                                    )
+                            });
+
+                            oldItemsMap.delete(
+                                key
+                            );
+                        }
+
+                        /*
+                         * ============================================
+                         * COMPLETELY DELETED ITEMS
+                         * ============================================
+                         */
+                        for (
+                            const [
+                                key,
+                                oldInfo
+                            ] of oldItemsMap.entries()
+                        ) {
+                            const oldQty =
+                                Number(
+                                    oldInfo.quantity ||
+                                    0
+                                );
+
+                            if (
+                                oldQty <= 0
+                            ) {
+                                continue;
+                            }
+
+                            let variantQuery;
+
+                            if (
+                                oldInfo.variantId
+                            ) {
+                                variantQuery = {
+                                    _id:
+                                        oldInfo.variantId,
+                                    active:
+                                        true
+                                };
+                            } else {
+                                const separator =
+                                    key.indexOf(
+                                        "_"
+                                    );
+
+                                if (
+                                    separator ===
+                                    -1
+                                ) {
+                                    throw new ApiError(
+                                        500,
+                                        `Unable to resolve deleted order item "${key}".`
+                                    );
+                                }
+
+                                variantQuery = {
+                                    productId:
+                                        key.slice(
+                                            0,
+                                            separator
+                                        ),
+                                    name:
+                                        key.slice(
+                                            separator +
+                                            1
+                                        ),
+                                    active:
+                                        true
+                                };
+                            }
+
+                            const variantResult =
+                                await Variant.findOneAndUpdate(
+                                    variantQuery,
+                                    {
+                                        $inc: {
+                                            totalStock:
+                                                oldQty,
+                                            availableStock:
+                                                oldQty
+                                        }
+                                    },
+                                    {
+                                        new:
+                                            true,
+                                        session
+                                    }
+                                );
+
+                            if (!variantResult) {
+                                throw new ApiError(
+                                    500,
+                                    `Could not restore stock for deleted order item "${key}".`
+                                );
+                            }
+
+                            const previousAvailableStock =
+                                variantResult.availableStock -
+                                oldQty;
+
+                            const previousPhysicalStock =
+                                variantResult.totalStock -
+                                oldQty;
+
+                            let allocatedSets = clonePurchaseSets(oldInfo.purchaseSets);
+                            const currentAllocatedQty = allocatedSets.reduce((sum, s) => sum + Number(s.quantity || 0), 0);
+                            if (currentAllocatedQty < oldQty) {
+                                const diffToCover = oldQty - currentAllocatedQty;
+                                const fallbackSetId = oldInfo.purchaseSetId || (variantResult.purchaseSets[0] ? String(variantResult.purchaseSets[0]._id) : "");
+                                if (fallbackSetId) {
+                                    const existing = allocatedSets.find(
+                                        s => String(s.purchaseSetId) === String(fallbackSetId)
+                                    );
+                                    if (existing) {
+                                        existing.quantity += diffToCover;
+                                    } else {
+                                        allocatedSets.push({
+                                            purchaseSetId: fallbackSetId,
+                                            quantity: diffToCover,
+                                            price: Number(oldInfo.purchasePrice || 0)
+                                        });
+                                    }
+                                }
+                            }
+
+                            const restoration =
+                                restoreOrderPurchaseSets(
+                                    {
+                                        variant:
+                                            variantResult,
+                                        allocatedSets,
+                                        quantity:
+                                            oldQty
+                                    }
+                                );
+
+                            await savePurchaseSets(
+                                {
+                                    variantId:
+                                        variantResult._id,
+                                    purchaseSets:
+                                        variantResult.purchaseSets,
+                                    session
+                                }
+                            );
+
+                            affectedProductIds.add(
+                                String(
+                                    variantResult.productId
+                                )
+                            );
+
+                            pendingStockLogs.push(
+                                buildPendingStockLog(
+                                    {
+                                        orderId:
+                                            order.orderId,
+                                        orderRef:
+                                            order._id,
+                                        variant:
+                                            variantResult,
+                                        productId:
+                                            variantResult.productId,
+                                        type:
+                                            "remove-item",
+                                        category:
+                                            "physical",
+                                        quantity:
+                                            oldQty,
+                                        purchasePrice:
+                                            restoration.restoredPurchasePrice,
+                                        previousStock:
+                                            previousAvailableStock,
+                                        updatedStock:
+                                            variantResult.availableStock,
+                                        price:
+                                            Number(
+                                                oldInfo.price ||
+                                                0
+                                            ),
+                                        discount:
+                                            Number(
+                                                oldInfo.discount ||
+                                                0
+                                            ),
+                                        itemQuantity:
+                                            oldQty,
+                                        itemStockIdsRef:
+                                            null
+                                    }
+                                )
+                            );
+
+                            const lastPending =
+                                pendingStockLogs[
+                                pendingStockLogs.length -
+                                1
+                                ];
+
+                            lastPending.previousPhysicalStock =
+                                previousPhysicalStock;
+
+                            lastPending.updatedPhysicalStock =
+                                variantResult.totalStock;
+
+                            itemChanges.push(
+                                `Removed item ${variantResult.name ||
+                                key
+                                } (Qty: ${oldQty})`
+                            );
+                        }
+
+                        order.items =
+                            newItems;
+                    }
+
+                    /*
+                     * ============================================
+                     * SYNC EACH AFFECTED PRODUCT ONCE
+                     * ============================================
+                     */
+                    const productStockMap =
+                        new Map();
+
+                    for (
+                        const productId of affectedProductIds
+                    ) {
+                        const result =
+                            await syncProductStock2(
+                                new mongoose.Types.ObjectId(
+                                    productId
+                                ),
+                                session
+                            );
+
+                        productStockMap.set(
+                            String(
+                                productId
+                            ),
+                            result
+                        );
+                    }
+
+                    /*
+                     * ============================================
+                     * INSERT PHYSICAL STOCK LOGS
+                     * ============================================
+                     */
+                    await insertPendingStockLogs(
+                        {
+                            pendingLogs:
+                                pendingStockLogs,
+                            productStockMap,
+                            session
+                        }
+                    );
+
+                    /*
+                     * New stock IDs were pushed directly into
+                     * each item's original stockIds array through
+                     * itemStockIdsRef.
+                     */
+
+                    /*
+                     * ============================================
+                     * SYNC ORDER STOCK LOG P&L VALUES
+                     * ============================================
+                     */
+                    await syncStockLogSellingPrices(
+                        {
+                            items:
+                                order.items,
+                            orderRef:
+                                order._id,
+                            session
+                        }
+                    );
+
+                    /*
+                     * ============================================
+                     * RECALCULATE ORDER TOTALS
+                     * ============================================
+                     */
+                    let subtotal = 0;
+
+                    for (const item of order.items) {
+                        const qty =
+                            Number(
+                                item.quantity ||
+                                0
+                            );
+
+                        const price =
+                            Number(
+                                item.price ||
+                                0
+                            );
+
+                        const itemDiscount =
+                            Number(
+                                item.discount ||
+                                0
+                            );
+
+                        subtotal +=
+                            qty *
+                            (
+                                price -
+                                itemDiscount
+                            );
+                    }
+
+                    order.subtotal =
+                        subtotal;
+
+                    let flatDiscount =
+                        Number(
+                            discount !==
+                                undefined
+                                ? discount
+                                : order.discount ||
+                                0
+                        );
+
+                    let percentDiscount =
+                        Number(
+                            discountPercent !==
+                                undefined
+                                ? discountPercent
+                                : order.discountPercent ||
+                                0
+                        );
+
+                    const globalDiscountType =
+                        req.body
+                            .discountType ||
+                        order.discountType ||
+                        "flat";
+
+                    if (
+                        subtotal > 0
+                    ) {
+                        if (
+                            globalDiscountType ===
+                            "percentage"
+                        ) {
+                            flatDiscount =
+                                Number(
+                                    (
+                                        (subtotal *
+                                            percentDiscount) /
+                                        100
+                                    ).toFixed(2)
+                                );
+                        } else {
+                            percentDiscount =
+                                Number(
+                                    (
+                                        (flatDiscount /
+                                            subtotal) *
+                                        100
+                                    ).toFixed(2)
+                                );
+                        }
+                    }
+
+                    order.discount =
+                        flatDiscount;
+
+                    order.discountPercent =
+                        percentDiscount;
+
+                    order.deliveryCharge =
+                        deliveryCharge !==
+                            undefined
+                            ? Number(
+                                deliveryCharge
+                            )
+                            : Number(
+                                order.deliveryCharge ||
+                                0
+                            );
+
+                    order.orderAmount =
+                        Math.max(
+                            0,
+                            subtotal -
+                            flatDiscount +
+                            order.deliveryCharge
+                        );
+
+                    order.remainingAmount =
+                        Math.max(
+                            0,
+                            order.orderAmount -
+                            Number(
+                                order.amountPaid ||
+                                0
+                            )
+                        );
+
+                    order.paymentStatus =
+                        order.remainingAmount <=
+                            0
+                            ? "Paid"
+                            : "Pending";
+
+                    await order.save({
+                        session
+                    });
+
+                    const remarks =
+                        itemChanges.length >
+                            0
+                            ? `Updated items: ${itemChanges.join(
+                                "; "
+                            )}`
+                            : "Order items, pricing, or quantities updated.";
+
+                    await logActivity({
+                        orderId:
+                            order._id,
+                        action:
+                            "Items Edited",
+                        remarks,
+                        req,
+                        session
+                    });
+                }
+            );
+
+            const updatedOrder =
+                await Order.findById(
+                    id
+                ).populate(
+                    "items.productId"
+                );
+
+            return res
+                .status(200)
+                .json(
+                    new ApiResponse(
+                        200,
+                        {
+                            order:
+                                updatedOrder
+                        },
+                        "Order items updated successfully."
+                    )
+                );
+        } catch (error) {
+            console.error(
+                "Error in updateOrderItems:",
+                error
+            );
+            throw error;
+        } finally {
+            session.endSession();
+        }
     }
+);
 
-    if (order.status === "Cancelled") {
-        throw new ApiError(400, "Order already cancelled");
-    }
-
-    // Atomic session: order save + stock restore
-    const session = await mongoose.startSession();
-    try {
-        await session.withTransaction(async () => {
-            order.status = "Cancelled";
-            order.reason = reason;
-            order.requests = updateRequestStatus(order.requests, reason);
-            await order.save({ session });
-
-            await adjustStockV3(order, { type: STOCK_TYPES.CANCEL, session });
-
-            await logActivity({
-                orderId: order._id,
-                action: "Cancelled",
-                remarks: reason || "Order cancelled by admin.",
-                req,
-                session
-            });
-        });
-    } finally {
-        session.endSession();
-    }
-
-    return res.json(
-        new ApiResponse(200, { order }, "Order cancelled and stock restored successfully.")
-    );
+export const getOrderActivity = asyncHandler(async (req, res) => {
+    const { id } = req.params;
+    const activityLogs = await ActivityLog.find({ orderId: id })
+        .sort({ createdAt: -1 });
+    return res.status(200).json(new ApiResponse(200, activityLogs, "Order activity logs fetched successfully."));
 });
+
+const systemCreatedCancel =
+    asyncHandler(
+        async (req, res) => {
+            const {
+                orderId,
+                reason
+            } = req.body;
+
+            const session =
+                await mongoose.startSession();
+
+            try {
+                let updatedOrder;
+
+                await session.withTransaction(
+                    async () => {
+                        /*
+                         * Read order INSIDE transaction.
+                         */
+                        const order =
+                            await Order.findById(
+                                orderId
+                            ).session(
+                                session
+                            );
+
+                        if (!order) {
+                            throw new ApiError(
+                                404,
+                                "Order not found"
+                            );
+                        }
+
+                        if (
+                            order.status ===
+                            "Cancelled"
+                        ) {
+                            throw new ApiError(
+                                400,
+                                "Order already cancelled"
+                            );
+                        }
+
+                        if (
+                            order.status ===
+                            "Rejected"
+                        ) {
+                            throw new ApiError(
+                                400,
+                                "Order already rejected"
+                            );
+                        }
+
+                        /*
+                         * Restore stock FIRST.
+                         *
+                         * If this throws, order remains in its
+                         * original status because the transaction
+                         * rolls back.
+                         */
+                        const result =
+                            await adjustStockV3(
+                                order,
+                                {
+                                    type:
+                                        STOCK_TYPES.CANCEL,
+                                    session
+                                }
+                            );
+
+                        if (
+                            !result?.restored ||
+                            !result.order
+                        ) {
+                            throw new ApiError(
+                                409,
+                                "Order stock could not be restored."
+                            );
+                        }
+
+                        /*
+                         * Use the transaction-local order returned
+                         * by adjustStockV3.
+                         */
+                        const restoredOrder =
+                            result.order;
+
+                        restoredOrder.status =
+                            "Cancelled";
+
+                        restoredOrder.reason =
+                            reason;
+
+                        restoredOrder.requests =
+                            updateRequestStatus(
+                                restoredOrder.requests,
+                                reason
+                            );
+
+                        updatedOrder =
+                            await restoredOrder.save(
+                                {
+                                    session
+                                }
+                            );
+
+                        await logActivity({
+                            orderId:
+                                restoredOrder._id,
+                            action:
+                                "Cancelled",
+                            remarks:
+                                reason ||
+                                "Order cancelled by admin.",
+                            req,
+                            session
+                        });
+                    }
+                );
+
+                return res.json(
+                    new ApiResponse(
+                        200,
+                        {
+                            order:
+                                updatedOrder
+                        },
+                        "Order cancelled and stock restored successfully."
+                    )
+                );
+            } finally {
+                await session.endSession();
+            }
+        }
+    );
+
+const systemCreatedReject =
+    asyncHandler(
+        async (req, res) => {
+            const {
+                orderId,
+                reason
+            } = req.body;
+
+            const session =
+                await mongoose.startSession();
+
+            try {
+                let updatedOrder;
+
+                await session.withTransaction(
+                    async () => {
+                        /*
+                         * Read order INSIDE transaction.
+                         */
+                        const order =
+                            await Order.findById(
+                                orderId
+                            ).session(
+                                session
+                            );
+
+                        if (!order) {
+                            throw new ApiError(
+                                404,
+                                "Order not found"
+                            );
+                        }
+
+                        if (
+                            order.status ===
+                            "Rejected"
+                        ) {
+                            throw new ApiError(
+                                400,
+                                "Order already rejected"
+                            );
+                        }
+
+                        if (
+                            order.status ===
+                            "Cancelled"
+                        ) {
+                            throw new ApiError(
+                                400,
+                                "Order already cancelled"
+                            );
+                        }
+
+                        /*
+                         * Restore stock FIRST.
+                         */
+                        const result =
+                            await adjustStockV3(
+                                order,
+                                {
+                                    type:
+                                        STOCK_TYPES.REJECT,
+                                    session
+                                }
+                            );
+
+                        if (
+                            !result?.restored ||
+                            !result.order
+                        ) {
+                            throw new ApiError(
+                                409,
+                                "Order stock could not be restored."
+                            );
+                        }
+
+                        const restoredOrder =
+                            result.order;
+
+                        restoredOrder.status =
+                            "Rejected";
+
+                        restoredOrder.reason =
+                            reason;
+
+                        restoredOrder.requests =
+                            rejectAllRequest(
+                                restoredOrder.requests,
+                                reason
+                            );
+
+                        updatedOrder =
+                            await restoredOrder.save(
+                                {
+                                    session
+                                }
+                            );
+
+                        await logActivity({
+                            orderId:
+                                restoredOrder._id,
+                            action:
+                                "Rejected",
+                            remarks:
+                                reason ||
+                                "Order rejected by admin.",
+                            req,
+                            session
+                        });
+                    }
+                );
+
+                return res.json(
+                    new ApiResponse(
+                        200,
+                        {
+                            order:
+                                updatedOrder
+                        },
+                        "Order rejected and stock restored successfully."
+                    )
+                );
+            } finally {
+                await session.endSession();
+            }
+        }
+    );
 
 export {
     paymentLinkWebhook,
@@ -5600,7 +7557,8 @@ export {
     generatePaymentRecordLink,
     manualShipOrder,
     updateManualShippingStatus,
-    systemCreatedCancel
+    systemCreatedCancel,
+    systemCreatedReject
 }
 
 // =========================================================================
@@ -5649,532 +7607,605 @@ const legacy_updateOrder = asyncHandler(async (req, res) => {
     }
 });
 
-export const updateOrderItems = asyncHandler(async (req, res) => {
-    const session = await mongoose.startSession();
-    try {
-        const { id } = req.params;
-        const { items, discount, discountPercent, deliveryCharge } = req.body;
-
-        if (!id) {
-            throw new ApiError(400, "Order ID is required.");
-        }
-
-        const order = await Order.findById(id);
-        if (!order) {
-            throw new ApiError(404, "Order not found.");
-        }
-
-        // Validate editing timeframe constraints
-        const canEdit = () => {
-            if (order.shippingType === 'Manual') {
-                return !['Shipped', 'Delivered', 'Cancelled', 'Rejected', 'Returned'].includes(order.status);
-            } else {
-                return !order.awbCode && !order.shipmentId && !order.pickupScheduled && !order.courierName && !['Shipped', 'Delivered', 'Cancelled', 'Rejected', 'Returned'].includes(order.status);
-            }
-        };
-        if (!canEdit()) {
-            throw new ApiError(400, "Order cannot be edited at this stage.");
-        }
-
-        await session.withTransaction(async () => {
-            const clonePurchaseSets = (sets = []) => sets.map(s => ({
-                purchaseSetId: String(s.purchaseSetId),
-                quantity: Number(s.quantity || 0),
-                price: Number(s.price || 0)
-            }));
-
-            const oldItemsMap = new Map();
-            for (const item of order.items) {
-                const key = item.variantId ? item.variantId.toString() : `${item.productId.toString()}_${item.variantName}`;
-                oldItemsMap.set(key, {
-                    quantity: item.quantity,
-                    stockIds: item.stockIds || [],
-                    price: item.price,
-                    discount: item.discount,
-                    variantId: item.variantId,
-                    purchasePrice: item.purchasePrice || 0,
-                    purchaseSetId: item.purchaseSetId || "",
-                    purchaseSets: item.purchaseSets || []
-                });
-            }
-
-            const newItems = [];
-            const itemChanges = [];
-
-            if (items && Array.isArray(items)) {
-                for (const reqItem of items) {
-                    const productId = reqItem.productId;
-                    const variantId = reqItem.variantId;
-                    const variantName = reqItem.variantName;
-                    const qty = Math.floor(Number(reqItem.quantity || 0));
-                    const itemDiscount = Number(reqItem.discount || 0);
-                    const itemDiscountPercent = Number(reqItem.discountPercent || 0);
-
-                    if (qty <= 0) continue;
-
-                    const key = variantId ? variantId.toString() : `${productId.toString()}_${variantName}`;
-                    const oldInfo = oldItemsMap.get(key) || {
-                        quantity: 0,
-                        stockIds: [],
-                        price: 0,
-                        discount: 0,
-                        variantId: null,
-                        purchasePrice: 0,
-                        purchaseSetId: "",
-                        purchaseSets: []
-                    };
-                    const oldQty = oldInfo.quantity;
-                    const diff = qty - oldQty;
-
-                    const finalPrice = reqItem.price !== undefined && reqItem.price !== null ? Number(reqItem.price) : oldInfo.price;
-                    const itemDiscountType = reqItem.discountType !== undefined ? reqItem.discountType : (oldInfo.discountType || "flat");
-                    const syncedDiscount = syncItemDiscount(itemDiscount, itemDiscountPercent, finalPrice, itemDiscountType);
-                    const finalDiscount = syncedDiscount.discount;
-                    const finalDiscountPercent = syncedDiscount.discountPercent;
-                    const finalUnitSellingPrice = finalPrice - finalDiscount;
-
-                    const product = await Product.findById(productId).session(session);
-                    if (!product) throw new ApiError(404, `Product not found for ID: ${productId}`);
-
-                    let itemStockIds = [...oldInfo.stockIds];
-                    let allocatedSets = clonePurchaseSets(oldInfo.purchaseSets);
-                    let selectedSetId = oldInfo.purchaseSetId || "";
-                    let avgPurchasePrice = Number(oldInfo.purchasePrice || 0);
-                    let incrementalPurchasePrice = 0;
-                    let restoredPurchasePrice = 0;
-
-                    // Adjust stock if quantity changed
-                    if (diff > 0) {
-                        const query = reqItem.variantId
-                            ? { _id: reqItem.variantId, active: true, totalStock: { $gte: diff }, availableStock: { $gte: diff } }
-                            : { productId: productId, name: variantName, active: true, totalStock: { $gte: diff }, availableStock: { $gte: diff } };
-                        const variantResult = await Variant.findOneAndUpdate(
-                            query,
-                            { $inc: { totalStock: -diff, availableStock: -diff } },
-                            { new: true, session }
-                        );
-
-                        if (!variantResult) {
-                            throw new ApiError(400, `Insufficient stock for product ${product.fullName} variant ${variantName}`);
-                        }
-
-                        // FIFO allocation on purchaseSets
-                        let remaining = diff;
-                        const sortedSets = variantResult.purchaseSets
-                            .map((set, idx) => ({ set, idx }))
-                            .filter(itemObj => itemObj.set.availableStock > 0)
-                            .sort((a, b) => a.set.price - b.set.price);
-
-                        let totalCost = 0;
-                        const newlyAllocated = [];
-
-                        for (const itemObj of sortedSets) {
-                            const set = variantResult.purchaseSets[itemObj.idx];
-                            const take = Math.min(remaining, set.availableStock);
-                            if (take <= 0) continue;
-                            set.availableStock -= take;
-                            set.remainingStock = Math.max(0, set.remainingStock - take);
-                            totalCost += take * set.price;
-                            newlyAllocated.push({
-                                purchaseSetId: String(set._id),
-                                quantity: take,
-                                price: set.price
-                            });
-                            remaining -= take;
-
-                            if (!selectedSetId) {
-                                selectedSetId = String(set._id);
-                            }
-
-                            if (remaining === 0) break;
-                        }
-
-                        if (remaining > 0 && variantResult.purchaseSets.length > 0) {
-                            const firstSet = variantResult.purchaseSets[0];
-                            firstSet.availableStock = Math.max(0, firstSet.availableStock - remaining);
-                            firstSet.remainingStock = Math.max(0, firstSet.remainingStock - remaining);
-                            newlyAllocated.push({
-                                purchaseSetId: String(firstSet._id),
-                                quantity: remaining,
-                                price: firstSet.price
-                            });
-                            if (!selectedSetId) {
-                                selectedSetId = String(firstSet._id);
-                            }
-                            totalCost += remaining * firstSet.price;
-                        }
-
-                        incrementalPurchasePrice = diff > 0 ? (totalCost / diff) : 0;
-
-                        // Fallback populating allocatedSets if it was empty from bad/old data
-                        if (allocatedSets.length === 0 && oldQty > 0) {
-                            const fallbackSetId = oldInfo.purchaseSetId || (variantResult.purchaseSets[0] ? String(variantResult.purchaseSets[0]._id) : "");
-                            if (fallbackSetId) {
-                                allocatedSets = [{
-                                    purchaseSetId: fallbackSetId,
-                                    quantity: oldQty,
-                                    price: Number(oldInfo.purchasePrice || 0)
-                                }];
-                            }
-                        }
-
-                        // Merge into the item's purchaseSets
-                        for (const alloc of newlyAllocated) {
-                            const matched = allocatedSets.find(s => s.purchaseSetId === alloc.purchaseSetId);
-                            if (matched) {
-                                matched.quantity += alloc.quantity;
-                            } else {
-                                allocatedSets.push(alloc);
-                            }
-                        }
-
-                        // Calculate weighted average purchase price
-                        if (avgPurchasePrice > 0 || incrementalPurchasePrice > 0) {
-                            avgPurchasePrice = parseFloat((((oldInfo.purchasePrice * oldQty) + (incrementalPurchasePrice * diff)) / qty).toFixed(3)) || 0;
-                        } else {
-                            avgPurchasePrice = incrementalPurchasePrice;
-                        }
-
-                        await variantResult.save({ session });
-                        await syncProductStock(productId, session);
-
-                        const parentProduct = await Product.findById(productId).session(session);
-                        const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
-
-                        // Create Stock entry
-                        const newStockLog = await Stock.create([{
-                            orderId: order.orderId,
-                            orderRef: order._id,
-                            type: "add-item", // sign: -
-                            category: "physical",
-                            variantId: variantResult._id,
-                            variantName: variantResult.name,
-                            purchasePrice: incrementalPurchasePrice,
-                            sellingPrice: finalUnitSellingPrice,
-                            quantity: diff,
-                            previousStock: variantResult.availableStock + diff,
-                            updatedStock: variantResult.availableStock,
-                            previousPhysicalStock: variantResult.totalStock + diff,
-                            updatedPhysicalStock: variantResult.totalStock,
-                            totalProductStock: currentTotalProductStock,
-                            productId: productId
-                        }], { session });
-
-                        itemStockIds.push(newStockLog[0]._id);
-
-                    } else if (diff < 0) {
-                        const restoreQty = -diff;
-                        const query = reqItem.variantId
-                            ? { _id: reqItem.variantId }
-                            : { productId: productId, name: variantName };
-                        const variantResult = await Variant.findOneAndUpdate(
-                            query,
-                            { $inc: { totalStock: restoreQty, availableStock: restoreQty } },
-                            { new: true, session }
-                        );
-
-                        if (!variantResult) {
-                            throw new ApiError(400, `Failed to restore variant stock for product ${product.fullName}`);
-                        }
-
-                        // Fallback populating allocatedSets if it was empty from bad/old data
-                        if (allocatedSets.length === 0 && oldQty > 0) {
-                            const fallbackSetId = oldInfo.purchaseSetId || (variantResult.purchaseSets[0] ? String(variantResult.purchaseSets[0]._id) : "");
-                            if (fallbackSetId) {
-                                allocatedSets = [{
-                                    purchaseSetId: fallbackSetId,
-                                    quantity: oldQty,
-                                    price: Number(oldInfo.purchasePrice || 0)
-                                }];
-                            }
-                        }
-
-                        let remainingToRestore = restoreQty;
-                        let restoredCost = 0;
-                        let restoredQty = 0;
-
-                        for (const alloc of allocatedSets) {
-                            const take = Math.min(remainingToRestore, alloc.quantity);
-                            if (take <= 0) continue;
-
-                            const set = variantResult.purchaseSets.find(s => String(s._id) === String(alloc.purchaseSetId));
-                            if (set) {
-                                set.availableStock += take;
-                                set.remainingStock += take;
-                            }
-                            alloc.quantity -= take;
-                            remainingToRestore -= take;
-                            restoredCost += take * alloc.price;
-                            restoredQty += take;
-
-                            if (remainingToRestore === 0) break;
-                        }
-
-                        // Fallback if we couldn't restore everything (desynced)
-                        if (remainingToRestore > 0 && variantResult.purchaseSets.length > 0) {
-                            const firstSet = variantResult.purchaseSets[0];
-                            firstSet.availableStock += remainingToRestore;
-                            firstSet.remainingStock += remainingToRestore;
-                            restoredCost += remainingToRestore * firstSet.price;
-                            restoredQty += remainingToRestore;
-                        }
-
-                        const remainingAllocations = allocatedSets.filter(alloc => alloc.quantity > 0);
-                        const remainingQty = remainingAllocations.reduce((sum, a) => sum + a.quantity, 0);
-                        const remainingCost = remainingAllocations.reduce((sum, a) => sum + (a.quantity * a.price), 0);
-
-                        avgPurchasePrice = remainingQty > 0 ? parseFloat((remainingCost / remainingQty).toFixed(3)) : 0;
-                        selectedSetId = remainingAllocations.length > 0 ? remainingAllocations[0].purchaseSetId : "";
-                        allocatedSets = remainingAllocations;
-
-                        restoredPurchasePrice = restoredQty > 0 ? parseFloat((restoredCost / restoredQty).toFixed(3)) : 0;
-
-                        await variantResult.save({ session });
-                        await syncProductStock(productId, session);
-
-                        const parentProduct = await Product.findById(productId).session(session);
-                        const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
-
-                        const newStockLog = await Stock.create([{
-                            orderId: order.orderId,
-                            orderRef: order._id,
-                            type: "remove-item", // sign: +
-                            category: "physical",
-                            variantId: variantResult._id,
-                            variantName: variantResult.name,
-                            purchasePrice: restoredPurchasePrice,
-                            sellingPrice: finalUnitSellingPrice,
-                            quantity: restoreQty,
-                            previousStock: variantResult.availableStock - restoreQty,
-                            updatedStock: variantResult.availableStock,
-                            previousPhysicalStock: variantResult.totalStock - restoreQty,
-                            updatedPhysicalStock: variantResult.totalStock,
-                            totalProductStock: currentTotalProductStock,
-                            productId: productId
-                        }], { session });
-
-                        itemStockIds.push(newStockLog[0]._id);
-                    }
-
-
-                    const queryConditions = [];
-                    if (order._id) {
-                        const cond = { orderRef: order._id };
-                        const vId = reqItem.variantId || oldInfo.variantId;
-                        if (vId) {
-                            cond.variantId = vId;
-                        } else {
-                            if (productId) cond.productId = productId;
-                            if (variantName) cond.variantName = variantName;
-                        }
-                        queryConditions.push(cond);
-                    }
-                    if (itemStockIds && itemStockIds.length > 0) {
-                        queryConditions.push({ _id: { $in: itemStockIds } });
-                    }
-
-                    if (queryConditions.length > 0) {
-                        await Stock.updateMany(
-                            { $or: queryConditions },
-                            {
-                                $set: {
-                                    sellingPrice: finalUnitSellingPrice,
-                                    purchasePrice: avgPurchasePrice
-                                }
-                            },
-                            { session }
-                        );
-                    }
-
-                    const changes = [];
-                    if (qty !== oldQty) {
-                        changes.push(`Qty: ${oldQty} -> ${qty}`);
-                    }
-                    if (finalPrice !== oldInfo.price) {
-                        changes.push(`Price: ₹${oldInfo.price} -> ₹${finalPrice}`);
-                    }
-                    if (finalDiscount !== oldInfo.discount) {
-                        changes.push(`Discount: ₹${oldInfo.discount} -> ₹${finalDiscount}`);
-                    }
-                    if (changes.length > 0) {
-                        itemChanges.push(`${variantName} (${changes.join(", ")})`);
-                    }
-
-                    newItems.push({
-                        productId,
-                        variantName,
-                        quantity: qty,
-                        price: finalPrice,
-                        discount: finalDiscount,
-                        discountPercent: finalDiscountPercent,
-                        discountType: itemDiscountType,
-                        stockIds: itemStockIds,
-                        variantId: oldInfo.variantId || (await Variant.findOne({ productId, name: variantName }).session(session))?._id,
-                        purchasePrice: avgPurchasePrice,
-                        purchaseSetId: selectedSetId,
-                        purchaseSets: allocatedSets
-                    });
-
-                    oldItemsMap.delete(key);
-                }
-
-                // Restore any completely deleted items
-                for (const [key, oldInfo] of oldItemsMap.entries()) {
-                    const oldQty = oldInfo.quantity;
-
-                    // Resolve the query: prefer variantId, fall back to productId+name from composite key
-                    const variantQuery = oldInfo.variantId
-                        ? { _id: oldInfo.variantId }
-                        : (() => { const [pid, vname] = key.split("_"); return { productId: pid, name: vname }; })();
-
-                    const variantResult = await Variant.findOneAndUpdate(
-                        variantQuery,
-                        { $inc: { totalStock: oldQty, availableStock: oldQty } },
-                        { new: true, session }
-                    );
-
-                    if (!variantResult) {
-                        console.warn(`[updateOrderItems] Could not find variant to restore stock for key: ${key}`);
-                        continue;
-                    }
-
-                    let allocatedSets = clonePurchaseSets(oldInfo.purchaseSets);
-                    // Fallback populating allocatedSets if it was empty from bad/old data
-                    if (allocatedSets.length === 0 && oldQty > 0) {
-                        const fallbackSetId = oldInfo.purchaseSetId || (variantResult.purchaseSets[0] ? String(variantResult.purchaseSets[0]._id) : "");
-                        if (fallbackSetId) {
-                            allocatedSets = [{
-                                purchaseSetId: fallbackSetId,
-                                quantity: oldQty,
-                                price: Number(oldInfo.purchasePrice || 0)
-                            }];
-                        }
-                    }
-
-                    let remainingToRestore = oldQty;
-                    let restoredCost = 0;
-                    let restoredQty = 0;
-
-                    for (const alloc of allocatedSets) {
-                        const take = Math.min(remainingToRestore, alloc.quantity);
-                        if (take <= 0) continue;
-
-                        const set = variantResult.purchaseSets.find(s => String(s._id) === String(alloc.purchaseSetId));
-                        if (set) {
-                            set.availableStock += take;
-                            set.remainingStock += take;
-                        }
-                        remainingToRestore -= take;
-                        restoredCost += take * alloc.price;
-                        restoredQty += take;
-
-                        if (remainingToRestore === 0) break;
-                    }
-
-                    if (remainingToRestore > 0 && variantResult.purchaseSets.length > 0) {
-                        const firstSet = variantResult.purchaseSets[0];
-                        firstSet.availableStock += remainingToRestore;
-                        firstSet.remainingStock += remainingToRestore;
-                        restoredCost += remainingToRestore * firstSet.price;
-                        restoredQty += remainingToRestore;
-                    }
-
-                    const restoredPurchasePrice = restoredQty > 0 ? parseFloat((restoredCost / restoredQty).toFixed(3)) : 0;
-
-                    await variantResult.save({ session });
-                    await syncProductStock(variantResult.productId, session);
-
-                    const parentProduct = await Product.findById(variantResult.productId).session(session);
-                    const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
-
-                    await Stock.create([{
-                        orderId: order.orderId,
-                        orderRef: order._id,
-                        type: "remove-item", // sign: +
-                        category: "physical",
-                        variantId: variantResult._id,
-                        variantName: variantResult.name,
-                        purchasePrice: restoredPurchasePrice,
-                        sellingPrice: oldInfo.price - (oldInfo.discount / oldQty),
-                        quantity: oldQty,
-                        previousStock: variantResult.availableStock - oldQty,
-                        updatedStock: variantResult.availableStock,
-                        previousPhysicalStock: variantResult.totalStock - oldQty,
-                        updatedPhysicalStock: variantResult.totalStock,
-                        totalProductStock: currentTotalProductStock,
-                        productId: variantResult.productId
-                    }], { session });
-
-                    itemChanges.push(`Removed item ${variantResult.name || key} (Qty: ${oldQty})`);
-                }
-
-                order.items = newItems;
-            }
-
-            // Recalculate totals
-            let subtotal = 0;
-            for (const item of order.items) {
-                const qty = item.quantity;
-                const price = item.price;
-                subtotal += qty * (price - (item.discount || 0));
-            }
-            order.subtotal = subtotal;
-
-            let flatDiscount = Number(discount !== undefined ? discount : order.discount);
-            let percentDiscount = Number(discountPercent !== undefined ? discountPercent : order.discountPercent);
-            // Use the saved discountType to decide which value is the anchor
-            const globalDiscountType = req.body.discountType || order.discountType || 'flat';
-            if (subtotal > 0) {
-                if (globalDiscountType === 'percentage') {
-                    // Percentage is the anchor — recompute flat from new subtotal
-                    flatDiscount = parseFloat(((subtotal * percentDiscount) / 100).toFixed(2));
-                } else {
-                    // Flat is the anchor — keep flat constant, recompute percent for display
-                    percentDiscount = parseFloat(((flatDiscount / subtotal) * 100).toFixed(2));
-                }
-            }
-            order.discount = flatDiscount;
-            order.discountPercent = percentDiscount;
-
-            const delCharge = deliveryCharge !== undefined ? Number(deliveryCharge) : order.deliveryCharge;
-            order.deliveryCharge = delCharge;
-
-            order.orderAmount = Math.max(0, subtotal - flatDiscount + delCharge);
-            order.remainingAmount = Math.max(0, order.orderAmount - order.amountPaid);
-
-            if (order.remainingAmount <= 0) {
-                order.paymentStatus = "Paid";
-            } else {
-                order.paymentStatus = "Pending";
-            }
-
-            await order.save({ session });
-
-            const remarks = itemChanges.length > 0 ? `Updated items: ${itemChanges.join("; ")}` : "Order items, pricing, or quantities updated.";
-
-            await logActivity({
-                orderId: order._id,
-                action: "Items Edited",
-                remarks,
-                req,
-                session
-            });
-        });
-
-        const updatedOrder = await Order.findById(id).populate("items.productId");
-        return res.status(200).json(new ApiResponse(200, { order: updatedOrder }, "Order items updated successfully."));
-    } catch (error) {
-        console.error("Error in updateOrderItems:", error);
-        throw error;
-    } finally {
-        session.endSession();
-    }
-});
-
-export const getOrderActivity = asyncHandler(async (req, res) => {
-    const { id } = req.params;
-    const activityLogs = await ActivityLog.find({ orderId: id })
-        .sort({ createdAt: -1 });
-    return res.status(200).json(new ApiResponse(200, activityLogs, "Order activity logs fetched successfully."));
-});
-
+// export const updateOrderItems = asyncHandler(async (req, res) => {
+//     const session = await mongoose.startSession();
+//     try {
+//         const { id } = req.params;
+//         const { items, discount, discountPercent, deliveryCharge } = req.body;
+
+//         if (!id) {
+//             throw new ApiError(400, "Order ID is required.");
+//         }
+
+//         const order = await Order.findById(id);
+//         if (!order) {
+//             throw new ApiError(404, "Order not found.");
+//         }
+
+//         // Validate editing timeframe constraints
+//         const canEdit = () => {
+//             if (order.shippingType === 'Manual') {
+//                 return !['Shipped', 'Delivered', 'Cancelled', 'Rejected', 'Returned'].includes(order.status);
+//             } else {
+//                 return !order.awbCode && !order.shipmentId && !order.pickupScheduled && !order.courierName && !['Shipped', 'Delivered', 'Cancelled', 'Rejected', 'Returned'].includes(order.status);
+//             }
+//         };
+//         if (!canEdit()) {
+//             throw new ApiError(400, "Order cannot be edited at this stage.");
+//         }
+
+//         await session.withTransaction(async () => {
+//             const clonePurchaseSets = (sets = []) => sets.map(s => ({
+//                 purchaseSetId: String(s.purchaseSetId),
+//                 quantity: Number(s.quantity || 0),
+//                 price: Number(s.price || 0)
+//             }));
+
+//             const oldItemsMap = new Map();
+//             for (const item of order.items) {
+//                 const key = item.variantId ? item.variantId.toString() : `${item.productId.toString()}_${item.variantName}`;
+//                 oldItemsMap.set(key, {
+//                     quantity: item.quantity,
+//                     stockIds: item.stockIds || [],
+//                     price: item.price,
+//                     discount: item.discount,
+//                     variantId: item.variantId,
+//                     purchasePrice: item.purchasePrice || 0,
+//                     purchaseSetId: item.purchaseSetId || "",
+//                     purchaseSets: item.purchaseSets || []
+//                 });
+//             }
+
+//             const newItems = [];
+//             const itemChanges = [];
+
+//             if (items && Array.isArray(items)) {
+//                 for (const reqItem of items) {
+//                     const productId = reqItem.productId;
+//                     const variantId = reqItem.variantId;
+//                     const variantName = reqItem.variantName;
+//                     const qty = Math.floor(Number(reqItem.quantity || 0));
+//                     const itemDiscount = Number(reqItem.discount || 0);
+//                     const itemDiscountPercent = Number(reqItem.discountPercent || 0);
+
+//                     if (qty <= 0) continue;
+
+//                     const key = variantId ? variantId.toString() : `${productId.toString()}_${variantName}`;
+//                     const oldInfo = oldItemsMap.get(key) || {
+//                         quantity: 0,
+//                         stockIds: [],
+//                         price: 0,
+//                         discount: 0,
+//                         variantId: null,
+//                         purchasePrice: 0,
+//                         purchaseSetId: "",
+//                         purchaseSets: []
+//                     };
+//                     const oldQty = oldInfo.quantity;
+//                     const diff = qty - oldQty;
+
+//                     const finalPrice = reqItem.price !== undefined && reqItem.price !== null ? Number(reqItem.price) : oldInfo.price;
+//                     const itemDiscountType = reqItem.discountType !== undefined ? reqItem.discountType : (oldInfo.discountType || "flat");
+//                     const syncedDiscount = syncItemDiscount(itemDiscount, itemDiscountPercent, finalPrice, itemDiscountType);
+//                     const finalDiscount = syncedDiscount.discount;
+//                     const finalDiscountPercent = syncedDiscount.discountPercent;
+//                     const finalUnitSellingPrice = finalPrice - finalDiscount;
+
+//                     const product = await Product.findById(productId).session(session);
+//                     if (!product) throw new ApiError(404, `Product not found for ID: ${productId}`);
+
+//                     let itemStockIds = [...oldInfo.stockIds];
+//                     let allocatedSets = clonePurchaseSets(oldInfo.purchaseSets);
+//                     let selectedSetId = oldInfo.purchaseSetId || "";
+//                     let avgPurchasePrice = Number(oldInfo.purchasePrice || 0);
+//                     let incrementalPurchasePrice = 0;
+//                     let restoredPurchasePrice = 0;
+
+//                     // Adjust stock if quantity changed
+//                     if (diff > 0) {
+//                         const query = reqItem.variantId
+//                             ? { _id: reqItem.variantId, active: true, totalStock: { $gte: diff }, availableStock: { $gte: diff } }
+//                             : { productId: productId, name: variantName, active: true, totalStock: { $gte: diff }, availableStock: { $gte: diff } };
+//                         const variantResult = await Variant.findOneAndUpdate(
+//                             query,
+//                             { $inc: { totalStock: -diff, availableStock: -diff } },
+//                             { new: true, session }
+//                         );
+
+//                         if (!variantResult) {
+//                             throw new ApiError(400, `Insufficient stock for product ${product.fullName} variant ${variantName}`);
+//                         }
+
+//                         // FIFO allocation on purchaseSets
+//                         let remaining = diff;
+//                         const sortedSets = variantResult.purchaseSets
+//                             .map((set, idx) => ({ set, idx }))
+//                             .filter(itemObj => itemObj.set.availableStock > 0)
+//                             .sort((a, b) => a.set.price - b.set.price);
+
+//                         let totalCost = 0;
+//                         const newlyAllocated = [];
+
+//                         for (const itemObj of sortedSets) {
+//                             const set = variantResult.purchaseSets[itemObj.idx];
+//                             const take = Math.min(remaining, set.availableStock);
+//                             if (take <= 0) continue;
+//                             set.availableStock -= take;
+//                             set.remainingStock = Math.max(0, set.remainingStock - take);
+//                             totalCost += take * set.price;
+//                             newlyAllocated.push({
+//                                 purchaseSetId: String(set._id),
+//                                 quantity: take,
+//                                 price: set.price
+//                             });
+//                             remaining -= take;
+
+//                             if (!selectedSetId) {
+//                                 selectedSetId = String(set._id);
+//                             }
+
+//                             if (remaining === 0) break;
+//                         }
+
+//                         if (remaining > 0 && variantResult.purchaseSets.length > 0) {
+//                             const firstSet = variantResult.purchaseSets[0];
+//                             firstSet.availableStock = Math.max(0, firstSet.availableStock - remaining);
+//                             firstSet.remainingStock = Math.max(0, firstSet.remainingStock - remaining);
+//                             newlyAllocated.push({
+//                                 purchaseSetId: String(firstSet._id),
+//                                 quantity: remaining,
+//                                 price: firstSet.price
+//                             });
+//                             if (!selectedSetId) {
+//                                 selectedSetId = String(firstSet._id);
+//                             }
+//                             totalCost += remaining * firstSet.price;
+//                         }
+
+//                         incrementalPurchasePrice = diff > 0 ? (totalCost / diff) : 0;
+
+//                         // Fallback populating allocatedSets if it was empty from bad/old data
+//                         if (allocatedSets.length === 0 && oldQty > 0) {
+//                             const fallbackSetId = oldInfo.purchaseSetId || (variantResult.purchaseSets[0] ? String(variantResult.purchaseSets[0]._id) : "");
+//                             if (fallbackSetId) {
+//                                 allocatedSets = [{
+//                                     purchaseSetId: fallbackSetId,
+//                                     quantity: oldQty,
+//                                     price: Number(oldInfo.purchasePrice || 0)
+//                                 }];
+//                             }
+//                         }
+
+//                         // Merge into the item's purchaseSets
+//                         for (const alloc of newlyAllocated) {
+//                             const matched = allocatedSets.find(s => s.purchaseSetId === alloc.purchaseSetId);
+//                             if (matched) {
+//                                 matched.quantity += alloc.quantity;
+//                             } else {
+//                                 allocatedSets.push(alloc);
+//                             }
+//                         }
+
+//                         // Calculate weighted average purchase price
+//                         if (avgPurchasePrice > 0 || incrementalPurchasePrice > 0) {
+//                             avgPurchasePrice = parseFloat((((oldInfo.purchasePrice * oldQty) + (incrementalPurchasePrice * diff)) / qty).toFixed(3)) || 0;
+//                         } else {
+//                             avgPurchasePrice = incrementalPurchasePrice;
+//                         }
+
+//                         await variantResult.save({ session });
+//                         await syncProductStock(productId, session);
+
+//                         const parentProduct = await Product.findById(productId).session(session);
+//                         const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+//                         // Create Stock entry
+//                         const newStockLog = await Stock.create([{
+//                             orderId: order.orderId,
+//                             orderRef: order._id,
+//                             type: "add-item", // sign: -
+//                             category: "physical",
+//                             variantId: variantResult._id,
+//                             variantName: variantResult.name,
+//                             purchasePrice: incrementalPurchasePrice,
+//                             sellingPrice: finalUnitSellingPrice,
+//                             quantity: diff,
+//                             previousStock: variantResult.availableStock + diff,
+//                             updatedStock: variantResult.availableStock,
+//                             previousPhysicalStock: variantResult.totalStock + diff,
+//                             updatedPhysicalStock: variantResult.totalStock,
+//                             totalProductStock: currentTotalProductStock,
+//                             productId: productId
+//                         }], { session });
+
+//                         itemStockIds.push(newStockLog[0]._id);
+
+//                     } else if (diff < 0) {
+//                         const restoreQty = -diff;
+//                         const query = reqItem.variantId
+//                             ? { _id: reqItem.variantId }
+//                             : { productId: productId, name: variantName };
+//                         const variantResult = await Variant.findOneAndUpdate(
+//                             query,
+//                             { $inc: { totalStock: restoreQty, availableStock: restoreQty } },
+//                             { new: true, session }
+//                         );
+
+//                         if (!variantResult) {
+//                             throw new ApiError(400, `Failed to restore variant stock for product ${product.fullName}`);
+//                         }
+
+//                         // Fallback populating allocatedSets if it was empty from bad/old data
+//                         if (allocatedSets.length === 0 && oldQty > 0) {
+//                             const fallbackSetId = oldInfo.purchaseSetId || (variantResult.purchaseSets[0] ? String(variantResult.purchaseSets[0]._id) : "");
+//                             if (fallbackSetId) {
+//                                 allocatedSets = [{
+//                                     purchaseSetId: fallbackSetId,
+//                                     quantity: oldQty,
+//                                     price: Number(oldInfo.purchasePrice || 0)
+//                                 }];
+//                             }
+//                         }
+
+//                         let remainingToRestore = restoreQty;
+//                         let restoredCost = 0;
+//                         let restoredQty = 0;
+
+//                         for (const alloc of allocatedSets) {
+//                             const take = Math.min(remainingToRestore, alloc.quantity);
+//                             if (take <= 0) continue;
+
+//                             const set = variantResult.purchaseSets.find(s => String(s._id) === String(alloc.purchaseSetId));
+//                             if (set) {
+//                                 set.availableStock += take;
+//                                 set.remainingStock += take;
+//                             }
+//                             alloc.quantity -= take;
+//                             remainingToRestore -= take;
+//                             restoredCost += take * alloc.price;
+//                             restoredQty += take;
+
+//                             if (remainingToRestore === 0) break;
+//                         }
+
+//                         // Fallback if we couldn't restore everything (desynced)
+//                         if (remainingToRestore > 0 && variantResult.purchaseSets.length > 0) {
+//                             const firstSet = variantResult.purchaseSets[0];
+//                             firstSet.availableStock += remainingToRestore;
+//                             firstSet.remainingStock += remainingToRestore;
+//                             restoredCost += remainingToRestore * firstSet.price;
+//                             restoredQty += remainingToRestore;
+//                         }
+
+//                         const remainingAllocations = allocatedSets.filter(alloc => alloc.quantity > 0);
+//                         const remainingQty = remainingAllocations.reduce((sum, a) => sum + a.quantity, 0);
+//                         const remainingCost = remainingAllocations.reduce((sum, a) => sum + (a.quantity * a.price), 0);
+
+//                         avgPurchasePrice = remainingQty > 0 ? parseFloat((remainingCost / remainingQty).toFixed(3)) : 0;
+//                         selectedSetId = remainingAllocations.length > 0 ? remainingAllocations[0].purchaseSetId : "";
+//                         allocatedSets = remainingAllocations;
+
+//                         restoredPurchasePrice = restoredQty > 0 ? parseFloat((restoredCost / restoredQty).toFixed(3)) : 0;
+
+//                         await variantResult.save({ session });
+//                         await syncProductStock(productId, session);
+
+//                         const parentProduct = await Product.findById(productId).session(session);
+//                         const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+//                         const newStockLog = await Stock.create([{
+//                             orderId: order.orderId,
+//                             orderRef: order._id,
+//                             type: "remove-item", // sign: +
+//                             category: "physical",
+//                             variantId: variantResult._id,
+//                             variantName: variantResult.name,
+//                             purchasePrice: restoredPurchasePrice,
+//                             sellingPrice: finalUnitSellingPrice,
+//                             quantity: restoreQty,
+//                             previousStock: variantResult.availableStock - restoreQty,
+//                             updatedStock: variantResult.availableStock,
+//                             previousPhysicalStock: variantResult.totalStock - restoreQty,
+//                             updatedPhysicalStock: variantResult.totalStock,
+//                             totalProductStock: currentTotalProductStock,
+//                             productId: productId
+//                         }], { session });
+
+//                         itemStockIds.push(newStockLog[0]._id);
+//                     }
+
+
+//                     const queryConditions = [];
+//                     if (order._id) {
+//                         const cond = { orderRef: order._id };
+//                         const vId = reqItem.variantId || oldInfo.variantId;
+//                         if (vId) {
+//                             cond.variantId = vId;
+//                         } else {
+//                             if (productId) cond.productId = productId;
+//                             if (variantName) cond.variantName = variantName;
+//                         }
+//                         queryConditions.push(cond);
+//                     }
+//                     if (itemStockIds && itemStockIds.length > 0) {
+//                         queryConditions.push({ _id: { $in: itemStockIds } });
+//                     }
+
+//                     if (queryConditions.length > 0) {
+//                         await Stock.updateMany(
+//                             { $or: queryConditions },
+//                             {
+//                                 $set: {
+//                                     sellingPrice: finalUnitSellingPrice,
+//                                     purchasePrice: avgPurchasePrice
+//                                 }
+//                             },
+//                             { session }
+//                         );
+//                     }
+
+//                     const changes = [];
+//                     if (qty !== oldQty) {
+//                         changes.push(`Qty: ${oldQty} -> ${qty}`);
+//                     }
+//                     if (finalPrice !== oldInfo.price) {
+//                         changes.push(`Price: ₹${oldInfo.price} -> ₹${finalPrice}`);
+//                     }
+//                     if (finalDiscount !== oldInfo.discount) {
+//                         changes.push(`Discount: ₹${oldInfo.discount} -> ₹${finalDiscount}`);
+//                     }
+//                     if (changes.length > 0) {
+//                         itemChanges.push(`${variantName} (${changes.join(", ")})`);
+//                     }
+
+//                     newItems.push({
+//                         productId,
+//                         variantName,
+//                         quantity: qty,
+//                         price: finalPrice,
+//                         discount: finalDiscount,
+//                         discountPercent: finalDiscountPercent,
+//                         discountType: itemDiscountType,
+//                         stockIds: itemStockIds,
+//                         variantId: oldInfo.variantId || (await Variant.findOne({ productId, name: variantName }).session(session))?._id,
+//                         purchasePrice: avgPurchasePrice,
+//                         purchaseSetId: selectedSetId,
+//                         purchaseSets: allocatedSets
+//                     });
+
+//                     oldItemsMap.delete(key);
+//                 }
+
+//                 // Restore any completely deleted items
+//                 for (const [key, oldInfo] of oldItemsMap.entries()) {
+//                     const oldQty = oldInfo.quantity;
+
+//                     // Resolve the query: prefer variantId, fall back to productId+name from composite key
+//                     const variantQuery = oldInfo.variantId
+//                         ? { _id: oldInfo.variantId }
+//                         : (() => { const [pid, vname] = key.split("_"); return { productId: pid, name: vname }; })();
+
+//                     const variantResult = await Variant.findOneAndUpdate(
+//                         variantQuery,
+//                         { $inc: { totalStock: oldQty, availableStock: oldQty } },
+//                         { new: true, session }
+//                     );
+
+//                     if (!variantResult) {
+//                         console.warn(`[updateOrderItems] Could not find variant to restore stock for key: ${key}`);
+//                         continue;
+//                     }
+
+//                     let allocatedSets = clonePurchaseSets(oldInfo.purchaseSets);
+//                     // Fallback populating allocatedSets if it was empty from bad/old data
+//                     if (allocatedSets.length === 0 && oldQty > 0) {
+//                         const fallbackSetId = oldInfo.purchaseSetId || (variantResult.purchaseSets[0] ? String(variantResult.purchaseSets[0]._id) : "");
+//                         if (fallbackSetId) {
+//                             allocatedSets = [{
+//                                 purchaseSetId: fallbackSetId,
+//                                 quantity: oldQty,
+//                                 price: Number(oldInfo.purchasePrice || 0)
+//                             }];
+//                         }
+//                     }
+
+//                     let remainingToRestore = oldQty;
+//                     let restoredCost = 0;
+//                     let restoredQty = 0;
+
+//                     for (const alloc of allocatedSets) {
+//                         const take = Math.min(remainingToRestore, alloc.quantity);
+//                         if (take <= 0) continue;
+
+//                         const set = variantResult.purchaseSets.find(s => String(s._id) === String(alloc.purchaseSetId));
+//                         if (set) {
+//                             set.availableStock += take;
+//                             set.remainingStock += take;
+//                         }
+//                         remainingToRestore -= take;
+//                         restoredCost += take * alloc.price;
+//                         restoredQty += take;
+
+//                         if (remainingToRestore === 0) break;
+//                     }
+
+//                     if (remainingToRestore > 0 && variantResult.purchaseSets.length > 0) {
+//                         const firstSet = variantResult.purchaseSets[0];
+//                         firstSet.availableStock += remainingToRestore;
+//                         firstSet.remainingStock += remainingToRestore;
+//                         restoredCost += remainingToRestore * firstSet.price;
+//                         restoredQty += remainingToRestore;
+//                     }
+
+//                     const restoredPurchasePrice = restoredQty > 0 ? parseFloat((restoredCost / restoredQty).toFixed(3)) : 0;
+
+//                     await variantResult.save({ session });
+//                     await syncProductStock(variantResult.productId, session);
+
+//                     const parentProduct = await Product.findById(variantResult.productId).session(session);
+//                     const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
+
+//                     await Stock.create([{
+//                         orderId: order.orderId,
+//                         orderRef: order._id,
+//                         type: "remove-item", // sign: +
+//                         category: "physical",
+//                         variantId: variantResult._id,
+//                         variantName: variantResult.name,
+//                         purchasePrice: restoredPurchasePrice,
+//                         sellingPrice: oldInfo.price - (oldInfo.discount / oldQty),
+//                         quantity: oldQty,
+//                         previousStock: variantResult.availableStock - oldQty,
+//                         updatedStock: variantResult.availableStock,
+//                         previousPhysicalStock: variantResult.totalStock - oldQty,
+//                         updatedPhysicalStock: variantResult.totalStock,
+//                         totalProductStock: currentTotalProductStock,
+//                         productId: variantResult.productId
+//                     }], { session });
+
+//                     itemChanges.push(`Removed item ${variantResult.name || key} (Qty: ${oldQty})`);
+//                 }
+
+//                 order.items = newItems;
+//             }
+
+//             // Recalculate totals
+//             let subtotal = 0;
+//             for (const item of order.items) {
+//                 const qty = item.quantity;
+//                 const price = item.price;
+//                 subtotal += qty * (price - (item.discount || 0));
+//             }
+//             order.subtotal = subtotal;
+
+//             let flatDiscount = Number(discount !== undefined ? discount : order.discount);
+//             let percentDiscount = Number(discountPercent !== undefined ? discountPercent : order.discountPercent);
+//             // Use the saved discountType to decide which value is the anchor
+//             const globalDiscountType = req.body.discountType || order.discountType || 'flat';
+//             if (subtotal > 0) {
+//                 if (globalDiscountType === 'percentage') {
+//                     // Percentage is the anchor — recompute flat from new subtotal
+//                     flatDiscount = parseFloat(((subtotal * percentDiscount) / 100).toFixed(2));
+//                 } else {
+//                     // Flat is the anchor — keep flat constant, recompute percent for display
+//                     percentDiscount = parseFloat(((flatDiscount / subtotal) * 100).toFixed(2));
+//                 }
+//             }
+//             order.discount = flatDiscount;
+//             order.discountPercent = percentDiscount;
+
+//             const delCharge = deliveryCharge !== undefined ? Number(deliveryCharge) : order.deliveryCharge;
+//             order.deliveryCharge = delCharge;
+
+//             order.orderAmount = Math.max(0, subtotal - flatDiscount + delCharge);
+//             order.remainingAmount = Math.max(0, order.orderAmount - order.amountPaid);
+
+//             if (order.remainingAmount <= 0) {
+//                 order.paymentStatus = "Paid";
+//             } else {
+//                 order.paymentStatus = "Pending";
+//             }
+
+//             await order.save({ session });
+
+//             const remarks = itemChanges.length > 0 ? `Updated items: ${itemChanges.join("; ")}` : "Order items, pricing, or quantities updated.";
+
+//             await logActivity({
+//                 orderId: order._id,
+//                 action: "Items Edited",
+//                 remarks,
+//                 req,
+//                 session
+//             });
+//         });
+
+//         const updatedOrder = await Order.findById(id).populate("items.productId");
+//         return res.status(200).json(new ApiResponse(200, { order: updatedOrder }, "Order items updated successfully."));
+//     } catch (error) {
+//         console.error("Error in updateOrderItems:", error);
+//         throw error;
+//     } finally {
+//         session.endSession();
+//     }
+// });
+
+
+// const systemCreatedCancel = asyncHandler(async (req, res) => {
+//     const { orderId, reason } = req.body;
+
+//     const order = await Order.findById(orderId);
+//     if (!order) {
+//         throw new ApiError(404, "Order not found");
+//     }
+
+//     if (order.status === "Cancelled") {
+//         throw new ApiError(400, "Order already cancelled");
+//     }
+
+//     // Atomic session: order save + stock restore
+//     const session = await mongoose.startSession();
+//     try {
+//         await session.withTransaction(async () => {
+//             order.status = "Cancelled";
+//             order.reason = reason;
+//             order.requests = updateRequestStatus(order.requests, reason);
+//             await order.save({ session });
+
+//             await adjustStockV3(order, { type: STOCK_TYPES.CANCEL, session });
+
+//             await logActivity({
+//                 orderId: order._id,
+//                 action: "Cancelled",
+//                 remarks: reason || "Order cancelled by admin.",
+//                 req,
+//                 session
+//             });
+//         });
+//     } finally {
+//         session.endSession();
+//     }
+
+//     return res.json(
+//         new ApiResponse(200, { order }, "Order cancelled and stock restored successfully.")
+//     );
+// });
+
+// const systemCreatedReject = asyncHandler(async (req, res) => {
+//     const { orderId, reason } = req.body;
+
+//     const order = await Order.findById(orderId);
+//     if (!order) {
+//         throw new ApiError(404, "Order not found");
+//     }
+
+//     if (order.status === "Rejected") {
+//         throw new ApiError(400, "Order already rejected");
+//     }
+
+//     // Atomic session: order save + stock restore
+//     const session = await mongoose.startSession();
+//     try {
+//         await session.withTransaction(async () => {
+//             order.status = "Rejected";
+//             order.reason = reason;
+//             order.requests = updateRequestStatus(order.requests, reason);
+//             await order.save({ session });
+
+//             await adjustStockV3(order, { type: STOCK_TYPES.REJECT, session });
+
+//             await logActivity({
+//                 orderId: order._id,
+//                 action: "Rejected",
+//                 remarks: reason || "Order rejected by admin.",
+//                 req,
+//                 session
+//             });
+//         });
+//     } finally {
+//         session.endSession();
+//     }
+
+//     return res.json(
+//         new ApiResponse(200, { order }, "Order rejected and stock restored successfully.")
+//     );
+// });
