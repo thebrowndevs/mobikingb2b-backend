@@ -4568,7 +4568,7 @@ async function performAdjustStock(
                         "physical",
                     isScratchy: true,
                     purchasePrice: Number(item.purchasePrice || 0),
-                    sellingPrice: Math.max(0, Number(item.price || 0) - (qty > 0 ? (Number(item.discount || 0) / qty) : 0))
+                    sellingPrice: Math.max(0, Number(item.price || 0) - (qty > 0 ? (Number(item.discount || 0)) : 0))
                 });
 
                 continue;
