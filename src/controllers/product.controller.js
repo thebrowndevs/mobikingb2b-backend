@@ -4,6 +4,7 @@ import { Variant } from "../models/variant.model.js";
 import { Stock } from "../models/stock.model.js";
 import { Inventory } from "../models/inventory.model.js";
 import { SubCategory } from "../models/sub_category.model.js";
+import { Category } from "../models/category.model.js";
 import { Order } from "../models/order.model.js";
 import { Quotation } from "../models/quotation.model.js";
 import { ApiError } from "../utils/ApiError.js";
@@ -12,6 +13,8 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import { Brand } from "../models/brand.model.js";
 import { createStockEntry } from "../services/stock.service.js";
 import { STOCK_TYPES } from "../constants.js";
+import ExcelJS from "exceljs";
+import fs from "fs";
 
 const parseOptionalNumber = (val) => {
     if (val === "" || val === null || val === undefined) return null;
@@ -1531,6 +1534,297 @@ const getProductQuotations = asyncHandler(async (req, res) => {
     );
 });
 
+const bulkUploadValidate = asyncHandler(async (req, res) => {
+    if (!req.file) {
+        throw new ApiError(400, "Please upload a file");
+    }
+
+    const filePath = req.file.path;
+    const extension = filePath.split(".").pop().toLowerCase();
+
+    const workbook = new ExcelJS.Workbook();
+    if (extension === "csv") {
+        await workbook.csv.readFile(filePath);
+    } else {
+        await workbook.xlsx.readFile(filePath);
+    }
+
+    const worksheet = workbook.getWorksheet(1);
+    if (!worksheet) {
+        throw new ApiError(400, "Spreadsheet is empty or worksheet not found");
+    }
+
+    const rows = [];
+    const headers = [];
+
+    worksheet.eachRow({ includeEmpty: true }, (row, rowNumber) => {
+        if (rowNumber === 1) {
+            row.values.forEach((val, idx) => {
+                if (idx > 0) headers[idx] = val?.toString().trim();
+            });
+        } else {
+            const rowData = {};
+            row.values.forEach((val, idx) => {
+                if (idx > 0 && headers[idx]) {
+                    rowData[headers[idx]] = val;
+                }
+            });
+            if (Object.keys(rowData).length > 0) {
+                rows.push(rowData);
+            }
+        }
+    });
+
+    try {
+        fs.unlinkSync(filePath);
+    } catch (e) {
+        console.error("Temp file deletion error:", e);
+    }
+
+    const mismatched = [];
+    const duplicates = [];
+    const correct = [];
+
+    const allBrands = await Brand.find({}).select("name");
+    const allSubCats = await SubCategory.find({}).select("name");
+
+    const brandNamesLower = allBrands.map(b => b.name.trim().toLowerCase());
+    const subCatNamesLower = allSubCats.map(s => s.name.trim().toLowerCase());
+
+    for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const rowNum = i + 2;
+
+        const fullName = row.fullName?.toString().trim();
+        const brandName = row.brand?.toString().trim();
+        const subCatName = row.category?.toString().trim();
+
+        if (!fullName) {
+            mismatched.push({
+                rowNum,
+                row,
+                reason: "Product Full Name is missing"
+            });
+            continue;
+        }
+
+        let brandExists = true;
+        if (brandName) {
+            brandExists = brandNamesLower.includes(brandName.toLowerCase());
+        }
+
+        let subCatExists = true;
+        if (subCatName) {
+            subCatExists = subCatNamesLower.includes(subCatName.toLowerCase());
+        } else {
+            subCatExists = false;
+        }
+
+        if (!brandExists || !subCatExists) {
+            mismatched.push({
+                rowNum,
+                row,
+                brandMissing: !brandExists,
+                categoryMissing: !subCatExists,
+                reason: `${!brandExists ? "Brand " : ""}${!brandExists && !subCatExists ? "& " : ""}${!subCatExists ? "SubCategory " : ""}does not exist in database`
+            });
+            continue;
+        }
+
+        const existingProduct = await Product.findOne({ fullName: { $regex: new RegExp(`^${fullName.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&")}$`, "i") } });
+        if (existingProduct) {
+            duplicates.push({
+                rowNum,
+                row,
+                existingProductId: existingProduct._id,
+                reason: `Product with name "${fullName}" already exists`
+            });
+            continue;
+        }
+
+        correct.push({
+            rowNum,
+            row
+        });
+    }
+
+    return res.status(200).json(
+        new ApiResponse(200, {
+            summary: {
+                totalRows: rows.length,
+                mismatchedCount: mismatched.length,
+                duplicatesCount: duplicates.length,
+                correctCount: correct.length
+            },
+            mismatched,
+            duplicates,
+            correct,
+            options: {
+                brands: allBrands.map(b => ({ id: b._id, name: b.name })),
+                subCategories: allSubCats.map(s => ({ id: s._id, name: s.name }))
+            }
+        }, "Spreadsheet validation complete")
+    );
+});
+
+const bulkUploadConfirm = asyncHandler(async (req, res) => {
+    const { rows } = req.body;
+    if (!Array.isArray(rows) || rows.length === 0) {
+        throw new ApiError(400, "Invalid payload or empty rows");
+    }
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        let defaultParentCategory = null;
+
+        for (let i = 0; i < rows.length; i++) {
+            const rowItem = rows[i];
+            const row = rowItem.row || rowItem;
+            const fullName = row.fullName?.toString().trim();
+            if (!fullName) {
+                throw new Error(`Row ${i + 2}: Product Full Name is missing`);
+            }
+
+            let brandId = null;
+            let brandName = row.brand?.toString().trim();
+            if (brandName) {
+                if (mongoose.Types.ObjectId.isValid(brandName)) {
+                    brandId = brandName;
+                } else {
+                    let brand = await Brand.findOne({ name: { $regex: new RegExp(`^\\s*${brandName.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&")}\\s*$`, "i") } }).session(session);
+                    if (!brand) {
+                        const newBrandArr = await Brand.create([{
+                            name: brandName,
+                            slug: brandName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "")
+                        }], { session });
+                        brand = newBrandArr[0];
+                    }
+                    brandId = brand._id;
+                }
+            }
+
+            let subCatId = null;
+            let subCatName = row.category?.toString().trim();
+            if (subCatName) {
+                if (mongoose.Types.ObjectId.isValid(subCatName)) {
+                    subCatId = subCatName;
+                } else {
+                    let subCat = await SubCategory.findOne({ name: { $regex: new RegExp(`^\\s*${subCatName.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, "\\$&")}\\s*$`, "i") } }).session(session);
+                    if (!subCat) {
+                        if (!defaultParentCategory) {
+                            defaultParentCategory = await Category.findOne({ name: "B2B Categories" }).session(session);
+                            if (!defaultParentCategory) {
+                                const newCatArr = await Category.create([{
+                                    name: "B2B Categories",
+                                    slug: "b2b-categories"
+                                }], { session });
+                                defaultParentCategory = newCatArr[0];
+                            }
+                        }
+                        const newSubCatArr = await SubCategory.create([{
+                            name: subCatName,
+                            slug: subCatName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, ""),
+                            parentCategory: defaultParentCategory._id
+                        }], { session });
+                        subCat = newSubCatArr[0];
+
+                        defaultParentCategory.subCategories.push(subCat._id);
+                        await defaultParentCategory.save({ session });
+                    }
+                    subCatId = subCat._id;
+                }
+            } else {
+                throw new Error(`Row ${i + 2}: Category (SubCategory) is required`);
+            }
+
+            let slug = row.slug?.toString().trim().toLowerCase() ||
+                fullName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+
+            // Ensure slug uniqueness
+            const slugExists = await Product.findOne({ slug }).session(session);
+            if (slugExists) {
+                slug = `${slug}-${Date.now().toString().slice(-4)}`;
+            }
+
+            const gstVal = parseOptionalNumber(row.gst) ?? 18;
+            const imagesVal = row.images ? row.images.toString().split(",").map(url => url.trim()) : [];
+
+            const productData = {
+                name: fullName.substring(0, 50),
+                fullName,
+                slug,
+                description: row.description?.toString().trim() || "",
+                active: row.active !== undefined ? (row.active === "true" || row.active === true) : true,
+                brand: brandId,
+                category: subCatId,
+                gst: gstVal,
+                images: imagesVal,
+                sellingPrice: {
+                    type: "fixed",
+                    slabs: [{ quantity: 1, price: 0 }]
+                }
+            };
+
+            const createdProducts = await Product.create([productData], { session });
+            const product = createdProducts[0];
+
+            // Sync product into SubCategory products list
+            await SubCategory.findByIdAndUpdate(subCatId, {
+                $addToSet: { products: product._id }
+            }, { session });
+
+            const variantNamesStr = row.variantNames?.toString().trim();
+            if (variantNamesStr) {
+                const names = variantNamesStr.split(",").map(n => n.trim()).filter(Boolean);
+                for (const vName of names) {
+                    const createdVariants = await Variant.create([{
+                        productId: product._id,
+                        name: vName,
+                        images: imagesVal,
+                        totalStock: 0,
+                        availableStock: 0,
+                        active: true
+                    }], { session });
+                    product.variants.push(createdVariants[0]._id);
+                }
+                await product.save({ session });
+            }
+
+            // Correct fields for Inventory Schema
+            const createdInventories = await Inventory.create([{
+                product: product._id,
+                physicalStock: 0,
+                reservedStock: 0,
+                version: 0
+            }], { session });
+            const inv = createdInventories[0];
+
+            product.inventory = inv._id;
+            await product.save({ session });
+        }
+
+        await session.commitTransaction();
+        session.endSession();
+
+        return res.status(200).json(
+            new ApiResponse(200, {
+                summary: {
+                    totalProcessed: rows.length,
+                    success: rows.length,
+                    failed: 0
+                },
+                logs: rows.map(r => ({ status: "success", fullName: r.row?.fullName || r.fullName, action: "created" }))
+            }, "Bulk upload confirmed and processed successfully")
+        );
+    } catch (error) {
+        await session.abortTransaction();
+        session.endSession();
+        throw new ApiError(500, error.message || "Failed to process bulk upload transaction");
+    }
+});
+
 export {
     createProduct,
     updateProductStock,
@@ -1554,5 +1848,7 @@ export {
     deleteProduct, getProductsByCategory,
     getProductsByGroup,
     bulkUpdateProductStock,
-    getProductInventoryDetails
+    getProductInventoryDetails,
+    bulkUploadValidate,
+    bulkUploadConfirm
 }

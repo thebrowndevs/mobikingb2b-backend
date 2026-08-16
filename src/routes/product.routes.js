@@ -17,7 +17,9 @@ import {
     updateVariant,
     deleteVariant,
     updateProductPrice,
-    getProductInventoryDetails
+    getProductInventoryDetails,
+    bulkUploadValidate,
+    bulkUploadConfirm
 } from "../controllers/product.controller.js";
 import { upload } from "../middlewares/multer.middlewares.js";
 import { getPaginatedProducts, getPaginatedProductsForAdmin } from "../controllers/pagination.controller.js";
@@ -27,6 +29,8 @@ const router = Router()
 
 //Product Routes
 router.route("/createProduct").post(verifyJWT, createProduct);
+router.route("/bulk-upload/validate").post(verifyJWT, upload.single("file"), bulkUploadValidate);
+router.route("/bulk-upload/confirm").post(verifyJWT, bulkUploadConfirm);
 // Named PUT routes MUST be before wildcard /:_id
 router.route("/status/:_id").put(verifyJWT, updateProductStatus);
 router.route("/check/:_id").put(verifyJWT, markProductChecked);
