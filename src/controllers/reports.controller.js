@@ -13,6 +13,7 @@ import { SubCategory } from "../models/sub_category.model.js";
 import { Group } from "../models/group.model.js";
 import { Brand } from "../models/brand.model.js";
 import { Payment } from "../models/payment.model.js";
+import { Quotation } from "../models/quotation.model.js";
 
 // Selective fields for reporting to prevent server crashes on large data
 const REPORT_POPULATE_CONFIG = {
@@ -84,6 +85,16 @@ export const getTotalOrders = async (req, res) => {
     return res.status(200).json(new ApiResponse(200, { totalOrders }, "Total orders fetched"));
   } catch (err) {
     console.error("Error fetching orders:", err);
+    return res.status(500).json(new ApiError(500, "Internal server error"));
+  }
+};
+
+export const getTotalQuotations = async (req, res) => {
+  try {
+    const totalQuotations = await Quotation.countDocuments();
+    return res.status(200).json(new ApiResponse(200, { totalQuotations }, "Total quotations fetched"));
+  } catch (err) {
+    console.error("Error fetching quotations:", err);
     return res.status(500).json(new ApiError(500, "Internal server error"));
   }
 };
@@ -201,6 +212,49 @@ export const getDailyOrderCounts = asyncHandler(async (req, res) => {
   );
 });
 
+export const getDailyQuotationCounts = asyncHandler(async (req, res) => {
+  const { startDate, endDate } = req.query;
+
+  if (!startDate || !endDate) {
+    throw new ApiError(400, "Start and end date are required");
+  }
+
+  const from = new Date(startDate);
+  const to = new Date(new Date(endDate).setHours(23, 59, 59, 999));
+
+  if (isNaN(from.getTime()) || isNaN(to.getTime())) {
+    throw new ApiError(400, "Invalid date format");
+  }
+
+  const agg = await Quotation.aggregate([
+    {
+      $match: {
+        createdAt: { $gte: from, $lte: to }
+      }
+    },
+    {
+      $group: {
+        _id: {
+          day: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } }
+        },
+        count: { $sum: 1 }
+      }
+    }
+  ]);
+
+  const countMap = {};
+  agg.forEach(entry => {
+    countMap[entry._id.day] = entry.count;
+  });
+
+  const dates = generateDateRangeArray(startDate, endDate);
+  const dailyCounts = dates.map(date => countMap[date] || 0);
+
+  return res.status(200).json(
+    new ApiResponse(200, { dates, dailyCounts }, "Daily quotation counts")
+  );
+});
+
 export const getDailyOrderSourceCounts = asyncHandler(async (req, res) => {
   const { startDate, endDate } = req.query;
 
@@ -268,6 +322,63 @@ export const getDailyOrderSourceCounts = asyncHandler(async (req, res) => {
 
   return res.status(200).json(
     new ApiResponse(200, { dates, appOrders, websiteOrders, posOrders }, "Order source counts by day")
+  );
+});
+
+export const getDailyQuotationSourceCounts = asyncHandler(async (req, res) => {
+  const { startDate, endDate } = req.query;
+
+  if (!startDate || !endDate) {
+    throw new ApiError(400, "Start and end date are required");
+  }
+
+  const from = new Date(startDate);
+  const to = new Date(new Date(endDate).setHours(23, 59, 59, 999));
+
+  const agg = await Quotation.aggregate([
+    {
+      $match: {
+        createdAt: { $gte: from, $lte: to }
+      }
+    },
+    {
+      $group: {
+        _id: {
+          day: { $dateToString: { format: "%Y-%m-%d", date: "$createdAt" } },
+          type: "$type",
+          isAppOrder: "$isAppOrder"
+        },
+        count: { $sum: 1 }
+      }
+    }
+  ]);
+
+  const dataMap = {};
+  for (const { _id, count } of agg) {
+    const day = _id.day;
+    if (!dataMap[day]) {
+      dataMap[day] = { app: 0, website: 0, pos: 0 };
+    }
+
+    if (_id.type === "Regular" && _id.isAppOrder === true) dataMap[day].app += count;
+    if (_id.type === "Regular" && _id.isAppOrder === false) dataMap[day].website += count;
+    if (_id.type === "Pos") dataMap[day].pos += count;
+  }
+
+  const dates = generateDateRangeArray(startDate, endDate);
+  const appQuotations = [];
+  const websiteQuotations = [];
+  const posQuotations = [];
+
+  for (const date of dates) {
+    const row = dataMap[date] || { app: 0, website: 0, pos: 0 };
+    appQuotations.push(row.app);
+    websiteQuotations.push(row.website);
+    posQuotations.push(row.pos);
+  }
+
+  return res.status(200).json(
+    new ApiResponse(200, { dates, appQuotations, websiteQuotations, posQuotations }, "Quotation source counts by day")
   );
 });
 

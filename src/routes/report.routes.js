@@ -11,6 +11,9 @@ import {
     fetchModelColumns,
     getProductSalesReport,
     getStockFlowReport,
+    getTotalQuotations,
+    getDailyQuotationCounts,
+    getDailyQuotationSourceCounts,
 } from "../controllers/reports.controller.js"; // adjust the path as needed
 import { verifyJWT } from "../middlewares/auth.middlewares.js";
 
@@ -23,10 +26,13 @@ router.route("/customers/count").get(verifyJWT, getTotalCustomers);
 router.route("/customers/").get(verifyJWT, getDailyCustomerSignupCounts);
 
 router.route("/orders/count").get(verifyJWT, getTotalOrders);
+router.route("/quotations/count").get(verifyJWT, getTotalQuotations);
 
 // Chart API
 router.route("/orders").get(verifyJWT, getDailyOrderCounts);
+router.route("/quotations").get(verifyJWT, getDailyQuotationCounts);
 router.route("/orders/filtered").get(verifyJWT, getDailyOrderSourceCounts);
+router.route("/quotations/filtered").get(verifyJWT, getDailyQuotationSourceCounts);
 router.route("/sales").get(verifyJWT, getDailySalesInRange);
 
 router.route("/sales/total").get(verifyJWT, getTotalSales);
