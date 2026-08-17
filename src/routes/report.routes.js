@@ -10,6 +10,7 @@ import {
     getDailySalesInRange,
     fetchModelColumns,
     getProductSalesReport,
+    getStockFlowReport,
 } from "../controllers/reports.controller.js"; // adjust the path as needed
 import { verifyJWT } from "../middlewares/auth.middlewares.js";
 
@@ -34,5 +35,6 @@ router.route("/sales/custom").get(verifyJWT, getSalesInRange);
 //Reports API
 router.route("/modules").post(verifyJWT, fetchModelColumns);
 router.route("/product-sales").post(verifyJWT, getProductSalesReport);
+router.route("/stock-flow/:productId").post(verifyJWT, getStockFlowReport);
 
 export default router;

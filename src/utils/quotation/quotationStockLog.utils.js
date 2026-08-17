@@ -306,13 +306,8 @@ export const syncStockLogSellingPrices = async ({
             },
             {
                 $set: {
-                    sellingPrice: finalUnitSellingPrice
-                    //     finalUnitSellingPrice,
-                    // purchasePrice:
-                    //     Number(
-                    //         item.purchasePrice ||
-                    //         0
-                    //     )
+                    sellingPrice: finalUnitSellingPrice,
+                    purchasePrice: Number(item.purchasePrice || 0)
                 }
             },
             {

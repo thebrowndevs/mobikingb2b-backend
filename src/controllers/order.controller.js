@@ -205,7 +205,8 @@ const createPosOrder = asyncHandler(async (req, res) => {
             paymentMode,
             status: "New",
             type: "Pos",
-            items
+            items,
+            gst: gst || ""
         });
 
         let updatedUser = null;

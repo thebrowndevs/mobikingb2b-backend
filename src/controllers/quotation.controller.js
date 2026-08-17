@@ -71,7 +71,8 @@ export const createQuotation = asyncHandler(async (req, res) => {
             discount = 0,
             discountPercent = 0,
             deliveryCharge = 0,
-            orderAmount
+            orderAmount,
+            gst
         } = req.body;
 
         const cartId = req?.user?.cart;
@@ -118,7 +119,8 @@ export const createQuotation = asyncHandler(async (req, res) => {
             status: "New",
             isAppOrder: req.body.isAppOrder || false,
             type: req.body.type || "Regular",
-            items: cart.items
+            items: cart.items,
+            gst: gst || ""
         });
 
         // We run inside a transaction to ensure all stock is reserved atomically
@@ -639,10 +641,13 @@ export const bookQuotation = asyncHandler(async (req, res) => {
             quotation.orderId = newOrder.orderId;
             await quotation.save({ session });
 
-            // Add order to user's orders list
+            // Add order to user's orders list and increment customer orderCount
             await User.findByIdAndUpdate(
                 quotation.userId,
-                { $push: { orders: newOrder._id } },
+                {
+                    $push: { orders: newOrder._id },
+                    $inc: { orderCount: 1 }
+                },
                 { session }
             );
 
@@ -653,8 +658,8 @@ export const bookQuotation = asyncHandler(async (req, res) => {
                 const qty = Math.floor(Number(item.quantity));
                 if (qty <= 0) continue;
 
-                // 1. Atomically decrement variant stock levels first
-                const updateInc = { totalStock: -qty };
+                // 1. Atomically decrement variant stock levels first and increment variant orderCount
+                const updateInc = { totalStock: -qty, orderCount: 1 };
                 if (quotation.reservedStockRestored) {
                     updateInc.availableStock = -qty;
                 }
@@ -663,6 +668,16 @@ export const bookQuotation = asyncHandler(async (req, res) => {
                     { _id: item.variantId },
                     { $inc: updateInc },
                     { new: true, session }
+                );
+
+                // Append order ID to product and increment product level orderCount
+                await Product.findByIdAndUpdate(
+                    item.productId,
+                    {
+                        $push: { orders: newOrder._id },
+                        $inc: { orderCount: 1 }
+                    },
+                    { session }
                 );
 
                 if (variant) {

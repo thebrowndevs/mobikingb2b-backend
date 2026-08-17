@@ -12,6 +12,7 @@ import { Category } from "../models/category.model.js";
 import { SubCategory } from "../models/sub_category.model.js";
 import { Group } from "../models/group.model.js";
 import { Brand } from "../models/brand.model.js";
+import { Payment } from "../models/payment.model.js";
 
 // Selective fields for reporting to prevent server crashes on large data
 const REPORT_POPULATE_CONFIG = {
@@ -24,6 +25,8 @@ const REPORT_POPULATE_CONFIG = {
   Order: "orderId",
   Coupon: "couponCode discount",
   Address: "city state address pincode",
+  Variant: "name totalStock availableStock",
+  Query: "isResolved",
 };
 
 // function getDateRangeArray(days) {
@@ -394,22 +397,25 @@ export const fetchModelColumns = asyncHandler(async (req, res) => {
   // Detect reference fields to populate
   const schemaPaths = Model.schema.paths;
   const populateFields = [];
-
   for (const col of columns) {
-    const path = schemaPaths[col];
+    let lookupCol = col;
+    if (model === "User" && ["businessActive", "businessVerified", "businessApproved", "gstVerified", "businessName", "businessEmail", "businessPhone", "gstNumber", "businessAddress", "businessStatus", "rejectionReason", "approvedAt", "rejectedAt", "approvedBy", "rejectedBy"].includes(col)) {
+      lookupCol = "business";
+    }
+    const path = schemaPaths[lookupCol];
     if (!path) {
       console.warn(`⚠️ Column '${col}' not found in schema of model '${model}'`);
       continue;
     }
 
-    const isRef = path.instance === "ObjectId" && path.options?.ref;
-    const isArrayRef = path.instance === "Array" && path.caster?.instance === "ObjectId" && (path.caster.options?.ref || path.options?.type?.[0]?.ref);
+    const ref = path.options?.ref || path.embeddedSchemaType?.options?.ref || path.caster?.options?.ref || (path.options?.type && Array.isArray(path.options.type) && path.options.type[0]?.ref);
 
-    if (isRef || isArrayRef) {
-      const ref = path.options?.ref || path.caster?.options?.ref || path.options?.type?.[0]?.ref;
-      populateFields.push({ path: col, ref });
+    if (ref) {
+      populateFields.push({ path: lookupCol, ref });
     }
   }
+
+  console.log("Model:", model, "Columns:", columns, "Detected Populate Fields:", populateFields);
 
   // Build projection
 
@@ -685,11 +691,33 @@ export const fetchModelColumns = asyncHandler(async (req, res) => {
     filter[dateField] = { $gte: start, $lte: end };
   }
 
-  const projection = columns.join(" ");
+  let activeColumns = [...columns];
+  let loadPayments = false;
+  if (model === "Order" && columns.includes("payments")) {
+    loadPayments = true;
+    activeColumns = activeColumns.filter(c => c !== "payments");
+  }
+
+  // Map virtual fields to actual schema fields for query projection
+  activeColumns = activeColumns.map(col => {
+    if (model === "User" && ["businessActive", "businessVerified", "businessApproved", "gstVerified", "businessName", "businessEmail", "businessPhone", "gstNumber", "businessAddress", "businessStatus", "rejectionReason", "approvedAt", "rejectedAt", "approvedBy", "rejectedBy"].includes(col)) {
+      return "business";
+    }
+    return col;
+  });
+
+  const projection = activeColumns.join(" ");
   // Build query
   let query = Model.find(filter, projection).lean();
 
-  if (model === "Order" && columns.includes("items")) {
+  if (model === "User" && (columns.includes("approvedBy") || columns.includes("rejectedBy"))) {
+    const pathsToPopulate = [];
+    if (columns.includes("approvedBy")) pathsToPopulate.push({ path: "business.approvedBy", select: "name email phoneNo fullName" });
+    if (columns.includes("rejectedBy")) pathsToPopulate.push({ path: "business.rejectedBy", select: "name email phoneNo fullName" });
+    query = query.populate(pathsToPopulate);
+  }
+
+  if (model === "Order" && activeColumns.includes("items")) {
     query = query.populate({
       path: "items.productId",
       select: "fullName name sku price"
@@ -724,7 +752,16 @@ export const fetchModelColumns = asyncHandler(async (req, res) => {
     query = query.populate({ path: field.path, select: selectFields });
   }
 
-  const data = await query.exec();
+  let data = await query.exec();
+
+  if (loadPayments && data.length > 0) {
+    const orderIds = data.map(o => o._id);
+    const payments = await Payment.find({ orderRef: { $in: orderIds } }).lean();
+    data = data.map(order => {
+      order.payments = payments.filter(p => String(p.orderRef) === String(order._id));
+      return order;
+    });
+  }
 
   return res
     .status(200)
@@ -782,6 +819,7 @@ export const fetchModelColumns = asyncHandler(async (req, res) => {
 //     .json(new ApiResponse(200, data, `${model} columns fetched successfully`));
 // });
 
+/*
 export const getProductSalesReport = asyncHandler(async (req, res) => {
   const { startDate, endDate } = req.body;
 
@@ -908,4 +946,228 @@ export const getProductSalesReport = asyncHandler(async (req, res) => {
   return res
     .status(200)
     .json(new ApiResponse(200, enrichedData, "Product sets report fetched successfully"));
+});
+*/
+
+export const getProductSalesReport = asyncHandler(async (req, res) => {
+  const { startDate, endDate } = req.body;
+
+  if (!startDate || !endDate) {
+    throw new ApiError(400, "Start date and end date are required");
+  }
+
+  // 0. Parse dates in IST (UTC+5:30)
+  const start = new Date(`${startDate}T00:00:00+05:30`);
+  const end = new Date(`${endDate}T23:59:59.999+05:30`);
+
+  // 1. Fetch Aggregated Purchase Sets (Stock-In)
+  const purchaseSets = await Stock.aggregate([
+    {
+      $match: {
+        type: "stock-in",
+        createdAt: { $gte: start, $lte: end },
+        productId: { $ne: null },
+        quantity: { $gt: 0 }
+      }
+    },
+    {
+      $group: {
+        _id: { productId: "$productId", price: { $ifNull: ["$purchasePrice", 0] } },
+        totalQty: { $sum: "$quantity" },
+        totalVal: { $sum: { $multiply: ["$quantity", { $ifNull: ["$purchasePrice", 0] }] } }
+      }
+    },
+    {
+      $project: {
+        productId: "$_id.productId",
+        type: { $literal: "Purchase Set" },
+        unitPrice: { $literal: 0 },
+        purchasePrice: "$_id.price",
+        quantity: "$totalQty",
+        totalValue: { $literal: 0 },
+        totalCost: "$totalVal"
+      }
+    }
+  ]);
+
+  // 2. Fetch Aggregated Sales Sets directly from Stock Logs (handling additions, removals, cancels, and returns)
+  const salesSets = await Stock.aggregate([
+    {
+      $match: {
+        createdAt: { $gte: start, $lte: end },
+        type: { $in: ["purchase", "add-item", "remove-item", "return", "cancel", "reject", "cancelled", "rejected"] },
+        productId: { $ne: null }
+      }
+    },
+    {
+      $project: {
+        productId: 1,
+        sellingPrice: { $ifNull: ["$sellingPrice", 0] },
+        purchasePrice: { $ifNull: ["$purchasePrice", 0] },
+        quantity: 1,
+        netQty: {
+          $cond: {
+            if: { $in: ["$type", ["purchase", "add-item"]] },
+            then: "$quantity",
+            else: { $multiply: ["$quantity", -1] }
+          }
+        },
+        netVal: {
+          $multiply: [
+            { $ifNull: ["$sellingPrice", 0] },
+            {
+              $cond: {
+                if: { $in: ["$type", ["purchase", "add-item"]] },
+                then: "$quantity",
+                else: { $multiply: ["$quantity", -1] }
+              }
+            }
+          ]
+        },
+        netCost: {
+          $multiply: [
+            { $ifNull: ["$purchasePrice", 0] },
+            {
+              $cond: {
+                if: { $in: ["$type", ["purchase", "add-item"]] },
+                then: "$quantity",
+                else: { $multiply: ["$quantity", -1] }
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      $group: {
+        _id: {
+          productId: "$productId",
+          price: "$sellingPrice",
+          purchasePrice: "$purchasePrice"
+        },
+        totalQty: { $sum: "$netQty" },
+        totalVal: { $sum: "$netVal" },
+        totalCostVal: { $sum: "$netCost" }
+      }
+    },
+    {
+      $project: {
+        productId: "$_id.productId",
+        type: { $literal: "Sale Set" },
+        unitPrice: "$_id.price",
+        purchasePrice: "$_id.purchasePrice",
+        quantity: "$totalQty",
+        totalValue: "$totalVal",
+        totalCost: "$totalCostVal"
+      }
+    }
+  ]);
+
+  // 3. Union and Enrich with Product Details
+  const combinedSets = [...purchaseSets, ...salesSets];
+  const productIds = Array.from(new Set(combinedSets.map(set => String(set.productId))));
+
+  // Fetch all relevant products in ONE query
+  const products = await Product.find({ _id: { $in: productIds } })
+    .populate("brand", "name")
+    .populate("groups", "name")
+    .lean();
+
+  // 4. Fetch Last Purchase Price for each product (Irrespective of Date)
+  const lastPurchasePrices = await Stock.aggregate([
+    {
+      $match: {
+        type: "stock-in",
+        productId: { $in: productIds.map(id => new mongoose.Types.ObjectId(id)) }
+      }
+    },
+    { $sort: { createdAt: -1 } },
+    {
+      $group: {
+        _id: "$productId",
+        lastPrice: { $first: { $ifNull: ["$purchasePrice", 0] } }
+      }
+    }
+  ]);
+
+  const productMap = new Map(products.map(p => [String(p._id), p]));
+  const lastPriceMap = new Map(lastPurchasePrices.map(lp => [String(lp._id), lp.lastPrice]));
+
+  const enrichedData = combinedSets.map(set => {
+    const product = productMap.get(String(set.productId));
+    const isSaleSet = set.type === "Sale Set";
+    const lastPurchasePrice = isSaleSet ? (lastPriceMap.get(String(set.productId)) || 0) : "";
+    const netProfit = isSaleSet ? (set.totalValue - set.totalCost) : "";
+
+    return {
+      productName: product?.fullName || product?.name || "Unknown Product",
+      sku: product?.sku || "N/A",
+      group: product?.brand?.name || product?.groups?.[0]?.name || "N/A",
+      setType: set.type,
+      unitPrice: set.unitPrice,
+      purchasePrice: set.purchasePrice,
+      quantity: set.quantity,
+      totalValue: set.totalValue,
+      totalCost: set.totalCost,
+      netProfit,
+      lastPurchasePrice
+    };
+  });
+
+  // Sort by product name for grouping sets together in Excel
+  enrichedData.sort((a, b) => a.productName.localeCompare(b.productName));
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, enrichedData, "Product sets report fetched successfully"));
+});
+
+export const getStockFlowReport = asyncHandler(async (req, res) => {
+  const { productId } = req.params;
+  const { startDate, endDate } = req.body;
+
+  if (!productId) {
+    throw new ApiError(400, "Product ID is required");
+  }
+
+  let filter = { productId: new mongoose.Types.ObjectId(productId) };
+
+  if (startDate && endDate) {
+    const start = new Date(`${startDate}T00:00:00+05:30`);
+    const end = new Date(`${endDate}T23:59:59.999+05:30`);
+    filter.createdAt = { $gte: start, $lte: end };
+  }
+
+  const stockLogs = await Stock.find(filter)
+    .populate("productId", "name fullName sku")
+    .sort({ createdAt: -1 })
+    .lean();
+
+  const formattedLogs = stockLogs.map(log => ({
+    logId: log._id ? String(log._id) : "N/A",
+    date: log.createdAt ? new Date(log.createdAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" }) : "N/A",
+    productId: log.productId?._id ? String(log.productId._id) : (log.productId ? String(log.productId) : "N/A"),
+    productName: log.productId?.fullName || log.productId?.name || "N/A",
+    sku: log.productId?.sku || "N/A",
+    variantId: log.variantId ? String(log.variantId) : "N/A",
+    variantName: log.variantName || "N/A",
+    type: log.type,
+    category: log.category || "N/A",
+    quantity: log.quantity,
+    previousStock: log.previousStock ?? "N/A",
+    updatedStock: log.updatedStock ?? "N/A",
+    previousPhysicalStock: log.previousPhysicalStock ?? "N/A",
+    updatedPhysicalStock: log.updatedPhysicalStock ?? "N/A",
+    totalProductStock: log.totalProductStock ?? "N/A",
+    purchasePrice: log.purchasePrice ?? "N/A",
+    sellingPrice: log.sellingPrice ?? "N/A",
+    orderId: log.orderId || "N/A",
+    quotationId: log.quotationId || "N/A",
+    vendor: log.vendor || "N/A",
+    isScratchy: log.isScratchy ? "True" : "False"
+  }));
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, formattedLogs, "Stock flow report fetched successfully"));
 });
