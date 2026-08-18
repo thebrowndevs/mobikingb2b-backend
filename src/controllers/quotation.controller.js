@@ -60,7 +60,6 @@ export const createQuotation = asyncHandler(async (req, res) => {
     const session = await mongoose.startSession();
     try {
         let {
-            userId,
             name,
             email,
             phoneNo,
@@ -75,7 +74,9 @@ export const createQuotation = asyncHandler(async (req, res) => {
             gst
         } = req.body;
 
+        const userId = req?.user?._id;
         const cartId = req?.user?.cart;
+
         if (!userId || !addressId || !cartId || !name || !phoneNo) {
             throw new ApiError(400, "Required checkout details are missing.");
         }
