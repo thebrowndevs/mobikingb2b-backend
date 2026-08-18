@@ -718,22 +718,23 @@ const getMyProfile = asyncHandler(async (req, res) => {
 
     try {
 
-        const customer = await User.findById(user._id).populate({
-            path: "cart",
-            populate: {
-                path: "items.productId",
-                model: "Product",
-                populate: {
-                    path: "category",  // This is the key part
-                    model: "SubCategory",
-                    select: "-products"
-                },
-                select: "-orders -stocks -groups"
-            }
-        })
-            .populate("address")
+        const customer = await User.findById(user._id)
+            // .populate({
+            //     path: "cart",
+            //     populate: {
+            //         path: "items.productId",
+            //         model: "Product",
+            //         populate: {
+            //             path: "category",  // This is the key part
+            //             model: "SubCategory",
+            //             select: "-products"
+            //         },
+            //         select: "-orders -stocks -groups"
+            //     }
+            // })
+            // .populate("address")
             .populate("wishlist")
-            .select("-orders -password -refreshToken -addresses -wishlists -phoneNo -email")
+            .select("-orders -password -refreshToken -addresses -wishlists")
             .exec();
 
         if (!customer) {
