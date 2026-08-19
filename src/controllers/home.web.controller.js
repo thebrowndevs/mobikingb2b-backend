@@ -104,7 +104,7 @@ const getWebsiteGroups = asyncHandler(async (req, res) => {
                 const [products, totalProducts] = await Promise.all([
                     Product.find({ _id: { $in: productIds }, active: true })
                         .select("-orders -stock -groups -category")
-                        .limit(10)
+                        .limit(12)
                         .lean(),
                     Product.countDocuments({ _id: { $in: productIds }, active: true })
                 ]);
