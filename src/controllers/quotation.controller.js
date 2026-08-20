@@ -616,15 +616,37 @@ export const bookQuotation = asyncHandler(async (req, res) => {
 
             // Create Payment stages if provided
             if (req.body.stages && Array.isArray(req.body.stages)) {
+                const isCouponApplied = !!(newOrder.couponCode || newOrder.coupon);
+                const couponApplied = isCouponApplied ? (newOrder.discount || 0) : 0;
+                const discountApplied = isCouponApplied ? 0 : (newOrder.discount || 0);
+
                 const paymentsToCreate = req.body.stages.map(stg => ({
-                    orderId: newOrder._id,
+                    orderId: newOrder.orderId,
+                    orderRef: newOrder._id,
+                    userId: quotation.userId,
                     amount: Number(stg.amount),
+                    subtotal: Number(newOrder.subtotal || 0),
+                    discount: Number(discountApplied),
+                    coupon: Number(couponApplied),
+                    couponId: newOrder.coupon || undefined,
                     method: stg.method,
                     status: stg.status || "Pending",
                     notes: stg.notes || "",
                     paidAt: stg.status === "Paid" ? new Date() : undefined
                 }));
-                await Payment.insertMany(paymentsToCreate, { session });
+                const insertedPayments = await Payment.insertMany(paymentsToCreate, { session });
+
+                // Call notification for any pending payments
+                try {
+                    const { sendPendingPaymentNotification } = await import("../services/firebase.service.js");
+                    for (const p of insertedPayments) {
+                        if (p.status === "Pending") {
+                            sendPendingPaymentNotification(p.userId, p.orderRef, p._id, p.amount, newOrder.orderId);
+                        }
+                    }
+                } catch (notiErr) {
+                    console.error("FCM Notification failed in bookQuotation:", notiErr);
+                }
 
                 // Calculate amountPaid and remainingAmount
                 const totalPaid = paymentsToCreate

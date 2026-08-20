@@ -28,7 +28,7 @@ export const createNotification = asyncHandler(async (req, res) => {
 export const getAllNotifications = asyncHandler(async (req, res) => {
   const notifications = await Notification.find()
     .sort({ createdAt: -1 })
-    // .limit(100); // Optional limit
+  // .limit(100); // Optional limit
 
   return res
     .status(200)
@@ -48,4 +48,21 @@ export const deleteNotification = asyncHandler(async (req, res) => {
   return res
     .status(200)
     .json(new ApiResponse(200, deleted, "Notification deleted successfully"));
+});
+
+/* Subscribe Token to FCM Topic */
+export const subscribeToFCMTopic = asyncHandler(async (req, res) => {
+  const { token, topic = "b2bUsers" } = req.body;
+
+  if (!token) {
+    throw new ApiError(400, "Device token is required.");
+  }
+
+  // Import dynamically/inline or at top
+  const { subscribeTokenToTopic } = await import("../services/firebase.service.js");
+  await subscribeTokenToTopic(token, topic);
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, null, `Device subscribed to ${topic} topic successfully`));
 });

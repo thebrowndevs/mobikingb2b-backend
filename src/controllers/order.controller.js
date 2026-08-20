@@ -5663,15 +5663,33 @@ const addOrderPayment = asyncHandler(async (req, res) => {
     try {
         let paymentDoc;
         await session.withTransaction(async () => {
+            const isCouponApplied = !!(order.couponCode || order.coupon);
+            const couponApplied = isCouponApplied ? (order.discount || 0) : 0;
+            const discountApplied = isCouponApplied ? 0 : (order.discount || 0);
+
             paymentDoc = await Payment.create([{
                 orderId: order.orderId,
                 orderRef: order._id,
+                userId: order.userId,
                 amount: Number(amount),
+                subtotal: Number(order.subtotal || 0),
+                discount: Number(discountApplied),
+                coupon: Number(couponApplied),
+                couponId: order.coupon || undefined,
                 method,
                 status: finalStatus,
                 notes: notes || "",
                 paidAt: finalStatus === "Paid" ? (paidAt ? new Date(paidAt) : new Date()) : undefined
             }], { session });
+
+            if (finalStatus === "Pending") {
+                try {
+                    const { sendPendingPaymentNotification } = await import("../services/firebase.service.js");
+                    sendPendingPaymentNotification(order.userId, order._id, paymentDoc[0]._id, paymentDoc[0].amount, order.orderId);
+                } catch (notiErr) {
+                    console.error("FCM Notification failed in addOrderPayment:", notiErr);
+                }
+            }
 
             // Fetch all paid payments for this order to recalculate
             const allPayments = await Payment.find({ orderRef: order._id, status: "Paid" }).session(session);
@@ -5746,6 +5764,12 @@ const editOrderPayment = asyncHandler(async (req, res) => {
             payment.status = finalStatus;
             payment.notes = notes !== undefined ? notes : payment.notes;
 
+            const isCouponApplied = !!(order.couponCode || order.coupon);
+            payment.subtotal = Number(order.subtotal || 0);
+            payment.discount = isCouponApplied ? 0 : Number(order.discount || 0);
+            payment.coupon = isCouponApplied ? Number(order.discount || 0) : 0;
+            payment.couponId = order.coupon || undefined;
+
             if (finalStatus === "Paid") {
                 payment.paidAt = paidAt ? new Date(paidAt) : (payment.paidAt || new Date());
             } else if (finalStatus === "Pending") {
@@ -5753,6 +5777,15 @@ const editOrderPayment = asyncHandler(async (req, res) => {
             }
 
             await payment.save({ session });
+
+            if (finalStatus === "Pending") {
+                try {
+                    const { sendPendingPaymentNotification } = await import("../services/firebase.service.js");
+                    sendPendingPaymentNotification(order.userId, order._id, payment._id, payment.amount, order.orderId);
+                } catch (notiErr) {
+                    console.error("FCM Notification failed in editOrderPayment:", notiErr);
+                }
+            }
 
             // Recalculate order payment totals
             const allPayments = await Payment.find({ orderRef: order._id, status: "Paid" }).session(session);

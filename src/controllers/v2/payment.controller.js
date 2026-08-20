@@ -89,6 +89,29 @@ export const paymentWebhookV2 = asyncHandler(async (req, res) => {
         console.log(`Processing ${event}:`, { razorpayOrderId, razorpayPaymentId, paymentLinkId });
 
         if (razorpayOrderId) {
+            const paymentRecord = await Payment.findOne({ razorpayOrderId });
+            if (paymentRecord) {
+                if (paymentRecord.status === "Paid") {
+                    console.log(`Payment record ${paymentRecord._id} is already paid. Skipping webhook confirmation.`);
+                    return res.status(200).json({ status: "Already fulfilled" });
+                }
+
+                const { confirmPaymentRecordPaidLogic } = await import("../../services/payment.service.js");
+                const session = await mongoose.startSession();
+                try {
+                    await session.withTransaction(async () => {
+                        await confirmPaymentRecordPaidLogic(paymentRecord._id, razorpayPaymentId, session);
+                    });
+                    console.log(`Webhook successfully confirmed B2B payment request: ${paymentRecord._id}`);
+                    return res.status(200).json({ status: "Payment request confirmed successfully" });
+                } catch (webhookErr) {
+                    console.error("Webhook B2B payment confirmation failed:", webhookErr);
+                    return res.status(500).json({ error: webhookErr.message });
+                } finally {
+                    session.endSession();
+                }
+            }
+
             const order = await Order.findOne({ razorpayOrderId });
             if (order) {
                 if (order.paymentStatus === 'Paid') {

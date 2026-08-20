@@ -1,12 +1,13 @@
-import admin from "firebase-admin";
+import { initializeApp, getApps, cert } from "firebase-admin/app";
+import { getMessaging } from "firebase-admin/messaging";
 import crypto from "crypto";
 
 let messagingInstance = null;
 
 const initFirebase = () => {
-    if (!admin.apps.length) {
-        admin.initializeApp({
-            credential: admin.credential.cert({
+    if (getApps().length === 0) {
+        initializeApp({
+            credential: cert({
                 project_id: process.env.FIREBASE_PROJECT_ID,
                 client_email: process.env.FIREBASE_CLIENT_EMAIL,
                 private_key: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
@@ -14,7 +15,7 @@ const initFirebase = () => {
         });
     }
     if (!messagingInstance) {
-        messagingInstance = admin.messaging();
+        messagingInstance = getMessaging();
     }
 };
 
@@ -117,6 +118,42 @@ export const sendRouteReloadNotification = (route) => {
             console.log(`[FCM-SILENT] Broadcast successful for route: ${route}. Response Message ID: ${response}`);
         } catch (error) {
             console.error(`[FCM-SILENT] Broadcast failed for route: ${route}`, error);
+        }
+    });
+};
+
+export const subscribeTokenToTopic = async (token, topic = "b2bUsers") => {
+    initFirebase();
+    try {
+        console.log(`[FCM] Subscribing token to topic: ${topic}`);
+        const response = await messagingInstance.subscribeToTopic(token, topic);
+        console.log(`[FCM] Successfully subscribed token to topic: ${topic}`);
+        return response;
+    } catch (error) {
+        console.error(`[FCM] Failed to subscribe token to topic: ${topic}`, error);
+        throw error;
+    }
+};
+
+export const sendPendingPaymentNotification = (userId, orderId, paymentId, amount = "", orderIdString = "") => {
+    setImmediate(async () => {
+        try {
+            console.log(`[FCM-SILENT] Broadcasting pending payments reload for user: ${userId}`);
+            const response = await sendSilentNotification({
+                topic: "b2bUsers",
+                data: {
+                    event: "pending_payments_api_reload",
+                    userId: String(userId),
+                    orderId: String(orderId),
+                    paymentId: String(paymentId),
+                    amount: String(amount),
+                    orderIdString: String(orderIdString),
+                    createdAt: new Date().toISOString()
+                }
+            });
+            console.log(`[FCM-SILENT] Broadcast successful for pending payment. Response: ${response}`);
+        } catch (error) {
+            console.error(`[FCM-SILENT] Broadcast failed for pending payment`, error);
         }
     });
 };

@@ -10,9 +10,30 @@ const paymentSchema = new mongoose.Schema(
             type: mongoose.Schema.Types.ObjectId,
             ref: "Order"
         },
+        userId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User",
+            required: true
+        },
         amount: {
             type: Number,
             required: true
+        },
+        subtotal: {
+            type: Number,
+            default: 0
+        },
+        discount: {
+            type: Number,
+            default: 0
+        },
+        coupon: {
+            type: Number,
+            default: 0
+        },
+        couponId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "Coupon"
         },
         method: {
             type: String,

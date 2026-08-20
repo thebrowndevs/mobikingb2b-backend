@@ -5,6 +5,7 @@ import { Stock } from "../models/stock.model.js";
 import { Product } from "../models/product.model.js";
 import { Cart } from "../models/cart.model.js";
 import { User } from "../models/user.model.js";
+import { Payment } from "../models/payment.model.js";
 
 /**
  * Shared transaction logic to finalize and confirm a paid order.
@@ -109,4 +110,47 @@ export const confirmOrderPaymentLogic = async (orderId, razorpayOrderId, razorpa
     );
 
     return order;
+};
+
+export const confirmPaymentRecordPaidLogic = async (paymentId, razorpayPaymentId, session) => {
+    let payment = await Payment.findById(paymentId).session(session);
+    if (!payment) {
+        throw new Error(`Payment record not found: ${paymentId}`);
+    }
+
+    if (payment.status === "Paid") {
+        console.log(`Payment record ${paymentId} already marked Paid.`);
+        const order = await Order.findById(payment.orderRef).session(session);
+        return { payment, order };
+    }
+
+    payment.status = "Paid";
+    payment.paidAt = new Date();
+    if (razorpayPaymentId) {
+        payment.paymentId = razorpayPaymentId;
+    }
+    await payment.save({ session });
+
+    const order = await Order.findById(payment.orderRef).session(session);
+    if (!order) {
+        throw new Error(`Order not found for payment: ${payment.orderRef}`);
+    }
+
+    const allPayments = await Payment.find({ orderRef: order._id, status: "Paid" }).session(session);
+    const totalPaid = allPayments.reduce((sum, p) => sum + p.amount, 0);
+
+    order.amountPaid = totalPaid;
+    order.remainingAmount = Math.max(0, order.orderAmount - totalPaid);
+
+    if (order.remainingAmount <= 0) {
+        order.paymentStatus = "Paid";
+        order.paymentDate = new Date();
+    } else {
+        order.paymentStatus = "Pending";
+    }
+
+    await order.save({ session });
+
+    console.log(`Payment record ${paymentId} successfully confirmed Paid. Order ${order._id} totals recalculated.`);
+    return { payment, order };
 };
