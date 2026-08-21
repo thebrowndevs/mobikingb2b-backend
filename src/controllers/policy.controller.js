@@ -82,7 +82,9 @@ export const updateCompanyDetails = asyncHandler(async (req, res) => {
     phoneNo, whatsappNo, email, address,
     instaLink, facebookLink, twitterLink, websiteLink,
     androidAppLink, iosAppLink, logoImage,
-    paymentGatewaySettings
+    paymentGatewaySettings,
+    minOrderLimit,
+    minQuotationLimit
   } = req.body;
 
   let details = await CompanyDetails.findOne();
@@ -100,6 +102,13 @@ export const updateCompanyDetails = asyncHandler(async (req, res) => {
     };
   }
 
+  if (minOrderLimit !== undefined && minOrderLimit !== null) {
+    updateFields.minOrderLimit = Number(minOrderLimit);
+  }
+  if (minQuotationLimit !== undefined && minQuotationLimit !== null) {
+    updateFields.minQuotationLimit = Number(minQuotationLimit);
+  }
+
   if (details) {
     details = await CompanyDetails.findByIdAndUpdate(details._id, { $set: updateFields }, { new: true });
   } else {
@@ -108,5 +117,21 @@ export const updateCompanyDetails = asyncHandler(async (req, res) => {
 
   return res.status(200).json(
     new ApiResponse(200, details, "Company details updated successfully")
+  );
+});
+
+/**
+ * GET /api/v1/policy/limits
+ * Public — no auth required.
+ * Returns the minimum cart values enforced for Order Requests and direct Buy Now orders.
+ */
+export const getCompanyLimits = asyncHandler(async (req, res) => {
+  const details = await CompanyDetails.findOne().select("minOrderLimit minQuotationLimit").lean();
+
+  return res.status(200).json(
+    new ApiResponse(200, {
+      minOrderLimit: details?.minOrderLimit ?? 0,
+      minQuotationLimit: details?.minQuotationLimit ?? 0
+    }, "Company limits fetched successfully")
   );
 });

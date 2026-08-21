@@ -30,8 +30,8 @@ export const startDeleteAbandonedOrderScheduler = () => {
 };
 
 export const startRestoreReservedOrdersScheduler = () => {
-    // cron.schedule("* * * * *", async () => {
-    cron.schedule("*/5 * * * *", async () => {
+    cron.schedule("* * * * *", async () => {
+        // cron.schedule("*/5 * * * *", async () => {
         console.log("⏰ Running restore reserved orders job at", new Date().toISOString());
         try {
             await restoreReservedOrders();

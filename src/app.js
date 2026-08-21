@@ -49,7 +49,7 @@ import productRouterV2 from './routes/v2/product.routes.js'
 import orderRouterV2 from './routes/v2/order.routes.js'
 import paymentRouterV2 from './routes/v2/payment.routes.js'
 
-// import { startAbandonedCartScheduler, startDeleteAbandonedOrderScheduler, startRestoreReservedOrdersScheduler } from './scheduler/abandonedCart.scheduler.js';
+import { startAbandonedCartScheduler, startDeleteAbandonedOrderScheduler, startRestoreReservedOrdersScheduler } from './scheduler/abandonedCart.scheduler.js';
 import { paymentLinkWebhook } from "./controllers/order.controller.js"
 import { paymentWebhookV2, phonepeWebhookV2 } from "./controllers/v2/payment.controller.js"
 
@@ -90,7 +90,7 @@ app.get('/', (req, res) => {
 
 // startAbandonedCartScheduler();
 // startDeleteAbandonedOrderScheduler();
-// startRestoreReservedOrdersScheduler();
+startRestoreReservedOrdersScheduler();
 
 // Global error handler
 app.use((err, req, res, next) => {

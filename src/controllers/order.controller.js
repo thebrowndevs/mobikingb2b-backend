@@ -28,6 +28,7 @@ import { STOCK_TYPES, ORDER_TYPES } from '../constants.js';
 import { initiateRazorpayPaymentLink } from '../services/razorpay.service.js';
 import { initiatePhonepePaymentLink } from '../services/phonepe.service.js';
 import { CompanyDetails } from '../models/company_details.model.js';
+import { confirmPaymentRecordPaidLogic } from '../services/payment.service.js';
 import { recalculateOrderTotals, syncItemDiscount, determineSlabForQuantity } from '../utils/pricing.js';
 import { logActivity } from "../utils/activityLogger.js";
 
@@ -55,9 +56,9 @@ import {
 } from "../utils/quotation/quotationStockLog.utils.js";
 
 import {
-    allocateOrderPurchaseSets,
-    restoreOrderPurchaseSets
-} from "../utils/order/orderPurchaseSet.utils.js";
+    reserveOrderVariantStock,
+    allocateOrderPurchaseSets
+} from "../utils/order/orderStock.utils.js";
 
 
 const razorpayConfig = () => {
@@ -83,60 +84,36 @@ const paymentLinkWebhook = asyncHandler(async (req, res) => {
 
     const signature = req.headers["x-razorpay-signature"];
 
-
     if (expectedSignature === signature) {
-
         const event = req.body;
         const paymentLink = event?.payload?.payment_link?.entity;
         const payment = event?.payload?.payment?.entity;
         const paymentLinkId = paymentLink?.id;
-        // const referenceId = paymentLink.reference_id;
         const status = paymentLink?.status;
 
-        // console.log("✅ Payment Link Paid:");
-        // console.log("Payment Link ID:", paymentLinkId);
-        // console.log("Reference ID:", referenceId);
         console.log("Payment Link:", paymentLink);
         console.log("Payment:", payment);
         console.log("Status:", status);
 
         const foundPaymentLink = await PaymentLink.findOneAndUpdate(
-            {
-                // orderId: paymentLink?.notes?.orderId,
-                paymentLink_id: paymentLinkId
-            },
+            { paymentLink_id: paymentLinkId },
             { status },
             { new: true }
         );
 
-        if (event.event === "payment_link.paid") {
-            const paymentDate = new Date();
-            const orderId = paymentLink?.notes?.orderId || foundPaymentLink?.orderId;
-            const updatedOrder = await Order.findByIdAndUpdate(
-                orderId,
-                {
-                    abondonedOrder: false,
-                    razorpayOrderId: paymentLink?.order_id,
-                    razorpayPaymentId: payment?.id,
-                    paymentStatus: "Paid",
-                    paymentDate
-                },
-                { new: true }
-            );
-
-            if (foundPaymentLink && foundPaymentLink.referenceId) {
-                await Payment.findByIdAndUpdate(
-                    foundPaymentLink.referenceId,
-                    {
-                        status: "Paid",
-                        paidAt: paymentDate,
-                        notes: `Paid via Razorpay Link. Transaction ID: ${payment?.id}`
-                    }
-                );
+        if (event.event === "payment_link.paid" && foundPaymentLink && foundPaymentLink.referenceId) {
+            const session = await mongoose.startSession();
+            try {
+                await session.withTransaction(async () => {
+                    await confirmPaymentRecordPaidLogic(foundPaymentLink.referenceId, payment?.id, session);
+                });
+            } catch (err) {
+                console.error("Webhook processing error in confirmPaymentRecordPaidLogic:", err);
+            } finally {
+                session.endSession();
             }
         }
 
-        // Update order status based on payment_link.paid or failed
         res.status(200).json({ status: "Webhook verified" });
     } else {
         res.status(400).json({ error: "Invalid signature" });
@@ -1106,68 +1083,1787 @@ const createCodOrder = asyncHandler(async (req, res) => {
     }
 });
 
-// Logic to restore stock for a given orderId
-export const restoreOrderStockLogic = async (orderId, session) => {
-    const order = await Order.findById(orderId)
-        .session(session)
-        .populate("items.productId");
+const createOnlineOrder =
+    asyncHandler(
+        async (req, res) => {
+            const session =
+                await mongoose.startSession();
 
-    if (!order) {
-        throw new ApiError(404, "Order not found");
-    }
+            try {
+                let {
+                    userId,
+                    cartId,
+                    name,
+                    email,
+                    phoneNo,
+                    orderAmount,
+                    coupon,
+                    comments,
+                    discount,
+                    deliveryCharge = 0,
+                    gst,
+                    subtotal,
+                    address,
+                    addressId,
+                    isAppOrder
+                } = req.body;
 
-    if (order._restockDone) {
-        throw new ApiError(409, "Stock already restored");
-    }
+                /*
+                 * =====================================================
+                 * COUPON
+                 * =====================================================
+                 */
+                let couponData =
+                    {};
 
-    const stockEntries = [];
+                let findCoupon =
+                    null;
 
-    for (const item of order.items) {
-        const qty = Math.floor(Number(item.quantity));
-        const variantKey = String(item.variantName || "").trim();
+                if (coupon) {
+                    findCoupon =
+                        await Coupon.findById(
+                            coupon
+                        );
 
-        const afterRestore = await Product.findOneAndUpdate(
-            { _id: item.productId._id },
-            {
-                $inc: {
-                    totalStock: qty,
-                    [`variants.${variantKey}`]: qty
+                    if (!findCoupon) {
+                        throw new ApiError(
+                            404,
+                            "Coupon not found"
+                        );
+                    }
+
+                    const start =
+                        new Date(
+                            findCoupon.startDate
+                        );
+
+                    const end =
+                        new Date(
+                            findCoupon.endDate
+                        );
+
+                    const now =
+                        Date.now();
+
+                    if (
+                        start.getTime() >
+                        now
+                    ) {
+                        throw new ApiError(
+                            400,
+                            "Offer not started yet"
+                        );
+                    }
+
+                    if (
+                        end.getTime() <
+                        now
+                    ) {
+                        throw new ApiError(
+                            400,
+                            "Coupon expired"
+                        );
+                    }
+
+                    if (
+                        findCoupon.type ===
+                        "oneTimeUser"
+                    ) {
+                        if (
+                            !findCoupon.userId ||
+                            String(
+                                findCoupon.userId
+                            ) !==
+                            String(
+                                req.user?._id
+                            )
+                        ) {
+                            throw new ApiError(
+                                400,
+                                "Invalid Coupon"
+                            );
+                        }
+
+                        if (
+                            findCoupon.appliedBy?.some(
+                                entry =>
+                                    String(
+                                        entry?.user
+                                    ) ===
+                                    String(
+                                        req.user?._id
+                                    )
+                            )
+                        ) {
+                            throw new ApiError(
+                                400,
+                                "Coupon already redeemed once"
+                            );
+                        }
+                    }
+
+                    if (
+                        findCoupon.type ===
+                        "oneTime" &&
+                        findCoupon.appliedBy?.some(
+                            entry =>
+                                String(
+                                    entry?.user
+                                ) ===
+                                String(
+                                    req.user?._id
+                                )
+                        )
+                    ) {
+                        throw new ApiError(
+                            400,
+                            "Coupon already redeemed once"
+                        );
+                    }
+
+                    couponData = {
+                        coupon:
+                            findCoupon._id,
+
+                        couponType:
+                            findCoupon.type,
+
+                        couponCode:
+                            findCoupon.code
+                    };
                 }
-            },
-            { new: true, session }
-        ).select("variants totalStock");
 
-        if (!afterRestore) {
-            throw new ApiError(404, `Product not found: ${item.productId._id}`);
+                /*
+                 * =====================================================
+                 * USER / CART
+                 * =====================================================
+                 */
+                userId =
+                    req?.user?._id;
+
+                cartId =
+                    req?.user?.cart;
+
+                if (
+                    !userId ||
+                    !name ||
+                    !phoneNo ||
+                    !cartId ||
+                    !addressId
+                ) {
+                    throw new ApiError(
+                        400,
+                        "Required order details missing."
+                    );
+                }
+
+                const cart =
+                    await Cart.findById(
+                        cartId
+                    ).populate(
+                        "items.productId"
+                    );
+
+                if (
+                    !cart ||
+                    cart.items.length ===
+                    0
+                ) {
+                    throw new ApiError(
+                        400,
+                        "Cart is empty or not found."
+                    );
+                }
+
+                /*
+                 * =====================================================
+                 * ADDRESS
+                 * =====================================================
+                 */
+                const foundAddress =
+                    await Address.findById(
+                        addressId
+                    );
+
+                if (!foundAddress) {
+                    throw new ApiError(
+                        404,
+                        "Address not found."
+                    );
+                }
+
+                const addressDetails = {
+                    address: `${foundAddress.street || ""}, ${foundAddress.street2 || ""}, ${foundAddress.city || ""}, ${foundAddress.state || ""}, ${foundAddress.pinCode || ""}`,
+                    address2:
+                        foundAddress.street2 ||
+                        "",
+                    city:
+                        foundAddress.city ||
+                        "",
+                    state:
+                        foundAddress.state ||
+                        "",
+                    country:
+                        foundAddress.country ||
+                        "India",
+                    pincode:
+                        foundAddress.pinCode ||
+                        "",
+                    latitude:
+                        foundAddress.latitude ||
+                        null,
+                    longitude:
+                        foundAddress.longitude ||
+                        null
+                };
+
+                /*
+                 * =====================================================
+                 * MIN ORDER LIMIT
+                 * =====================================================
+                 */
+                const companySettings =
+                    await CompanyDetails.findOne()
+                        .select(
+                            "minOrderLimit"
+                        )
+                        .lean();
+
+                const minOrderLimit =
+                    companySettings
+                        ?.minOrderLimit ??
+                    0;
+
+                /*
+                 * =====================================================
+                 * PRICING
+                 * =====================================================
+                 */
+                let subtotal_amount =
+                    0;
+
+                const categoryCharges =
+                    new Map();
+
+                const productQtyMap =
+                    new Map();
+
+                for (
+                    const item of
+                    cart.items
+                ) {
+                    const productId =
+                        String(
+                            item
+                                .productId
+                                ._id
+                        );
+
+                    productQtyMap.set(
+                        productId,
+                        (
+                            productQtyMap.get(
+                                productId
+                            ) || 0
+                        ) +
+                        Number(
+                            item.quantity ||
+                            0
+                        )
+                    );
+                }
+
+                for (
+                    const item of
+                    cart.items
+                ) {
+                    const qty =
+                        Math.floor(
+                            Number(
+                                item.quantity
+                            )
+                        );
+
+                    if (
+                        qty <=
+                        0
+                    ) {
+                        continue;
+                    }
+
+                    const variantKey =
+                        String(
+                            item.variantName ||
+                            ""
+                        ).trim();
+
+                    if (
+                        !variantKey
+                    ) {
+                        throw new ApiError(
+                            400,
+                            `Missing variant name for product ${item.productId?._id || item.productId}.`
+                        );
+                    }
+
+                    /*
+                     * Early read-only check only.
+                     * The real concurrency gate is inside transaction.
+                     */
+                    const variant =
+                        await Variant.findOne(
+                            {
+                                _id:
+                                    item.variantId,
+                                active:
+                                    true
+                            }
+                        ).lean();
+
+                    if (
+                        !variant ||
+                        Number(
+                            variant.availableStock ||
+                            0
+                        ) <
+                        qty
+                    ) {
+                        throw new ApiError(
+                            409,
+                            `Insufficient stock for variant "${variantKey}".`
+                        );
+                    }
+
+                    const product =
+                        await Product.findById(
+                            item
+                                .productId
+                                ._id
+                        ).populate(
+                            "category"
+                        );
+
+                    if (
+                        !product
+                    ) {
+                        throw new ApiError(
+                            404,
+                            `Product not found: ${item.productId._id}`
+                        );
+                    }
+
+                    const totalProductQty =
+                        productQtyMap.get(
+                            String(
+                                item
+                                    .productId
+                                    ._id
+                            )
+                        ) ||
+                        qty;
+
+                    const matchedSlab =
+                        determineSlabForQuantity(
+                            product,
+                            totalProductQty
+                        );
+
+                    const slabPrice =
+                        matchedSlab
+                            ? matchedSlab.price
+                            : product.basePrice ||
+                            0;
+
+                    const {
+                        discount:
+                        itemDiscount,
+                        discountPercent:
+                        itemDiscountPercent,
+                        discountType
+                    } =
+                        syncItemDiscount(
+                            item.discount ||
+                            0,
+
+                            item.discountPercent ||
+                            0,
+
+                            slabPrice,
+
+                            item.discountType ||
+                            "flat"
+                        );
+
+                    item._slabPrice =
+                        slabPrice;
+
+                    item._appliedSlab =
+                        matchedSlab
+                            ? {
+                                quantity:
+                                    matchedSlab.quantity,
+                                price:
+                                    matchedSlab.price
+                            }
+                            : undefined;
+
+                    item._itemDiscount =
+                        itemDiscount;
+
+                    item._itemDiscountPercent =
+                        itemDiscountPercent;
+
+                    item._discountType =
+                        discountType;
+
+                    subtotal_amount +=
+                        (
+                            slabPrice -
+                            itemDiscount
+                        ) *
+                        qty;
+
+                    if (
+                        product.category
+                    ) {
+                        const categoryId =
+                            product.category._id.toString();
+
+                        const categoryDelivery =
+                            Number(
+                                product
+                                    .category
+                                    .deliveryCharge ||
+                                0
+                            );
+
+                        if (
+                            categoryDelivery >
+                            0 &&
+                            !categoryCharges.has(
+                                categoryId
+                            )
+                        ) {
+                            categoryCharges.set(
+                                categoryId,
+                                categoryDelivery
+                            );
+                        }
+                    }
+                }
+
+                const totalDeliveryCharge =
+                    categoryCharges.size >
+                        0
+                        ? Math.max(
+                            ...Array.from(
+                                categoryCharges.values()
+                            )
+                        )
+                        : 0;
+
+                let couponDiscount =
+                    0;
+
+                if (
+                    findCoupon
+                ) {
+                    couponDiscount =
+                        subtotal_amount *
+                        (
+                            Number(
+                                findCoupon.percent
+                            ) *
+                            0.01
+                        );
+
+                    couponDiscount =
+                        Number(
+                            couponDiscount.toFixed(
+                                2
+                            )
+                        );
+
+                    if (
+                        couponDiscount >=
+                        Number(
+                            findCoupon.value ||
+                            0
+                        )
+                    ) {
+                        couponDiscount =
+                            Number(
+                                findCoupon.value
+                            );
+                    }
+                }
+
+                const finalOrderAmount =
+                    Number(
+                        (
+                            Math.max(
+                                0,
+                                subtotal_amount -
+                                couponDiscount
+                            ) +
+                            totalDeliveryCharge
+                        ).toFixed(
+                            2
+                        )
+                    );
+
+                if (
+                    minOrderLimit >
+                    0 &&
+                    subtotal_amount <
+                    minOrderLimit
+                ) {
+                    throw new ApiError(
+                        400,
+                        `Order must be minimum ₹${minOrderLimit}.`
+                    );
+                }
+
+                /*
+                 * =====================================================
+                 * CREATE RAZORPAY ORDER
+                 * =====================================================
+                 */
+                const razorpay =
+                    razorpayConfig();
+
+                const razorpayOrder =
+                    await razorpay.orders.create(
+                        {
+                            amount:
+                                Math.round(
+                                    finalOrderAmount *
+                                    100
+                                ),
+                            currency:
+                                "INR",
+
+                            receipt:
+                                `rcpt_${uuidv4().split("-")[0]}`,
+
+                            payment_capture:
+                                1
+                        }
+                    );
+
+                let newOrder;
+                let newPayment;
+
+                /*
+                 * =====================================================
+                 * ATOMIC TRANSACTION
+                 * =====================================================
+                 */
+                await session.withTransaction(
+                    async () => {
+                        const orderId =
+                            uuidv4()
+                                .split(
+                                    "-"
+                                )[0]
+                                .toUpperCase();
+
+                        newOrder =
+                            new Order({
+                                gateway:
+                                    "razorpay",
+
+                                ...couponData,
+                                ...addressDetails,
+
+                                userId,
+
+                                name:
+                                    name.trim(),
+
+                                email:
+                                    email?.trim() ||
+                                    "",
+
+                                phoneNo:
+                                    phoneNo.trim(),
+
+                                comments:
+                                    comments ||
+                                    "",
+
+                                addressId,
+
+                                method:
+                                    "Online",
+
+                                type:
+                                    "Regular",
+
+                                status:
+                                    "New",
+
+                                paymentStatus:
+                                    "Pending",
+
+                                paymentDate:
+                                    new Date(),
+
+                                isAppOrder:
+                                    Boolean(
+                                        isAppOrder
+                                    ),
+
+                                orderState:
+                                    "Reserved",
+
+                                abondonedOrder:
+                                    true,
+
+                                orderId,
+
+                                razorpayOrderId:
+                                    razorpayOrder.id,
+
+                                subtotal:
+                                    subtotal_amount,
+
+                                discount:
+                                    couponDiscount,
+
+                                deliveryCharge:
+                                    totalDeliveryCharge,
+
+                                orderAmount:
+                                    finalOrderAmount,
+
+                                gst:
+                                    gst || "",
+
+                                items:
+                                    cart.items
+                            });
+
+                        await newOrder.save({
+                            session
+                        });
+
+                        const stockEntries =
+                            [];
+
+                        const affectedProductIds =
+                            new Set();
+
+                        /*
+                         * =================================================
+                         * PHYSICAL STOCK
+                         * =================================================
+                         */
+                        for (
+                            const item of
+                            newOrder.items
+                        ) {
+                            const quantity =
+                                Math.floor(
+                                    Number(
+                                        item.quantity
+                                    )
+                                );
+
+                            if (
+                                !Number.isInteger(
+                                    quantity
+                                ) ||
+                                quantity <=
+                                0
+                            ) {
+                                throw new ApiError(
+                                    400,
+                                    `Invalid quantity for product ${item.productId}.`
+                                );
+                            }
+
+                            if (
+                                !item.variantId
+                            ) {
+                                throw new ApiError(
+                                    400,
+                                    `Variant ID is required for "${item.variantName}".`
+                                );
+                            }
+
+                            const {
+                                variant,
+                                previousAvailableStock,
+                                updatedAvailableStock,
+                                previousPhysicalStock,
+                                updatedPhysicalStock
+                            } =
+                                await reserveOrderVariantStock(
+                                    {
+                                        variantId:
+                                            item.variantId,
+                                        quantity,
+                                        session
+                                    }
+                                );
+
+                            const allocation =
+                                allocateOrderPurchaseSets(
+                                    {
+                                        variant,
+                                        quantity
+                                    }
+                                );
+
+                            await savePurchaseSets({
+                                variantId:
+                                    variant._id,
+
+                                purchaseSets:
+                                    variant.purchaseSets,
+
+                                session
+                            });
+
+                            const purchasePrice =
+                                Number(
+                                    (
+                                        allocation.totalCost /
+                                        quantity
+                                    ).toFixed(
+                                        3
+                                    )
+                                );
+
+                            const cartItem = cart.items.find(
+                                ci => ci.variantId && item.variantId && String(ci.variantId) === String(item.variantId)
+                            );
+
+                            /*
+                             * Correct shared Order/Cart item keys.
+                             */
+                            item.price =
+                                cartItem?._slabPrice ??
+                                item.price;
+
+                            item.appliedSlab =
+                                cartItem?._appliedSlab;
+
+                            item.discount =
+                                cartItem?._itemDiscount ??
+                                item.discount ??
+                                0;
+
+                            item.discountPercent =
+                                cartItem?._itemDiscountPercent ??
+                                item.discountPercent ??
+                                0;
+
+                            item.discountType =
+                                cartItem?._discountType ??
+                                item.discountType ??
+                                "flat";
+
+                            item.purchasePrice =
+                                purchasePrice;
+
+                            item.purchaseSetId =
+                                allocation.selectedSetId;
+
+                            item.purchaseSets =
+                                allocation.allocatedSets;
+
+                            item.variantId =
+                                variant._id;
+
+                            item.sku =
+                                String(
+                                    variant._id
+                                );
+
+                            affectedProductIds.add(
+                                String(
+                                    item.productId
+                                        ?._id ||
+                                    item.productId
+                                )
+                            );
+
+                            const parentProduct = await Product.findById(
+                                item.productId?._id || item.productId
+                            ).session(session).lean();
+
+                            const currentTotalProductStock = parentProduct
+                                ? Math.max(0, (parentProduct.totalProductStock || parentProduct.totalStock || 0) - quantity)
+                                : 0;
+
+                            /*
+                             * IMPORTANT:
+                             *
+                             * Online order does NOT modify
+                             * Inventory.reservedStock.
+                             *
+                             * That field belongs to quotation reservation.
+                             */
+
+                            stockEntries.push({
+                                type:
+                                    STOCK_TYPES.RESERVED,
+
+                                category:
+                                    "physical",
+
+                                orderId,
+
+                                orderRef:
+                                    newOrder._id,
+
+                                variantId:
+                                    variant._id,
+
+                                variantName:
+                                    variant.name,
+
+                                purchasePrice,
+
+                                sellingPrice:
+                                    Number(
+                                        item.price ||
+                                        0
+                                    ) -
+                                    Number(
+                                        item.discount ||
+                                        0
+                                    ),
+
+                                quantity,
+
+                                previousStock:
+                                    previousAvailableStock,
+
+                                updatedStock:
+                                    updatedAvailableStock,
+
+                                previousPhysicalStock:
+                                    previousPhysicalStock,
+
+                                updatedPhysicalStock:
+                                    updatedPhysicalStock,
+
+                                totalProductStock:
+                                    currentTotalProductStock,
+
+                                productId:
+                                    item.productId
+                                        ?._id ||
+                                    item.productId
+                            });
+                        }
+
+                        /*
+                         * =================================================
+                         * PRODUCT / INVENTORY SYNC
+                         * =================================================
+                         */
+                        for (
+                            const productId of
+                            affectedProductIds
+                        ) {
+                            await syncProductStock2(
+                                new mongoose.Types.ObjectId(
+                                    productId
+                                ),
+                                session
+                            );
+                        }
+
+                        /*
+                         * =================================================
+                         * STOCK LOGS
+                         * =================================================
+                         */
+                        if (
+                            stockEntries.length >
+                            0
+                        ) {
+                            const insertedLogs =
+                                await Stock.insertMany(
+                                    stockEntries,
+                                    {
+                                        session
+                                    }
+                                );
+
+                            newOrder.stockIds =
+                                insertedLogs.map(
+                                    log =>
+                                        log._id
+                                );
+
+                            for (
+                                const item of
+                                newOrder.items
+                            ) {
+                                const matchingLogs =
+                                    insertedLogs.filter(
+                                        log =>
+                                            log.variantId &&
+                                            item.variantId &&
+                                            String(
+                                                log.variantId
+                                            ) ===
+                                            String(
+                                                item.variantId
+                                            )
+                                    );
+
+                                item.stockIds =
+                                    matchingLogs.map(
+                                        log =>
+                                            log._id
+                                    );
+                            }
+                        }
+
+                        await newOrder.save({
+                            session
+                        });
+
+                        /*
+                         * =================================================
+                         * PAYMENT RECORD
+                         * =================================================
+                         */
+                        const isCouponApplied =
+                            Boolean(
+                                newOrder.coupon
+                            );
+
+                        const [
+                            payment
+                        ] =
+                            await Payment.create(
+                                [
+                                    {
+                                        orderId:
+                                            newOrder.orderId,
+
+                                        orderRef:
+                                            newOrder._id,
+
+                                        userId:
+                                            newOrder.userId,
+
+                                        amount:
+                                            finalOrderAmount,
+
+                                        subtotal:
+                                            subtotal_amount,
+
+                                        discount:
+                                            0,
+
+                                        coupon:
+                                            isCouponApplied
+                                                ? couponDiscount
+                                                : 0,
+
+                                        couponId:
+                                            newOrder.coupon ||
+                                            undefined,
+
+                                        method:
+                                            "Online",
+
+                                        status:
+                                            "Pending",
+
+                                        razorpayOrderId:
+                                            razorpayOrder.id,
+
+                                        notes:
+                                            "Auto-created on Buy Now checkout"
+                                    }
+                                ],
+                                {
+                                    session
+                                }
+                            );
+
+                        newPayment =
+                            payment;
+
+                        /*
+                         * =================================================
+                         * CART COPY
+                         * =================================================
+                         */
+                        const newCart =
+                            new Cart({
+                                userId:
+                                    cart.userId,
+
+                                items:
+                                    cart.items,
+
+                                totalCartValue:
+                                    cart.totalCartValue
+                            });
+
+                        await newCart.save({
+                            session,
+                            timestamps:
+                                false
+                        });
+
+                        await User.findByIdAndUpdate(
+                            cart.userId,
+                            {
+                                cart:
+                                    newCart._id
+                            },
+                            {
+                                new:
+                                    true,
+                                session
+                            }
+                        );
+
+                        await Cart.findByIdAndDelete(
+                            cart._id,
+                            {
+                                session
+                            }
+                        );
+                    }
+                );
+
+                const updatedUser =
+                    await User.findById(
+                        userId
+                    )
+                        .select(
+                            "-password -refreshToken"
+                        )
+                        .populate({
+                            path:
+                                "cart",
+                            populate: {
+                                path:
+                                    "items.productId",
+                                model:
+                                    "Product",
+                                populate: {
+                                    path:
+                                        "category",
+                                    model:
+                                        "SubCategory"
+                                }
+                            }
+                        })
+                        .populate(
+                            "wishlist"
+                        )
+                        .populate(
+                            "address"
+                        )
+                        .populate(
+                            "orders"
+                        );
+
+                return res
+                    .status(201)
+                    .json(
+                        new ApiResponse(
+                            201,
+                            {
+                                razorpayOrderId:
+                                    razorpayOrder.id,
+
+                                amount:
+                                    razorpayOrder.amount,
+
+                                currency:
+                                    razorpayOrder.currency,
+
+                                key:
+                                    process.env
+                                        .RAZORPAY_KEY_ID,
+
+                                newOrderId:
+                                    newOrder._id,
+
+                                /*
+                                 * YOUR INTERNAL Payment document ID.
+                                 */
+                                paymentId:
+                                    newPayment._id,
+
+                                user:
+                                    updatedUser
+                            },
+                            "Razorpay Order Created"
+                        )
+                    );
+            } catch (err) {
+                console.error(
+                    "createOnlineOrder error:",
+                    err
+                );
+
+                return res
+                    .status(
+                        err.statusCode ||
+                        500
+                    )
+                    .json({
+                        message:
+                            err.message ||
+                            "Internal server error"
+                    });
+            } finally {
+                await session.endSession();
+            }
+        }
+    );
+
+const verifyPayment =
+    async (
+        req,
+        res
+    ) => {
+        const session =
+            await mongoose.startSession();
+
+        try {
+            const {
+                paymentId,
+                razorpay_order_id,
+                razorpay_payment_id,
+                razorpay_signature
+            } = req.body;
+
+            if (
+                !paymentId ||
+                !razorpay_order_id ||
+                !razorpay_payment_id ||
+                !razorpay_signature
+            ) {
+                throw new ApiError(
+                    400,
+                    "Payment verification details missing."
+                );
+            }
+
+            /*
+             * =====================================================
+             * VERIFY RAZORPAY SIGNATURE
+             * =====================================================
+             */
+            const generatedSignature =
+                crypto
+                    .createHmac(
+                        "sha256",
+                        process.env
+                            .RAZORPAY_KEY_SECRET
+                    )
+                    .update(
+                        `${razorpay_order_id}|${razorpay_payment_id}`
+                    )
+                    .digest("hex");
+
+            if (
+                generatedSignature !==
+                razorpay_signature
+            ) {
+                return res
+                    .status(400)
+                    .json(
+                        new ApiResponse(
+                            400,
+                            null,
+                            "Invalid signature"
+                        )
+                    );
+            }
+
+            let result;
+
+            await session.withTransaction(
+                async () => {
+                    /*
+                     * Ensure the exact Payment document belongs to
+                     * this Razorpay order before confirming it.
+                     */
+                    const payment =
+                        await Payment.findById(
+                            paymentId
+                        ).session(
+                            session
+                        );
+
+                    if (!payment) {
+                        throw new ApiError(
+                            404,
+                            "Payment record not found."
+                        );
+                    }
+
+                    if (
+                        String(
+                            payment.razorpayOrderId
+                        ) !==
+                        String(
+                            razorpay_order_id
+                        )
+                    ) {
+                        throw new ApiError(
+                            400,
+                            "Payment does not belong to the supplied Razorpay order."
+                        );
+                    }
+
+                    result =
+                        await confirmPaymentRecordPaidLogic(
+                            paymentId,
+                            razorpay_payment_id,
+                            session
+                        );
+                }
+            );
+
+            /*
+             * Populate outside transaction for response only.
+             */
+            const finalOrder =
+                await Order.findById(
+                    result.order._id
+                ).populate(
+                    "items.productId"
+                );
+
+            const updatedUser =
+                await User.findById(
+                    finalOrder.userId
+                )
+                    .select(
+                        "-password -refreshToken"
+                    )
+                    .populate({
+                        path:
+                            "cart",
+                        populate: {
+                            path:
+                                "items.productId",
+                            model:
+                                "Product",
+                            populate: {
+                                path:
+                                    "category",
+                                model:
+                                    "SubCategory"
+                            }
+                        }
+                    })
+                    .populate(
+                        "wishlist"
+                    )
+                    .populate(
+                        "address"
+                    )
+                    .populate(
+                        "orders"
+                    );
+
+            return res
+                .status(200)
+                .json(
+                    new ApiResponse(
+                        200,
+                        {
+                            order:
+                                finalOrder,
+                            payment:
+                                result.payment,
+                            user:
+                                updatedUser
+                        },
+                        result.fullyPaid
+                            ? "Payment Verified. Order Completed"
+                            : "Payment Verified Successfully"
+                    )
+                );
+        } catch (err) {
+            console.error(
+                "verifyPayment error:",
+                err
+            );
+
+            return res
+                .status(
+                    err.statusCode ||
+                    500
+                )
+                .json({
+                    message:
+                        err.message ||
+                        "Internal server error"
+                });
+        } finally {
+            await session.endSession();
+        }
+    };
+
+
+export const restoreOrderStockLogic =
+    async (
+        orderId,
+        session
+    ) => {
+        /*
+         * =====================================================
+         * ATOMIC RESTOCK CLAIM
+         * =====================================================
+         *
+         * Only one transaction is allowed to restore this order.
+         */
+        const order =
+            await Order.findOneAndUpdate(
+                {
+                    _id:
+                        orderId,
+
+                    _restockDone:
+                    {
+                        $ne:
+                            true
+                    }
+                },
+                {
+                    $set: {
+                        _restockDone:
+                            true
+                    }
+                },
+                {
+                    new:
+                        true,
+                    session
+                }
+            ).populate(
+                "items.productId"
+            );
+
+        if (!order) {
+            throw new ApiError(
+                409,
+                "Stock has already been restored or order does not exist."
+            );
         }
 
-        const updatedStock = afterRestore.variants.get(variantKey);
-        const previousStock = updatedStock - qty;
+        if (
+            !order.items ||
+            order.items.length ===
+            0
+        ) {
+            throw new ApiError(
+                400,
+                "Order has no items to restore."
+            );
+        }
 
-        stockEntries.push({
-            orderId: order.orderId,
-            orderRef: order?._id,
-            type: STOCK_TYPES.PURCHASE_RESTORE,
-            variantName: variantKey,
-            quantity: qty,
-            previousStock,
-            updatedStock,
-            productId: item.productId._id
-        });
-    }
+        const affectedProductIds =
+            new Set();
 
-    if (stockEntries.length > 0) {
-        await Stock.insertMany(stockEntries, { session });
-    }
+        const stockEntries =
+            [];
 
-    order._restockDone = true;
-    // For reserved orders that were timed out, we also mark them as Abandoned.
-    // However, if called from the manual API, we just keep it as is or update if needed.
-    // The cron job will handle the orderState update separately.
-    await order.save({ session });
+        /*
+         * =====================================================
+         * RESTORE EACH VARIANT
+         * =====================================================
+         */
+        for (
+            const item of
+            order.items
+        ) {
+            const quantity =
+                Math.floor(
+                    Number(
+                        item.quantity
+                    )
+                );
 
-    return order;
-};
+            if (
+                !Number.isInteger(
+                    quantity
+                ) ||
+                quantity <=
+                0
+            ) {
+                continue;
+            }
+
+            const productId =
+                item.productId?._id ||
+                item.productId;
+
+            const variantId =
+                item.variantId;
+
+            if (!variantId) {
+                throw new ApiError(
+                    500,
+                    `Variant ID missing for order item "${item.variantName}".`
+                );
+            }
+
+            /*
+             * Restore exact Variant physical stock.
+             *
+             * This is atomic.
+             */
+            const variant =
+                await Variant.findOneAndUpdate(
+                    {
+                        _id:
+                            variantId,
+                        active:
+                            true
+                    },
+                    {
+                        $inc: {
+                            totalStock:
+                                quantity,
+
+                            availableStock:
+                                quantity
+                        }
+                    },
+                    {
+                        new:
+                            true,
+                        session
+                    }
+                );
+
+            if (!variant) {
+                throw new ApiError(
+                    404,
+                    `Variant "${item.variantName}" not found while restoring order ${order.orderId}.`
+                );
+            }
+
+            const previousAvailableStock =
+                variant.availableStock -
+                quantity;
+
+            const previousPhysicalStock =
+                variant.totalStock -
+                quantity;
+
+            /*
+             * =================================================
+             * RESTORE EXACT PURCHASE SETS
+             * =================================================
+             */
+            if (
+                !Array.isArray(
+                    item.purchaseSets
+                ) ||
+                item.purchaseSets.length ===
+                0
+            ) {
+                throw new ApiError(
+                    500,
+                    `Purchase-set allocation missing for order ${order.orderId}, variant "${item.variantName}".`
+                );
+            }
+
+            let restoredQuantity =
+                0;
+
+            for (
+                const allocation of
+                item.purchaseSets
+            ) {
+                const allocationQty =
+                    Number(
+                        allocation.quantity ||
+                        0
+                    );
+
+                if (
+                    allocationQty <=
+                    0
+                ) {
+                    continue;
+                }
+
+                if (
+                    !allocation.purchaseSetId
+                ) {
+                    throw new ApiError(
+                        500,
+                        `Missing purchaseSetId for order ${order.orderId}, variant "${item.variantName}".`
+                    );
+                }
+
+                const purchaseSet =
+                    variant.purchaseSets.id(
+                        allocation.purchaseSetId
+                    );
+
+                if (!purchaseSet) {
+                    throw new ApiError(
+                        500,
+                        `Purchase set ${allocation.purchaseSetId} not found while restoring order ${order.orderId}.`
+                    );
+                }
+
+                purchaseSet.availableStock +=
+                    allocationQty;
+
+                purchaseSet.remainingStock +=
+                    allocationQty;
+
+                restoredQuantity +=
+                    allocationQty;
+            }
+
+            if (
+                restoredQuantity !==
+                quantity
+            ) {
+                throw new ApiError(
+                    500,
+                    `Purchase-set quantity mismatch for order ${order.orderId}, variant "${item.variantName}". Expected ${quantity}, got ${restoredQuantity}.`
+                );
+            }
+
+            /*
+             * Persist only purchaseSets because totalStock /
+             * availableStock were atomically changed above.
+             */
+            const purchaseSetUpdate =
+                await Variant.updateOne(
+                    {
+                        _id:
+                            variant._id
+                    },
+                    {
+                        $set: {
+                            purchaseSets:
+                                variant.purchaseSets
+                        }
+                    },
+                    {
+                        session
+                    }
+                );
+
+            if (
+                purchaseSetUpdate.matchedCount ===
+                0
+            ) {
+                throw new ApiError(
+                    500,
+                    `Failed to restore purchase sets for order ${order.orderId}.`
+                );
+            }
+
+            affectedProductIds.add(
+                String(
+                    productId
+                )
+            );
+
+            const parentProduct = await Product.findById(productId).session(session).lean();
+
+            const currentTotalProductStock = parentProduct
+                ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) + quantity
+                : 0;
+
+            stockEntries.push({
+                orderId:
+                    order.orderId,
+
+                orderRef:
+                    order._id,
+
+                type:
+                    STOCK_TYPES.PURCHASE_RESTORE,
+
+                category:
+                    "physical",
+
+                variantId:
+                    variant._id,
+
+                variantName:
+                    variant.name,
+
+                quantity,
+
+                previousStock:
+                    previousAvailableStock,
+
+                updatedStock:
+                    variant.availableStock,
+
+                previousPhysicalStock:
+                    previousPhysicalStock,
+
+                updatedPhysicalStock:
+                    variant.totalStock,
+
+                totalProductStock:
+                    currentTotalProductStock,
+
+                productId,
+
+                purchasePrice:
+                    Number(
+                        item.purchasePrice ||
+                        0
+                    ),
+
+                sellingPrice:
+                    Number(
+                        item.price ||
+                        0
+                    ) -
+                    Number(
+                        item.discount ||
+                        0
+                    )
+            });
+        }
+
+        /*
+         * =====================================================
+         * SYNC PRODUCT AGGREGATES ONCE PER PRODUCT
+         * =====================================================
+         */
+        for (
+            const productId of
+            affectedProductIds
+        ) {
+            await syncProductStock2(
+                new mongoose.Types.ObjectId(
+                    productId
+                ),
+                session
+            );
+        }
+
+        /*
+         * =====================================================
+         * STOCK LOG
+         * =====================================================
+         */
+        if (
+            stockEntries.length >
+            0
+        ) {
+            await Stock.insertMany(
+                stockEntries,
+                {
+                    session
+                }
+            );
+        }
+
+        /*
+         * _restockDone was already atomically claimed at the
+         * beginning. We intentionally do not update it again.
+         */
+        return order;
+    };
+
+
+// // Logic to restore stock for a given orderId
+// export const restoreOrderStockLogic = async (orderId, session) => {
+//     const order = await Order.findById(orderId)
+//         .session(session)
+//         .populate("items.productId");
+
+//     if (!order) {
+//         throw new ApiError(404, "Order not found");
+//     }
+
+//     if (order._restockDone) {
+//         throw new ApiError(409, "Stock already restored");
+//     }
+
+//     const stockEntries = [];
+
+//     for (const item of order.items) {
+//         const qty = Math.floor(Number(item.quantity));
+//         const variantKey = String(item.variantName || "").trim();
+
+//         // 1. Fetch variant and restore purchaseSets via helper
+//         const variant = await Variant.findOne({ productId: item.productId._id, name: variantKey }).session(session);
+//         if (!variant) {
+//             throw new ApiError(404, `Variant "${variantKey}" not found for product ${item.productId._id}`);
+//         }
+
+//         const previousAvailable = variant.availableStock;
+//         const previousPhysical = variant.totalStock;
+
+//         // Perform restore on variant purchaseSets
+//         restoreOrderPurchaseSets({
+//             variant,
+//             allocatedSets: item.purchaseSets || [],
+//             quantity: qty
+//         });
+
+//         // Restore overall stock levels on the variant
+//         variant.availableStock += qty;
+//         variant.totalStock += qty;
+//         await variant.save({ session });
+
+//         // 2. Restore overall stock levels on parent Product
+//         const parentProduct = await Product.findByIdAndUpdate(
+//             item.productId._id,
+//             { $inc: { availableStock: qty, totalStock: qty } },
+//             { new: true, session }
+//         );
+
+//         // 3. Decrement reservedStock in Inventory
+//         const inventory = await Inventory.findOne({ product: item.productId._id }).session(session);
+//         if (inventory) {
+//             inventory.reservedStock = Math.max(0, inventory.reservedStock - qty);
+//             await inventory.save({ session });
+//         }
+
+//         // 4. Create PURCHASE_RESTORE Stock Log
+//         stockEntries.push({
+//             orderId: order.orderId,
+//             orderRef: order?._id,
+//             type: STOCK_TYPES.PURCHASE_RESTORE,
+//             category: "physical",
+//             variantId: variant._id,
+//             variantName: variantKey,
+//             quantity: qty,
+//             previousStock: previousAvailable,
+//             updatedStock: variant.availableStock,
+//             previousPhysicalStock: previousPhysical,
+//             updatedPhysicalStock: variant.totalStock,
+//             productId: item.productId._id
+//         });
+//     }
+
+//     if (stockEntries.length > 0) {
+//         await Stock.insertMany(stockEntries, { session });
+//     }
+
+//     order._restockDone = true;
+//     await order.save({ session });
+
+//     return order;
+// };
 
 //In case of online orders when payment fails, or user initiate online order but do not pay
 const restoreOrderStock = asyncHandler(async (req, res) => {
@@ -1307,570 +3003,619 @@ const restoreOrderStock = asyncHandler(async (req, res) => {
 //     }
 // };
 
-const createOnlineOrder = asyncHandler(async (req, res) => {
-    const session = await mongoose.startSession();
-
-    try {
-        let {
-            userId, cartId,
-            name, email, phoneNo,
-            orderAmount,
-            coupon,
-            comments,
-            discount,
-            deliveryCharge = 0,
-            gst,
-            subtotal,
-            address,
-            addressId,
-            isAppOrder
-        } = req.body;
-
-        let couponData = {};
-        let findCoupon = null;
-
-        if (coupon) {
-            findCoupon = await Coupon.findById(coupon);
-            if (!findCoupon) {
-                throw new ApiError(404, "Coupon not found");
-            }
-
-            const start = new Date(findCoupon?.startDate);
-            const end = new Date(findCoupon?.endDate);
-            const now = Date.now();
-
-            console.log("Start UTC:", start.toISOString());
-            console.log("End UTC:", end.toISOString());
-            console.log("Now UTC:", new Date(now).toISOString());
-
-            if (start.getTime() > now) {
-                throw new ApiError(400, "Offer not started yet");
-            }
-
-            if (end.getTime() < now) {
-                throw new ApiError(400, "Coupon expired");
-            }
-
-            // Enforce oneTime and oneTimeUser constraints
-            if (findCoupon?.type === "oneTimeUser") {
-                if (!findCoupon.userId || findCoupon.userId.toString() !== req.user?._id?.toString()) {
-                    throw new ApiError(400, "Invalid Coupon");
-                }
-                if (findCoupon.appliedBy?.some(c => c?.user?.toString() === req.user?._id?.toString())) {
-                    throw new ApiError(400, "Coupon already redeemed once");
-                }
-            }
-            if (findCoupon?.type === "oneTime" && findCoupon.appliedBy?.some(c => c?.user?.toString() === req.user?._id?.toString())) {
-                throw new ApiError(400, "Coupon already redeemed once");
-            }
-
-            couponData = {
-                coupon: findCoupon._id,
-                couponType: findCoupon.type,
-                couponCode: findCoupon.code
-            }
-            // console.log("Coupon: ", couponData)
-        }
-
-        cartId = req?.user?.cart;
-        if (
-            !userId || !name || !phoneNo || !cartId ||
-            // !orderAmount || 
-            !subtotal ||
-            // !gst || 
-            !address
-        ) {
-            throw new ApiError(400, 'Required order details missing.');
-        }
-
-        if (
-            deliveryCharge == undefined || deliveryCharge == null || deliveryCharge < 0
-        ) {
-            throw new ApiError(400, 'Delivery charge cannot be negative.');
-        }
-
-        const cart = await Cart.findOne({ _id: cartId }).populate('items.productId');
-        if (!cart || cart.items.length === 0) {
-            throw new ApiError(400, 'Cart is empty or not found.');
-        }
-
-        const foundAddress = await Address.findById(addressId);
-
-        const addressDetails = {
-            address: `${foundAddress?.street || ""}, ${foundAddress?.street2 || ""}, ${foundAddress?.city || ""}, ${foundAddress?.state || ""}, ${foundAddress?.pinCode || ""}`,
-            // address: foundAddress?.street,
-            address2: foundAddress?.street2,
-            city: foundAddress?.city,
-            state: foundAddress?.state,
-            country: foundAddress?.country,
-            pincode: foundAddress?.pinCode
-        }
-
-        const paymentDate = new Date();
-        // 2️⃣ Create Order in DB (status: Created)
-        const newOrder = new Order({
-            gateway: 'razorpay',
-            ...couponData,
-            ...addressDetails,
-            userId,
-            name: name.trim(),
-            email: email.trim(),
-            phoneNo: phoneNo.trim(),
-            // address,
-            comments,
-            addressId,
-            method: 'Online',
-            type: 'Regular',
-            status: 'New',
-            paymentStatus: 'Pending',
-            paymentDate,
-            isAppOrder,
-            orderState: "Reserved",
-            abondonedOrder: true,
-            orderId: uuidv4().split('-')[0].toUpperCase(),
-            // razorpayOrderId: razorpayOrder.id,
-            orderAmount,
-            // coupon,
-            // discount,
-            deliveryCharge,
-            gst,
-            subtotal,
-            items: cart.items
-        });
-
-        console.log("Initial New Order: ", newOrder);
-        // Recalculate subtotal and deliveryCharge
-        let subtotal_amount = 0;
-        const categoryCharges = new Map();
-        // console.log("New Order 1:", newOrder);
-
-        for (const item of newOrder.items) {
-
-            const qty = Math.floor(Number(item.quantity));
-            if (!Number.isInteger(qty) || qty <= 0) {
-                throw new Error(`Invalid quantity for product ${item.productId?._id || item.productId}: ${item.quantity}`);
-            }
-
-            const variantKey = String(item.variantName || '').trim();
-            if (!variantKey) {
-                throw new Error(`Missing variantName for product ${item.productId._id}`);
-            }
-
-            // console.log("New Order 1:", item.productId);
-            const prod = await Product.findOne({ _id: item.productId._id })
-                .session(session)
-                .populate("category")
-                .exec();
-
-            if (!prod || !prod.category) {
-                throw new ApiError(400, `Product or category missing for ${item.productId._id}`);
-            }
-
-            console.log("product variant", prod?.variants, variantKey, !Object.prototype.hasOwnProperty.call(prod.variants, variantKey));
-
-            if (
-                !prod?.variants) {
-                throw new ApiError(404, `Variants not found for product ${item?.productId?._id}`);
-            }
-
-            // Strict case-sensitive match: variant must exist exactly as provided
-
-            //Adding stock entries document
-            if (!prod.variants?.has(variantKey)) {
-                throw new ApiError(404, `Variant "${variantKey}" not found for product ${item?.productId?._id}`);
-            }
-
-            const previousStock = prod.variants.get(variantKey);;
-            const updatedStock = previousStock - qty;
-
-            console.log("previous Stock", previousStock);
-            console.log("updated Stock", updatedStock);
-
-            if (previousStock < qty) {
-                throw new ApiError(400, `Insufficient stock for ${variantKey}`);
-            }
-
-            // const varianQty = prod.variants[variantKey];
-            // if (typeof varianQty !== "number") {
-            //     throw new ApiError(400, `Variant "${variantKey}" has invalid inventory data`);
-            // }
-
-            // if (!varianQty || varianQty < qty) {
-            //     throw new ApiError(
-            //         400,
-            //         `Only ${varianQty} units available for variant "${variantKey}", but ${qty} requested`
-            //     );
-            // }
-
-            subtotal_amount += (item.price - (item.discount || 0)) * item.quantity;
-
-            const categoryId = prod.category._id.toString();
-            const deliveryCharge = prod.category.deliveryCharge || 0;
-
-            if (deliveryCharge > 0 && !categoryCharges.has(categoryId)) {
-                categoryCharges.set(categoryId, deliveryCharge);
-            }
-        }
-
-        let values = Array.from(categoryCharges.values());
-        let totalDeliveryCharge = Math.max(...values);
-
-        if (!isFinite(totalDeliveryCharge) || totalDeliveryCharge === undefined) {
-            totalDeliveryCharge = 0;
-        }
-
-        newOrder.subtotal = subtotal_amount;
-        newOrder.deliveryCharge = totalDeliveryCharge;
-        // newOrder.orderAmount = subtotal_amount - (newOrder.discount || 0) + totalDeliveryCharge;
-
-        let discountedAmount = 0
-        if (findCoupon) {
-            discountedAmount = subtotal_amount * (parseFloat(findCoupon?.percent) * 0.01);
-            discountedAmount = parseFloat(discountedAmount.toFixed(2));
-            if (discountedAmount >= findCoupon?.value) {
-                discountedAmount = parseFloat(findCoupon?.value);
-            }
-        }
-
-        newOrder.discount = discountedAmount;
-        newOrder.orderAmount = (subtotal_amount - (discountedAmount || 0) + totalDeliveryCharge).toFixed(2);
-
-        console.log("discount", subtotal_amount - (discountedAmount || 0));
-        console.log("orderAmount", newOrder.orderAmount, deliveryCharge);
-
-        // 1️⃣ Create Razorpay Order
-        const razorpay = await razorpayConfig();
-
-        const razorpayOrder = await razorpay.orders.create({
-            amount: newOrder?.orderAmount * 100, // in paise
-            currency: 'INR',
-            receipt: `rcpt_${uuidv4().split('-')[0]}`,
-            payment_capture: 1
-        });
-
-
-        await session.withTransaction(async () => {
-
-            newOrder.razorpayOrderId = razorpayOrder.id;
-            await newOrder.save({ session });
-
-            //deduct stock and create logs
-            const stockEntries = [];
-
-            for (const item of newOrder.items) {
-
-                const qty = Math.floor(Number(item.quantity));
-
-                const variantKey = String(item.variantName || "").trim();
-
-                const variantResult = await Variant.findOneAndUpdate(
-                    {
-                        productId: item.productId._id,
-                        name: variantKey,
-                        active: true,
-                        totalStock: { $gte: qty },
-                        availableStock: { $gte: qty }
-                    },
-                    {
-                        $inc: {
-                            totalStock: -qty,
-                            availableStock: -qty
-                        }
-                    },
-                    { new: true, session }
-                );
-
-                if (!variantResult) {
-                    throw new ApiError(
-                        409,
-                        `Insufficient stock for variant ${variantKey}`
-                    );
-                }
-
-                const productResult = await Product.findOneAndUpdate(
-                    {
-                        _id: item.productId._id,
-                        totalStock: { $gte: qty },
-                        availableStock: { $gte: qty }
-                    },
-                    {
-                        $inc: {
-                            totalStock: -qty,
-                            availableStock: -qty
-                        }
-                    },
-                    { new: true, session }
-                );
-
-                if (!productResult) {
-                    throw new ApiError(
-                        409,
-                        `Insufficient stock for parent product of variant ${variantKey}`
-                    );
-                }
-
-                const updatedStock = variantResult.totalStock;
-                const previousStock = updatedStock + qty;
-
-                stockEntries.push({
-                    type: STOCK_TYPES.PURCHASE,
-                    orderId: newOrder.orderId,
-                    orderRef: newOrder?._id,
-                    variantName: variantKey,
-                    purchasePrice: item.purchasePrice || 0,
-                    quantity: qty,
-                    previousStock,
-                    updatedStock,
-                    productId: item.productId._id
-                });
-            }
-
-            //save stock ids in order for verify payment
-            const createdStocks = await Stock.insertMany(stockEntries, { session });
-            newOrder.stockIds = createdStocks.map(s => s._id);
-
-            await newOrder.save({ session });
-
-            // Create new cart, update user with new cart and delete old cart
-            const newCart = new Cart({
-                userId: cart.userId,
-                items: cart.items,
-                totalCartValue: cart.totalCartValue
-            });
-            // console.log("New Cart:", newCart);
-
-            await newCart.save({ session, timestamps: false });
-
-            await User.findByIdAndUpdate(
-                cart.userId,
-                { cart: newCart._id },
-                { new: true, session }
-            );
-
-            // Deleting Old Cart
-            await Cart.findByIdAndDelete(cart._id, { session });
-        })
-
-        const updatedUser = await User.findById(cart.userId).select('-password -refreshToken')
-            .populate({
-                path: "cart",
-                populate: {
-                    path: "items.productId",
-                    model: "Product",
-                    populate: {
-                        path: "category",  // This is the key part
-                        model: "SubCategory"
-                    }
-                }
-            })
-            .populate("wishlist")
-            .populate("address")
-            .populate("orders")
-            .exec();
-
-        return res.status(201).json(
-            new ApiResponse(201, {
-                razorpayOrderId: razorpayOrder.id,
-                amount: razorpayOrder.amount,
-                currency: razorpayOrder.currency,
-                key: process.env.RAZORPAY_KEY_ID,
-                newOrderId: newOrder._id,
-                user: updatedUser
-            }, 'Razorpay Order Created')
-        );
-
-    } catch (err) {
-        console.error('createOnlineOrder error:', err);
-        return res.status(500).json({ message: err.message || 'Internal server error' });
-    } finally {
-        session.endSession();
-    }
-});
-
-const verifyPayment = async (req, res) => {
-    const session = await mongoose.startSession();
-    console.log("Verify order called");
-    try {
-        const {
-            razorpay_order_id,
-            razorpay_payment_id,
-            razorpay_signature,
-            orderId: dbOrderId
-        } = req.body;
-
-        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-            throw new ApiError(400, 'Payment verification details missing.');
-        }
-
-        // 1️⃣ Verify Signature
-        const generatedSignature = crypto
-            .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
-            .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-            .digest('hex');
-
-        const isValid = generatedSignature === razorpay_signature;
-
-        if (!isValid) {
-            return res.status(400).json(new ApiResponse(400, null, 'Invalid signature'));
-        }
-
-        let updatedUser = null;
-        let finalOrder = null;
-
-        // Use a transaction to make the whole operation atomic
-        await session.withTransaction(async () => {
-            // Try to find the order by razorpayOrderId first (safer)
-            let order = await Order.findOne({ razorpayOrderId: razorpay_order_id })
-                .session(session)
-                .populate('items.productId');
-
-            // Fallback: if not found, try by DB id (legacy / client-sent id)
-            if (!order && dbOrderId) {
-                order = await Order.findById(dbOrderId)
-                    .session(session)
-                    .populate('items.productId');
-            }
-
-            if (!order) {
-                throw new ApiError(404, 'Order not found for this payment.');
-            }
-
-            // Atomic Lock / Idempotency Check: Mark order as Paid using findOneAndUpdate to prevent concurrent duplicate runs
-            const lockedOrder = await Order.findOneAndUpdate(
-                { _id: order._id, paymentStatus: { $ne: 'Paid' } },
-                { $set: { paymentStatus: 'Paid' } },
-                { session, new: true }
-            );
-
-            if (!lockedOrder) {
-                console.log(`Order ${order._id} already marked Paid. Skipping duplicate execution in verifyPayment.`);
-
-                finalOrder = await Order.findById(order._id).session(session).populate('items.productId');
-                updatedUser = await User.findById(order.userId)
-                    .session(session)
-                    .select('-password -refreshToken')
-                    .populate({
-                        path: "cart",
-                        populate: {
-                            path: "items.productId",
-                            model: "Product",
-                            populate: {
-                                path: "category",
-                                model: "SubCategory"
-                            }
-                        }
-                    })
-                    .populate("wishlist")
-                    .populate("address")
-                    .populate("orders")
-                    .exec();
-                return;
-            }
-
-            order = lockedOrder;
-
-            if (order?.coupon) {
-                let foundCoupon = await Coupon.findById(order?.coupon);
-                // if (!foundCoupon) {
-                //     throw new Error(404, "Coupon not found");
-                // }
-                if (foundCoupon?.type == "oneTime" || foundCoupon?.type == "oneTimeUser") {
-                    foundCoupon.appliedBy = [
-                        ...foundCoupon?.appliedBy,
-                        {
-                            user: req?.user?._id,
-                            order: order?._id
-                        }
-                    ]
-                    await foundCoupon.save({ session })
-                }
-
-            }
-
-            // Update order metadata
-            order.abondonedOrder = false;
-            order.razorpayOrderId = razorpay_order_id;
-            order.razorpayPaymentId = razorpay_payment_id;
-            order.orderState = "Confirmed";
-
-            // Next orderId generation (if you use sequential readable order ids)
-            const nextOrderId = await Order.generateNextOrderId();
-            order.orderId = nextOrderId;
-
-            // Replace the new orderid in all associated stock entries
-            const stockIds = order.stockIds || [];
-            if (stockIds?.length > 0) {
-
-                await Stock.updateMany(
-                    { _id: { $in: stockIds } },
-                    { $set: { orderId: order.orderId } },
-                    { session }
-                );
-            }
-
-            // Validate quantities and decrement stock atomically
-            const uniqueProductIds = [
-                ...new Set(order.items.map(it => it.productId._id.toString()))
-            ];
-
-            // Link products -> orders
-            await Product.updateMany(
-                { _id: { $in: uniqueProductIds } },
-                { $push: { orders: order._id } },
-                { session }
-            );
-
-            // Clear the user's cart atomically (if cart exists)
-            const cart = await Cart.findById(req?.user?.cart).session(session);
-            if (cart) {
-                cart.items = [];
-                cart.totalCartValue = 0;
-                await cart.save({ session });
-            }
-
-            // Save order
-            await order.save({ session });
-
-            // push order into user's orders array and populate updatedUser
-            updatedUser = await User.findByIdAndUpdate(
-                order.userId,
-                { $push: { orders: order._id } },
-                { new: true, session }
-            )
-                .select('-password -refreshToken')
-                .populate({
-                    path: "cart",
-                    populate: {
-                        path: "items.productId",
-                        model: "Product",
-                        populate: {
-                            path: "category",
-                            model: "SubCategory"
-                        }
-                    }
-                })
-                .populate("wishlist")
-                .populate("address")
-                .populate("orders")
-                .exec();
-
-            finalOrder = order;
-        });
-
-        // If we get here, transaction committed
-        return res.status(200).json(
-            new ApiResponse(200, { order: finalOrder, user: updatedUser }, "Payment Verified. Order Completed")
-        );
-
-    } catch (err) {
-        console.error('verifyPayment error:', err);
-        // If it's an ApiError it probably already has useful status, but fallback to 500
-        const status = err.statusCode || 500;
-        return res.status(status).json({ message: err.message || 'Internal server error' });
-    } finally {
-        session.endSession();
-    }
-};
+// const createOnlineOrder = asyncHandler(async (req, res) => {
+//     const session = await mongoose.startSession();
+
+//     try {
+//         let {
+//             userId, cartId,
+//             name, email, phoneNo,
+//             orderAmount,
+//             coupon,
+//             comments,
+//             discount,
+//             deliveryCharge = 0,
+//             gst,
+//             subtotal,
+//             address,
+//             addressId,
+//             isAppOrder
+//         } = req.body;
+
+//         // ── 1. Coupon validation ─────────────────────────────────────────────
+//         let couponData = {};
+//         let findCoupon = null;
+
+//         if (coupon) {
+//             findCoupon = await Coupon.findById(coupon);
+//             if (!findCoupon) throw new ApiError(404, "Coupon not found");
+
+//             const start = new Date(findCoupon?.startDate);
+//             const end   = new Date(findCoupon?.endDate);
+//             const now   = Date.now();
+
+//             if (start.getTime() > now) throw new ApiError(400, "Offer not started yet");
+//             if (end.getTime() < now)   throw new ApiError(400, "Coupon expired");
+
+//             if (findCoupon?.type === "oneTimeUser") {
+//                 if (!findCoupon.userId || findCoupon.userId.toString() !== req.user?._id?.toString())
+//                     throw new ApiError(400, "Invalid Coupon");
+//                 if (findCoupon.appliedBy?.some(c => c?.user?.toString() === req.user?._id?.toString()))
+//                     throw new ApiError(400, "Coupon already redeemed once");
+//             }
+//             if (findCoupon?.type === "oneTime" && findCoupon.appliedBy?.some(c => c?.user?.toString() === req.user?._id?.toString()))
+//                 throw new ApiError(400, "Coupon already redeemed once");
+
+//             couponData = {
+//                 coupon: findCoupon._id,
+//                 couponType: findCoupon.type,
+//                 couponCode: findCoupon.code
+//             };
+//         }
+
+//         // ── 2. Validate required inputs ──────────────────────────────────────
+//         userId = req?.user?._id;
+//         cartId = req?.user?.cart;
+
+//         if (!userId || !name || !phoneNo || !cartId || !addressId) {
+//             throw new ApiError(400, "Required order details missing.");
+//         }
+
+//         // ── 3. Load cart and address ─────────────────────────────────────────
+//         const cart = await Cart.findById(cartId).populate("items.productId");
+//         if (!cart || cart.items.length === 0) {
+//             throw new ApiError(400, "Cart is empty or not found.");
+//         }
+
+//         const foundAddress = await Address.findById(addressId);
+//         if (!foundAddress) throw new ApiError(404, "Address not found.");
+
+//         const addressDetails = {
+//             address: `${foundAddress?.street || ""}, ${foundAddress?.street2 || ""}, ${foundAddress?.city || ""}, ${foundAddress?.state || ""}, ${foundAddress?.pinCode || ""}`,
+//             address2: foundAddress?.street2 || "",
+//             city: foundAddress?.city || "",
+//             state: foundAddress?.state || "",
+//             country: foundAddress?.country || "India",
+//             pincode: foundAddress?.pinCode || "",
+//             latitude: foundAddress?.latitude || null,
+//             longitude: foundAddress?.longitude || null
+//         };
+
+//         // ── 4. Fetch minOrderLimit ────────────────────────────────────────────
+//         const companySettings = await CompanyDetails.findOne().select("minOrderLimit").lean();
+//         const minOrderLimit = companySettings?.minOrderLimit ?? 0;
+
+//         // ── 5. Pre-transaction recalculation loop (slab pricing + totals) ────
+//         //      Validates stock availability WITHOUT locking yet.
+//         let subtotal_amount = 0;
+//         const categoryCharges = new Map();
+
+//         // Build per-product total qty map (for slab matching across same product)
+//         const productQtyMap = new Map();
+//         for (const item of cart.items) {
+//             const prodId = String(item.productId._id);
+//             productQtyMap.set(prodId, (productQtyMap.get(prodId) || 0) + (item.quantity || 0));
+//         }
+
+//         // Validate stock and compute slab prices (read-only, pre-transaction)
+//         for (const item of cart.items) {
+//             const qty = Math.floor(Number(item.quantity));
+//             if (qty <= 0) continue;
+
+//             const variantKey = String(item.variantName || "").trim();
+
+//             // Read-only variant stock check (actual atomic deduct is inside transaction)
+//             const variant = await Variant.findOne({ _id: item.variantId, active: true });
+//             if (!variant || variant.availableStock < qty) {
+//                 throw new ApiError(409, `Insufficient stock for variant "${variantKey}"`);
+//             }
+
+//             const prod = await Product.findById(item.productId._id).populate("category");
+//             if (!prod) throw new ApiError(404, `Product not found: ${item.productId._id}`);
+
+//             // Slab pricing — determineSlabForQuantity(product, totalProductQty)
+//             const totalProductQty = productQtyMap.get(String(item.productId._id)) || qty;
+//             const matchedSlab = determineSlabForQuantity(prod, totalProductQty);
+//             const slabPrice = matchedSlab ? matchedSlab.price : (prod.basePrice || 0);
+
+//             // Sync discount against new slab price
+//             const { discount: itemDiscount, discountPercent: itemDiscountPercent, discountType } =
+//                 syncItemDiscount(item.discount || 0, item.discountPercent || 0, slabPrice, item.discountType || "flat");
+
+//             // Mutate cart item for use inside transaction
+//             item._slabPrice = slabPrice;
+//             item._appliedSlab = matchedSlab ? { quantity: matchedSlab.quantity, price: matchedSlab.price } : undefined;
+//             item._itemDiscount = itemDiscount;
+//             item._itemDiscountPercent = itemDiscountPercent;
+//             item._discountType = discountType;
+
+//             subtotal_amount += (slabPrice - itemDiscount) * qty;
+
+//             if (prod.category) {
+//                 const categoryId = prod.category._id.toString();
+//                 const catDelivery = prod.category.deliveryCharge || 0;
+//                 if (catDelivery > 0 && !categoryCharges.has(categoryId)) {
+//                     categoryCharges.set(categoryId, catDelivery);
+//                 }
+//             }
+//         }
+
+//         let totalDeliveryCharge = categoryCharges.size > 0
+//             ? Math.max(...Array.from(categoryCharges.values()))
+//             : 0;
+//         if (!isFinite(totalDeliveryCharge)) totalDeliveryCharge = 0;
+
+//         // Coupon discount
+//         let couponDiscount = 0;
+//         if (findCoupon) {
+//             couponDiscount = subtotal_amount * (parseFloat(findCoupon.percent) * 0.01);
+//             couponDiscount = parseFloat(couponDiscount.toFixed(2));
+//             if (couponDiscount >= findCoupon.value) {
+//                 couponDiscount = parseFloat(String(findCoupon.value));
+//             }
+//         }
+
+//         const finalOrderAmount = parseFloat((Math.max(0, subtotal_amount - couponDiscount) + totalDeliveryCharge).toFixed(2));
+
+//         // ── 6. Enforce minOrderLimit ──────────────────────────────────────────
+//         if (minOrderLimit > 0 && subtotal_amount < minOrderLimit) {
+//             throw new ApiError(400, `Order must be minimum ₹${minOrderLimit}.`);
+//         }
+
+//         // ── 7. Create Razorpay order ──────────────────────────────────────────
+//         const razorpay = razorpayConfig();
+//         const razorpayOrder = await razorpay.orders.create({
+//             amount: Math.round(finalOrderAmount * 100), // in paise
+//             currency: "INR",
+//             receipt: `rcpt_${uuidv4().split("-")[0]}`,
+//             payment_capture: 1
+//         });
+
+//         // ── 8. Atomic transaction ─────────────────────────────────────────────
+//         let newOrder;
+//         let newPayment;
+
+//         await session.withTransaction(async () => {
+//             const tempOrderId = uuidv4().split("-")[0].toUpperCase();
+
+//             newOrder = new Order({
+//                 gateway: "razorpay",
+//                 ...couponData,
+//                 ...addressDetails,
+//                 userId,
+//                 name: name.trim(),
+//                 email: email?.trim() || "",
+//                 phoneNo: phoneNo.trim(),
+//                 comments: comments || "",
+//                 addressId,
+//                 method: "Online",
+//                 type: "Regular",
+//                 status: "New",
+//                 paymentStatus: "Pending",
+//                 paymentDate: new Date(),
+//                 isAppOrder: isAppOrder || false,
+//                 orderState: "Reserved",
+//                 abondonedOrder: true,
+//                 orderId: tempOrderId,
+//                 razorpayOrderId: razorpayOrder.id,
+//                 subtotal: parseFloat(subtotal_amount.toFixed(2)),
+//                 discount: couponDiscount,
+//                 deliveryCharge: totalDeliveryCharge,
+//                 orderAmount: finalOrderAmount,
+//                 gst: gst || "",
+//                 items: cart.items
+//             });
+
+//             await newOrder.save({ session });
+
+//             const stockEntries = [];
+
+//             // ── 8b. Per-item stock loop ───────────────────────────────────────
+//             for (const item of newOrder.items) {
+//                 const qty = Math.floor(Number(item.quantity));
+//                 if (qty <= 0) continue;
+
+//                 const variantKey = String(item.variantName || "").trim();
+
+//                 // Atomic availableStock + totalStock deduct
+//                 const variant = await Variant.findOneAndUpdate(
+//                     {
+//                         _id: item.variantId,
+//                         active: true,
+//                         availableStock: { $gte: qty }
+//                     },
+//                     { $inc: { availableStock: -qty, totalStock: -qty } },
+//                     { new: true, session }
+//                 );
+
+//                 if (!variant) {
+//                     throw new ApiError(409, `Insufficient stock for variant "${variantKey}". Please refresh your cart.`);
+//                 }
+
+//                 const previousAvailableStock = variant.availableStock + qty;
+//                 const previousTotalStock     = variant.totalStock + qty;
+
+//                 // FIFO purchaseSet allocation (inline — same as createQuotation lines 157-196)
+//                 let remaining = qty;
+//                 const sortedSets = variant.purchaseSets
+//                     .map((set, idx) => ({ set, idx }))
+//                     .filter(entry => entry.set.availableStock > 0)
+//                     .sort((a, b) => a.set.price - b.set.price);
+
+//                 let selectedSetId = "";
+//                 let totalCost    = 0;
+//                 const allocatedSets = [];
+
+//                 for (const entry of sortedSets) {
+//                     if (remaining <= 0) break;
+//                     const set  = variant.purchaseSets[entry.idx];
+//                     const take = Math.min(remaining, set.availableStock);
+//                     set.availableStock  -= take;
+//                     set.remainingStock   = Math.max(0, (set.remainingStock || 0) - take);
+//                     totalCost           += take * set.price;
+//                     allocatedSets.push({ purchaseSetId: String(set._id), quantity: take, price: set.price });
+//                     if (!selectedSetId && take > 0) selectedSetId = String(set._id);
+//                     remaining -= take;
+//                 }
+
+//                 // Fallback if purchaseSets are exhausted but variant still has totalStock
+//                 if (remaining > 0 && variant.purchaseSets.length > 0) {
+//                     const fallback = variant.purchaseSets[0];
+//                     fallback.availableStock  = Math.max(0, fallback.availableStock - remaining);
+//                     fallback.remainingStock  = Math.max(0, (fallback.remainingStock || 0) - remaining);
+//                     totalCost += remaining * fallback.price;
+//                     allocatedSets.push({ purchaseSetId: String(fallback._id), quantity: remaining, price: fallback.price });
+//                     if (!selectedSetId) selectedSetId = String(fallback._id);
+//                     remaining = 0;
+//                 }
+
+//                 const avgPurchasePrice = qty > 0 ? parseFloat((totalCost / qty).toFixed(3)) : 0;
+
+//                 await variant.save({ session });
+
+//                 // Product-level stock deduct
+//                 await Product.findByIdAndUpdate(
+//                     item.productId,
+//                     { $inc: { availableStock: -qty, totalStock: -qty } },
+//                     { session }
+//                 );
+
+//                 // Inventory: increment reservedStock
+//                 const productId = item.productId._id || item.productId;
+//                 const inventory = await Inventory.findOne({ product: productId }).session(session);
+//                 if (inventory) {
+//                     inventory.reservedStock += qty;
+//                     await inventory.save({ session });
+//                 } else {
+//                     await Inventory.create([{
+//                         product: productId,
+//                         physicalStock: variant.totalStock + qty,
+//                         reservedStock: qty,
+//                         version: 0
+//                     }], { session });
+//                 }
+
+//                 // Sync slab + purchase fields onto order item
+//                 item.price            = item._slabPrice ?? item.price;
+//                 item.appliedSlab      = item._appliedSlab;
+//                 item.discount         = item._itemDiscount ?? item.discount ?? 0;
+//                 item.discountPercent  = item._itemDiscountPercent ?? item.discountPercent ?? 0;
+//                 item.discountType     = item._discountType ?? item.discountType ?? "flat";
+//                 item.purchasePrice    = avgPurchasePrice;
+//                 item.purchaseSetId    = selectedSetId;
+//                 item.purchaseSets     = allocatedSets;
+//                 item.variantId        = variant._id;
+//                 item.sku              = String(variant._id);
+
+//                 stockEntries.push({
+//                     type:                 STOCK_TYPES.RESERVED,
+//                     category:             "physical",
+//                     orderId:              tempOrderId,
+//                     orderRef:             newOrder._id,
+//                     variantId:            variant._id,
+//                     variantName:          variant.name,
+//                     purchasePrice:        avgPurchasePrice,
+//                     sellingPrice:         (item.price || 0) - (item.discount || 0),
+//                     quantity:             qty,
+//                     previousStock:        previousAvailableStock,
+//                     updatedStock:         variant.availableStock,
+//                     previousPhysicalStock: previousTotalStock,
+//                     updatedPhysicalStock:  variant.totalStock,
+//                     productId
+//                 });
+//             }
+
+//             // ── 8c. Insert stock logs, link IDs ──────────────────────────────
+//             if (stockEntries.length > 0) {
+//                 const insertedLogs = await Stock.insertMany(stockEntries, { session });
+//                 // Link per-item stockIds by variantId
+//                 for (const item of newOrder.items) {
+//                     const matched = insertedLogs.filter(log =>
+//                         log.variantId && item.variantId &&
+//                         String(log.variantId) === String(item.variantId)
+//                     );
+//                     item.stockIds = matched.map(l => l._id);
+//                 }
+//                 // Also store all stockIds on order top-level for easy lookup in verifyPayment
+//                 newOrder.stockIds = insertedLogs.map(l => l._id);
+//             }
+
+//             await newOrder.save({ session });
+
+//             // ── 8d. Create Payment record (Pending) ───────────────────────────
+//             const isCouponApplied = !!(newOrder.couponCode || newOrder.coupon);
+//             const couponApplied   = isCouponApplied ? (newOrder.discount || 0) : 0;
+//             const discountApplied = isCouponApplied ? 0 : 0; // no item-level discount on Buy Now
+
+//             const [payment] = await Payment.create([{
+//                 orderId:         tempOrderId,
+//                 orderRef:        newOrder._id,
+//                 userId:          newOrder.userId,
+//                 amount:          finalOrderAmount,
+//                 subtotal:        parseFloat(subtotal_amount.toFixed(2)),
+//                 discount:        discountApplied,
+//                 coupon:          couponApplied,
+//                 couponId:        newOrder.coupon || undefined,
+//                 method:          "Online",
+//                 status:          "Pending",
+//                 razorpayOrderId: razorpayOrder.id,
+//                 notes:           "Auto-created on Buy Now checkout"
+//             }], { session });
+//             newPayment = payment;
+
+//             // ── 8e. Cart copy (anti-abandoned) ────────────────────────────────
+//             const newCart = new Cart({
+//                 userId: cart.userId,
+//                 items:  cart.items,
+//                 totalCartValue: cart.totalCartValue
+//             });
+//             await newCart.save({ session, timestamps: false });
+
+//             await User.findByIdAndUpdate(
+//                 cart.userId,
+//                 { cart: newCart._id },
+//                 { new: true, session }
+//             );
+
+//             await Cart.findByIdAndDelete(cart._id, { session });
+//         });
+
+//         // ── 9. Fetch updated user and return ─────────────────────────────────
+//         const updatedUser = await User.findById(cart.userId)
+//             .select("-password -refreshToken")
+//             .populate({
+//                 path: "cart",
+//                 populate: {
+//                     path: "items.productId",
+//                     model: "Product",
+//                     populate: { path: "category", model: "SubCategory" }
+//                 }
+//             })
+//             .populate("wishlist")
+//             .populate("address")
+//             .populate("orders")
+//             .exec();
+
+//         return res.status(201).json(
+//             new ApiResponse(201, {
+//                 razorpayOrderId: razorpayOrder.id,
+//                 amount: razorpayOrder.amount,
+//                 currency: razorpayOrder.currency,
+//                 key: process.env.RAZORPAY_KEY_ID,
+//                 newOrderId: newOrder._id,
+//                 paymentId: newPayment._id,
+//                 user: updatedUser
+//             }, "Razorpay Order Created")
+//         );
+
+//     } catch (err) {
+//         console.error("createOnlineOrder error:", err);
+//         return res.status(err.statusCode || 500).json({ message: err.message || "Internal server error" });
+//     } finally {
+//         session.endSession();
+//     }
+// });
+
+
+// const verifyPayment = async (req, res) => {
+//     const session = await mongoose.startSession();
+//     console.log("Verify order called");
+//     try {
+//         const {
+//             razorpay_order_id,
+//             razorpay_payment_id,
+//             razorpay_signature,
+//             orderId: dbOrderId
+//         } = req.body;
+
+//         if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
+//             throw new ApiError(400, 'Payment verification details missing.');
+//         }
+
+//         // 1️⃣ Verify Signature
+//         const generatedSignature = crypto
+//             .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+//             .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+//             .digest('hex');
+
+//         const isValid = generatedSignature === razorpay_signature;
+
+//         if (!isValid) {
+//             return res.status(400).json(new ApiResponse(400, null, 'Invalid signature'));
+//         }
+
+//         let updatedUser = null;
+//         let finalOrder = null;
+
+//         await session.withTransaction(async () => {
+//             let order = await Order.findOne({ razorpayOrderId: razorpay_order_id })
+//                 .session(session)
+//                 .populate('items.productId');
+
+//             if (!order && dbOrderId) {
+//                 order = await Order.findById(dbOrderId)
+//                     .session(session)
+//                     .populate('items.productId');
+//             }
+
+//             if (!order) {
+//                 throw new ApiError(404, 'Order not found for this payment.');
+//             }
+
+//             // Atomic Lock / Idempotency Check: Mark order as Paid using findOneAndUpdate to prevent concurrent duplicate runs
+//             const lockedOrder = await Order.findOneAndUpdate(
+//                 { _id: order._id, paymentStatus: { $ne: 'Paid' } },
+//                 { $set: { paymentStatus: 'Paid' } },
+//                 { session, new: true }
+//             );
+
+//             if (!lockedOrder) {
+//                 console.log(`Order ${order._id} already marked Paid. Skipping duplicate execution in verifyPayment.`);
+
+//                 finalOrder = await Order.findById(order._id).session(session).populate('items.productId');
+//                 updatedUser = await User.findById(order.userId)
+//                     .session(session)
+//                     .select('-password -refreshToken')
+//                     .populate({
+//                         path: "cart",
+//                         populate: {
+//                             path: "items.productId",
+//                             model: "Product",
+//                             populate: { path: "category", model: "SubCategory" }
+//                         }
+//                     })
+//                     .populate("wishlist")
+//                     .populate("address")
+//                     .populate("orders")
+//                     .exec();
+//                 return;
+//             }
+
+//             order = lockedOrder;
+
+//             if (order?.coupon) {
+//                 let foundCoupon = await Coupon.findById(order?.coupon).session(session);
+//                 if (foundCoupon?.type === "oneTime" || foundCoupon?.type === "oneTimeUser") {
+//                     const userIdStr = req?.user?._id || order.userId;
+//                     const alreadyLogged = foundCoupon.appliedBy?.some(
+//                         c => c?.user?.toString() === userIdStr?.toString() && c?.order?.toString() === order?._id?.toString()
+//                     );
+//                     if (!alreadyLogged) {
+//                         foundCoupon.appliedBy = [
+//                             ...(foundCoupon?.appliedBy || []),
+//                             {
+//                                 user: userIdStr,
+//                                 order: order?._id
+//                             }
+//                         ];
+//                         await foundCoupon.save({ session });
+//                     }
+//                 }
+//             }
+
+//             // Generate sequential orderId from the counter
+//             const nextOrderId = await Order.generateNextOrderId();
+//             order.orderId = nextOrderId;
+
+//             // Update associated stock logs: type to PURCHASE and set sequential orderId
+//             const stockIds = order.stockIds || [];
+//             if (stockIds?.length > 0) {
+//                 await Stock.updateMany(
+//                     { _id: { $in: stockIds } },
+//                     { $set: { orderId: order.orderId, type: STOCK_TYPES.PURCHASE } },
+//                     { session }
+//                 );
+//             }
+
+//             // Release inventory reservation (reservedStock -= qty)
+//             for (const item of order.items) {
+//                 const productId = item.productId._id || item.productId;
+//                 const inv = await Inventory.findOne({ product: productId }).session(session);
+//                 if (inv) {
+//                     inv.reservedStock = Math.max(0, inv.reservedStock - item.quantity);
+//                     await inv.save({ session });
+//                 }
+//             }
+
+//             // Update the Pending Payment record to Paid
+//             await Payment.findOneAndUpdate(
+//                 { orderRef: order._id, status: "Pending" },
+//                 {
+//                     $set: {
+//                         status: "Paid",
+//                         paidAt: new Date(),
+//                         orderId: order.orderId,
+//                         razorpayPaymentId: razorpay_payment_id,
+//                         notes: `Paid via Razorpay. Payment ID: ${razorpay_payment_id}`
+//                     }
+//                 },
+//                 { session }
+//             );
+
+//             // Update order metadata
+//             order.abondonedOrder = false;
+//             order.razorpayOrderId = razorpay_order_id;
+//             order.razorpayPaymentId = razorpay_payment_id;
+//             order.orderState = "Confirmed";
+//             order.amountPaid = order.orderAmount;
+//             order.remainingAmount = 0;
+
+//             // Link products -> orders
+//             const uniqueProductIds = [
+//                 ...new Set(order.items.map(it => String(it.productId._id || it.productId)))
+//             ];
+//             await Product.updateMany(
+//                 { _id: { $in: uniqueProductIds } },
+//                 { $push: { orders: order._id } },
+//                 { session }
+//             );
+
+//             // Clear the user's cart atomically (if cart exists)
+//             const cart = await Cart.findById(req?.user?.cart || order.userId?.cart).session(session);
+//             if (cart) {
+//                 cart.items = [];
+//                 cart.totalCartValue = 0;
+//                 await cart.save({ session });
+//             }
+
+//             // Save order
+//             await order.save({ session });
+
+//             // Push order into user's orders array
+//             updatedUser = await User.findByIdAndUpdate(
+//                 order.userId,
+//                 { $push: { orders: order._id } },
+//                 { new: true, session }
+//             )
+//                 .select('-password -refreshToken')
+//                 .populate({
+//                     path: "cart",
+//                     populate: {
+//                         path: "items.productId",
+//                         model: "Product",
+//                         populate: { path: "category", model: "SubCategory" }
+//                     }
+//                 })
+//                 .populate("wishlist")
+//                 .populate("address")
+//                 .populate("orders")
+//                 .exec();
+
+//             finalOrder = order;
+//         });
+
+//         return res.status(200).json(
+//             new ApiResponse(200, { order: finalOrder, user: updatedUser }, "Payment Verified. Order Completed")
+//         );
+
+//     } catch (err) {
+//         console.error('verifyPayment error:', err);
+//         const status = err.statusCode || 500;
+//         return res.status(status).json({ message: err.message || 'Internal server error' });
+//     } finally {
+//         session.endSession();
+//     }
+// };
 
 // const createOnlineOrder = asyncHandler(async (req, res) => {
 //     const session = await mongoose.startSession();

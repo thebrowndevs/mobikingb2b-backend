@@ -6,6 +6,8 @@ import { Product } from "../models/product.model.js";
 import { Cart } from "../models/cart.model.js";
 import { User } from "../models/user.model.js";
 import { Payment } from "../models/payment.model.js";
+import { ApiError } from "../utils/ApiError.js";
+import { STOCK_TYPES } from "../constants.js";
 
 /**
  * Shared transaction logic to finalize and confirm a paid order.
@@ -112,46 +114,456 @@ export const confirmOrderPaymentLogic = async (orderId, razorpayOrderId, razorpa
     return order;
 };
 
-export const confirmPaymentRecordPaidLogic = async (paymentId, razorpayPaymentId, session) => {
-    let payment = await Payment.findById(paymentId).session(session);
-    if (!payment) {
-        throw new Error(`Payment record not found: ${paymentId}`);
-    }
+export const confirmPaymentRecordPaidLogic =
+    async (
+        paymentId,
+        razorpayPaymentId,
+        session
+    ) => {
+        if (!paymentId) {
+            throw new ApiError(
+                400,
+                "Payment ID is required."
+            );
+        }
 
-    if (payment.status === "Paid") {
-        console.log(`Payment record ${paymentId} already marked Paid.`);
-        const order = await Order.findById(payment.orderRef).session(session);
-        return { payment, order };
-    }
+        /*
+         * Load exact internal Payment record.
+         */
+        const payment =
+            await Payment.findById(
+                paymentId
+            ).session(session);
 
-    payment.status = "Paid";
-    payment.paidAt = new Date();
-    if (razorpayPaymentId) {
-        payment.paymentId = razorpayPaymentId;
-        payment.razorpayPaymentId = razorpayPaymentId;
-    }
-    await payment.save({ session });
+        if (!payment) {
+            throw new ApiError(
+                404,
+                `Payment record not found: ${paymentId}`
+            );
+        }
 
-    const order = await Order.findById(payment.orderRef).session(session);
-    if (!order) {
-        throw new Error(`Order not found for payment: ${payment.orderRef}`);
-    }
+        /*
+         * Already Paid:
+         * only allow an idempotent retry using the same
+         * Razorpay payment ID.
+         */
+        if (
+            payment.status ===
+            "Paid"
+        ) {
+            if (
+                razorpayPaymentId &&
+                payment.razorpayPaymentId &&
+                String(
+                    payment.razorpayPaymentId
+                ) !==
+                String(
+                    razorpayPaymentId
+                )
+            ) {
+                throw new ApiError(
+                    409,
+                    "Payment is already Paid with a different Razorpay payment ID."
+                );
+            }
 
-    const allPayments = await Payment.find({ orderRef: order._id, status: "Paid" }).session(session);
-    const totalPaid = allPayments.reduce((sum, p) => sum + p.amount, 0);
+            const order =
+                await Order.findById(
+                    payment.orderRef
+                ).session(
+                    session
+                );
 
-    order.amountPaid = totalPaid;
-    order.remainingAmount = Math.max(0, order.orderAmount - totalPaid);
+            if (!order) {
+                throw new ApiError(
+                    404,
+                    "Order not found for payment."
+                );
+            }
 
-    if (order.remainingAmount <= 0) {
-        order.paymentStatus = "Paid";
-        order.paymentDate = new Date();
-    } else {
-        order.paymentStatus = "Pending";
-    }
+            return {
+                payment,
+                order,
+                alreadyPaid:
+                    true
+            };
+        }
 
-    await order.save({ session });
+        if (
+            payment.status !==
+            "Pending"
+        ) {
+            throw new ApiError(
+                409,
+                `Payment cannot be confirmed from status "${payment.status}".`
+            );
+        }
 
-    console.log(`Payment record ${paymentId} successfully confirmed Paid. Order ${order._id} totals recalculated.`);
-    return { payment, order };
-};
+        /*
+         * Atomic Pending -> Paid claim.
+         */
+        const lockedPayment =
+            await Payment.findOneAndUpdate(
+                {
+                    _id:
+                        payment._id,
+
+                    status:
+                        "Pending"
+                },
+                {
+                    $set: {
+                        status:
+                            "Paid",
+
+                        paidAt:
+                            new Date(),
+
+                        ...(razorpayPaymentId && {
+                            paymentId:
+                                razorpayPaymentId,
+
+                            razorpayPaymentId:
+                                razorpayPaymentId
+                        })
+                    }
+                },
+                {
+                    new:
+                        true,
+                    session
+                }
+            );
+
+        if (!lockedPayment) {
+            throw new ApiError(
+                409,
+                "Payment was already processed by another request."
+            );
+        }
+
+        const order =
+            await Order.findById(
+                lockedPayment.orderRef
+            ).session(
+                session
+            );
+
+        if (!order) {
+            throw new ApiError(
+                404,
+                "Order not found for payment."
+            );
+        }
+
+        /*
+         * Confirm Razorpay order mapping.
+         */
+        if (
+            order.razorpayOrderId &&
+            lockedPayment.razorpayOrderId &&
+            String(
+                order.razorpayOrderId
+            ) !==
+            String(
+                lockedPayment.razorpayOrderId
+            )
+        ) {
+            throw new ApiError(
+                400,
+                "Payment and order Razorpay order IDs do not match."
+            );
+        }
+
+        if (
+            [
+                "Cancelled",
+                "Rejected",
+                "Returned"
+            ].includes(
+                order.status
+            )
+        ) {
+            throw new ApiError(
+                409,
+                `Cannot confirm payment for order in ${order.status} status.`
+            );
+        }
+
+        /*
+         * Recalculate amount actually paid.
+         */
+        const paidPayments =
+            await Payment.find({
+                orderRef:
+                    order._id,
+                status:
+                    "Paid"
+            }).session(
+                session
+            );
+
+        const totalPaid =
+            paidPayments.reduce(
+                (sum, p) =>
+                    sum +
+                    Number(
+                        p.amount || 0
+                    ),
+                0
+            );
+
+        const normalizedTotalPaid =
+            Number(
+                totalPaid.toFixed(2)
+            );
+
+        const orderAmount =
+            Number(
+                order.orderAmount ||
+                0
+            );
+
+        if (
+            normalizedTotalPaid >
+            orderAmount
+        ) {
+            throw new ApiError(
+                400,
+                `Total paid amount ₹${normalizedTotalPaid} exceeds order amount ₹${orderAmount}.`
+            );
+        }
+
+        order.amountPaid =
+            normalizedTotalPaid;
+
+        order.remainingAmount =
+            Math.max(
+                0,
+                Number(
+                    (
+                        orderAmount -
+                        normalizedTotalPaid
+                    ).toFixed(2)
+                )
+            );
+
+        /*
+         * Partial payment:
+         * Payment is Paid, but order remains reserved.
+         */
+        if (
+            order.remainingAmount >
+            0
+        ) {
+            order.paymentStatus =
+                "Pending";
+
+            await order.save({
+                session
+            });
+
+            return {
+                payment:
+                    lockedPayment,
+                order,
+                fullyPaid:
+                    false
+            };
+        }
+
+        /*
+         * FULLY PAID
+         *
+         * There is intentionally NO stock adjustment here.
+         *
+         * The stock was already physically removed when the
+         * online order was created.
+         */
+
+        order.abondonedOrder =
+            false;
+
+        order.paymentStatus =
+            "Paid";
+
+        order.paymentDate =
+            order.paymentDate ||
+            new Date();
+
+        order.orderState =
+            "Confirmed";
+
+        order.remainingAmount =
+            0;
+
+        if (razorpayPaymentId) {
+            order.razorpayPaymentId =
+                razorpayPaymentId;
+        }
+
+        const nextOrderId = await Order.generateNextOrderId();
+        order.orderId = nextOrderId;
+
+        /*
+         * RESERVED -> PURCHASE
+         */
+        if (
+            order.stockIds?.length >
+            0
+        ) {
+            await Stock.updateMany(
+                {
+                    _id: {
+                        $in:
+                            order.stockIds
+                    },
+
+                    orderRef:
+                        order._id,
+
+                    type:
+                        STOCK_TYPES.RESERVED
+                },
+                {
+                    $set: {
+                        type:
+                            STOCK_TYPES.PURCHASE,
+
+                        orderId:
+                            order.orderId
+                    }
+                },
+                {
+                    session
+                }
+            );
+        }
+
+        /*
+         * Link Products -> Order.
+         */
+        const uniqueProductIds =
+            [
+                ...new Set(
+                    order.items.map(
+                        item =>
+                            String(
+                                item
+                                    .productId
+                                    ?._id ||
+                                item.productId
+                            )
+                    )
+                )
+            ];
+
+        if (
+            uniqueProductIds.length >
+            0
+        ) {
+            await Product.updateMany(
+                {
+                    _id: {
+                        $in:
+                            uniqueProductIds
+                    }
+                },
+                {
+                    $addToSet: {
+                        orders:
+                            order._id
+                    }
+                },
+                {
+                    session
+                }
+            );
+        }
+
+        /*
+         * User -> Order.
+         */
+        await User.findByIdAndUpdate(
+            order.userId,
+            {
+                $addToSet: {
+                    orders:
+                        order._id
+                }
+            },
+            {
+                session
+            }
+        );
+
+        /*
+         * Clear active user cart.
+         */
+        const userObj = await User.findById(order.userId).session(session);
+        if (userObj?.cart) {
+            const activeCart = await Cart.findById(userObj.cart).session(session);
+            if (activeCart) {
+                activeCart.items = [];
+                activeCart.totalCartValue = 0;
+                await activeCart.save({ session });
+            }
+        }
+
+        await order.save({
+            session
+        });
+
+        return {
+            payment:
+                lockedPayment,
+            order,
+            fullyPaid:
+                true
+        };
+    };
+
+
+// export const confirmPaymentRecordPaidLogic = async (paymentId, razorpayPaymentId, session) => {
+//     let payment = await Payment.findById(paymentId).session(session);
+//     if (!payment) {
+//         throw new Error(`Payment record not found: ${paymentId}`);
+//     }
+
+//     if (payment.status === "Paid") {
+//         console.log(`Payment record ${paymentId} already marked Paid.`);
+//         const order = await Order.findById(payment.orderRef).session(session);
+//         return { payment, order };
+//     }
+
+//     payment.status = "Paid";
+//     payment.paidAt = new Date();
+//     if (razorpayPaymentId) {
+//         payment.paymentId = razorpayPaymentId;
+//         payment.razorpayPaymentId = razorpayPaymentId;
+//     }
+//     await payment.save({ session });
+
+//     const order = await Order.findById(payment.orderRef).session(session);
+//     if (!order) {
+//         throw new Error(`Order not found for payment: ${payment.orderRef}`);
+//     }
+
+//     const allPayments = await Payment.find({ orderRef: order._id, status: "Paid" }).session(session);
+//     const totalPaid = allPayments.reduce((sum, p) => sum + p.amount, 0);
+
+//     order.amountPaid = totalPaid;
+//     order.remainingAmount = Math.max(0, order.orderAmount - totalPaid);
+
+//     if (order.remainingAmount <= 0) {
+//         order.paymentStatus = "Paid";
+//         order.paymentDate = new Date();
+//     } else {
+//         order.paymentStatus = "Pending";
+//     }
+
+//     await order.save({ session });
+
+//     console.log(`Payment record ${paymentId} successfully confirmed Paid. Order ${order._id} totals recalculated.`);
+//     return { payment, order };
+// };

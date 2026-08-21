@@ -1,147 +1,589 @@
 import mongoose from "mongoose";
 import { Order } from "../models/order.model.js";
+import { Payment } from "../models/payment.model.js";
 import { restoreOrderStockLogic } from "../controllers/order.controller.js";
-import { confirmOrderPaymentLogic } from "../services/payment.service.js";
+import { confirmOrderPaymentLogic, confirmPaymentRecordPaidLogic } from "../services/payment.service.js";
 import { checkRazorpayOrderStatus } from "../services/razorpay.service.js";
 import { checkPhonepeOrderStatus } from "../services/phonepe.service.js";
 import { PaymentLink } from "../models/payment_link.model.js";
+import { ApiError } from "../utils/ApiError.js";
 
 /**
  * Job to find orders in 'Reserved' state for more than 15 minutes
  * with 'Pending' payment status, restore their stock, and mark them as 'Abandoned'.
  * If payment is found to have been completed on Razorpay or PhonePe, confirms the order instead.
  */
-export const restoreReservedOrders = async () => {
-    const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
-    // const fifteenMinutesAgo = new Date(Date.now() - 2 * 60 * 1000);
+// export const restoreReservedOrders = async () => {
+//     const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000);
+//     // const fifteenMinutesAgo = new Date(Date.now() - 2 * 60 * 1000);
 
-    console.log("🔍 Checking for reserved orders older than:", fifteenMinutesAgo.toISOString());
+//     console.log("🔍 Checking for reserved orders older than:", fifteenMinutesAgo.toISOString());
 
-    const session = await mongoose.startSession();
+//     const session = await mongoose.startSession();
 
-    try {
-        // Find orders: Reserved, Pending payment, Created > 15m ago, and stock not yet restored
-        const ordersToRestore = await Order.find({
-            orderState: "Reserved",
-            paymentStatus: "Pending",
-            createdAt: { $lt: fifteenMinutesAgo },
-            _restockDone: { $ne: true }
-        });
+//     try {
+//         // Find orders: Reserved, Pending payment, Created > 15m ago, and stock not yet restored
+//         const ordersToRestore = await Order.find({
+//             orderState: "Reserved",
+//             paymentStatus: "Pending",
+//             createdAt: { $lt: fifteenMinutesAgo },
+//             _restockDone: { $ne: true }
+//         });
 
-        console.log(`📦 Found ${ordersToRestore.length} orders to inspect.`);
+//         console.log(`📦 Found ${ordersToRestore.length} orders to inspect.`);
 
-        for (const order of ordersToRestore) {
+//         for (const order of ordersToRestore) {
+//             try {
+//                 let isPaid = false;
+//                 let paymentId = null;
+//                 let rawResponse = null;
+//                 let activeGateway = order.gateway;
+
+//                 // Legacy fallback if gateway is not explicitly set
+//                 if (!activeGateway) {
+//                     if (order.phonepeOrderId) {
+//                         activeGateway = "phonepe";
+//                     } else if (order.razorpayOrderId) {
+//                         activeGateway = "razorpay";
+//                     }
+//                 }
+
+//                 let utr = "";
+//                 let paymentMode = "";
+
+//                 if (activeGateway === "phonepe" && order.phonepeOrderId) {
+//                     console.log(`Checking PhonePe payment status for order: ${order.orderId} (PP ID: ${order.phonepeOrderId})`);
+//                     const ppStatus = await checkPhonepeOrderStatus(order.phonepeOrderId);
+//                     if (ppStatus.isPaid) {
+//                         isPaid = true;
+//                         paymentId = ppStatus.paymentId;
+//                         rawResponse = ppStatus.rawResponse;
+//                         utr = ppStatus.utr || "N/A";
+//                         paymentMode = ppStatus.paymentMode || "N/A";
+//                     }
+//                 } else if (activeGateway === "razorpay" && order.razorpayOrderId) {
+//                     console.log(`Checking Razorpay payment status for order: ${order.orderId} (RP ID: ${order.razorpayOrderId})`);
+//                     const rzpStatus = await checkRazorpayOrderStatus(order.razorpayOrderId);
+//                     if (rzpStatus.isPaid) {
+//                         isPaid = true;
+//                         paymentId = rzpStatus.paymentId;
+//                     }
+//                 }
+
+//                 if (isPaid) {
+//                     console.log(`💰 Order ${order.orderId} was paid on ${activeGateway}! Confirming order...`);
+//                     await session.withTransaction(async () => {
+//                         // Check if this is a payment link order
+//                         const isLinked = await PaymentLink.findOne({ orderId: order._id }).session(session);
+
+//                         if (isLinked) {
+//                             console.log(`Order ${order.orderId} is linked to a PaymentLink. Executing minimal confirmation.`);
+//                             const paymentDate = new Date();
+//                             order.abondonedOrder = false;
+//                             order.paymentStatus = 'Paid';
+//                             order.paymentDate = paymentDate;
+//                             if (activeGateway === "phonepe") {
+//                                 order.phonepePaymentId = paymentId;
+//                                 order.phonepeRawResponse = rawResponse;
+//                                 order.phonepeUtr = utr;
+//                                 order.phonepePaymentMode = paymentMode;
+//                             } else {
+//                                 order.razorpayPaymentId = paymentId;
+//                             }
+//                             await order.save({ session });
+//                         } else {
+//                             if (activeGateway === "phonepe") {
+//                                 order.phonepePaymentId = paymentId;
+//                                 order.phonepeRawResponse = rawResponse;
+//                                 order.phonepeUtr = utr;
+//                                 order.phonepePaymentMode = paymentMode;
+//                                 await order.save({ session });
+//                                 await confirmOrderPaymentLogic(
+//                                     order._id,
+//                                     null,
+//                                     null,
+//                                     session,
+//                                     order.userId
+//                                 );
+//                             } else {
+//                                 await confirmOrderPaymentLogic(
+//                                     order._id,
+//                                     order.razorpayOrderId,
+//                                     paymentId,
+//                                     session,
+//                                     order.userId
+//                                 );
+//                             }
+//                         }
+//                     });
+//                     console.log(`✅ Order ${order.orderId} confirmed successfully via cron job.`);
+//                     continue; // Skip restocking/abandoning
+//                 }
+
+//                 // If not paid (or no Razorpay ID), proceed with restocking and abandoning
+//                 console.log(`⏳ Restoring stock and abandoning order: ${order.orderId} (${order._id})`);
+//                 await session.withTransaction(async () => {
+//                     // Restore stock using the logic extracted in the controller
+//                     await restoreOrderStockLogic(order._id, session);
+
+//                     // Update order state to Abandoned and mark as such
+//                     await Order.findByIdAndUpdate(
+//                         order._id,
+//                         {
+//                             orderState: "Abandoned",
+//                             abondonedOrder: true
+//                         },
+//                         { session }
+//                     );
+//                 });
+//                 console.log(`✅ Successfully restored and abandoned order: ${order.orderId}`);
+//             } catch (error) {
+//                 console.error(`❌ Failed to process order ${order._id}:`, error.message);
+//             }
+//         }
+//     } catch (error) {
+//         console.error("❌ Error in restoreReservedOrders job:", error.message);
+//     } finally {
+//         session.endSession();
+//     }
+// };
+
+export const restoreReservedOrders =
+    async () => {
+        const fifteenMinutesAgo =
+            new Date(
+                Date.now() -
+                // 15 *
+                1 *
+                60 *
+                1000
+            );
+
+        console.log(
+            "🔍 Checking for reserved orders older than:",
+            fifteenMinutesAgo.toISOString()
+        );
+
+        /*
+         * Read candidate IDs only.
+         *
+         * The real atomic eligibility check happens inside the
+         * transaction when stock restoration claims _restockDone.
+         */
+        const ordersToRestore =
+            await Order.find(
+                {
+                    orderState:
+                        "Reserved",
+
+                    paymentStatus:
+                        "Pending",
+
+                    createdAt: {
+                        $lt:
+                            fifteenMinutesAgo
+                    },
+
+                    _restockDone:
+                    {
+                        $ne:
+                            true
+                    }
+                }
+            )
+                .select(
+                    "_id orderId gateway razorpayOrderId phonepeOrderId"
+                )
+                .lean();
+
+        console.log(
+            `📦 Found ${ordersToRestore.length} orders to inspect.`
+        );
+
+        for (
+            const candidate of
+            ordersToRestore
+        ) {
+            const session =
+                await mongoose.startSession();
+
             try {
-                let isPaid = false;
-                let paymentId = null;
-                let rawResponse = null;
-                let activeGateway = order.gateway;
+                /*
+                 * =================================================
+                 * CHECK GATEWAY STATUS OUTSIDE TRANSACTION
+                 *
+                 * External API call must not be held inside a
+                 * MongoDB transaction.
+                 * =================================================
+                 */
+                let isPaid =
+                    false;
 
-                // Legacy fallback if gateway is not explicitly set
-                if (!activeGateway) {
-                    if (order.phonepeOrderId) {
-                        activeGateway = "phonepe";
-                    } else if (order.razorpayOrderId) {
-                        activeGateway = "razorpay";
+                let paymentId =
+                    null;
+
+                let rawResponse =
+                    null;
+
+                let activeGateway =
+                    candidate.gateway;
+
+                if (
+                    !activeGateway
+                ) {
+                    if (
+                        candidate.phonepeOrderId
+                    ) {
+                        activeGateway =
+                            "phonepe";
+                    } else if (
+                        candidate.razorpayOrderId
+                    ) {
+                        activeGateway =
+                            "razorpay";
                     }
                 }
 
-                let utr = "";
-                let paymentMode = "";
+                let utr =
+                    "";
 
-                if (activeGateway === "phonepe" && order.phonepeOrderId) {
-                    console.log(`Checking PhonePe payment status for order: ${order.orderId} (PP ID: ${order.phonepeOrderId})`);
-                    const ppStatus = await checkPhonepeOrderStatus(order.phonepeOrderId);
-                    if (ppStatus.isPaid) {
-                        isPaid = true;
-                        paymentId = ppStatus.paymentId;
-                        rawResponse = ppStatus.rawResponse;
-                        utr = ppStatus.utr || "N/A";
-                        paymentMode = ppStatus.paymentMode || "N/A";
+                let paymentMode =
+                    "";
+
+                if (
+                    activeGateway ===
+                    "phonepe" &&
+                    candidate.phonepeOrderId
+                ) {
+                    console.log(
+                        `Checking PhonePe payment status for order: ${candidate.orderId}`
+                    );
+
+                    const ppStatus =
+                        await checkPhonepeOrderStatus(
+                            candidate.phonepeOrderId
+                        );
+
+                    if (
+                        ppStatus.isPaid
+                    ) {
+                        isPaid =
+                            true;
+
+                        paymentId =
+                            ppStatus.paymentId;
+
+                        rawResponse =
+                            ppStatus.rawResponse;
+
+                        utr =
+                            ppStatus.utr ||
+                            "N/A";
+
+                        paymentMode =
+                            ppStatus.paymentMode ||
+                            "N/A";
                     }
-                } else if (activeGateway === "razorpay" && order.razorpayOrderId) {
-                    console.log(`Checking Razorpay payment status for order: ${order.orderId} (RP ID: ${order.razorpayOrderId})`);
-                    const rzpStatus = await checkRazorpayOrderStatus(order.razorpayOrderId);
-                    if (rzpStatus.isPaid) {
-                        isPaid = true;
-                        paymentId = rzpStatus.paymentId;
+                } else if (
+                    activeGateway ===
+                    "razorpay" &&
+                    candidate.razorpayOrderId
+                ) {
+                    console.log(
+                        `Checking Razorpay payment status for order: ${candidate.orderId}`
+                    );
+
+                    const rzpStatus =
+                        await checkRazorpayOrderStatus(
+                            candidate.razorpayOrderId
+                        );
+
+                    if (
+                        rzpStatus.isPaid
+                    ) {
+                        isPaid =
+                            true;
+
+                        paymentId =
+                            rzpStatus.paymentId;
                     }
                 }
 
+                /*
+                 * =================================================
+                 * PAID
+                 * =================================================
+                 */
                 if (isPaid) {
-                    console.log(`💰 Order ${order.orderId} was paid on ${activeGateway}! Confirming order...`);
-                    await session.withTransaction(async () => {
-                        // Check if this is a payment link order
-                        const isLinked = await PaymentLink.findOne({ orderId: order._id }).session(session);
-
-                        if (isLinked) {
-                            console.log(`Order ${order.orderId} is linked to a PaymentLink. Executing minimal confirmation.`);
-                            const paymentDate = new Date();
-                            order.abondonedOrder = false;
-                            order.paymentStatus = 'Paid';
-                            order.paymentDate = paymentDate;
-                            if (activeGateway === "phonepe") {
-                                order.phonepePaymentId = paymentId;
-                                order.phonepeRawResponse = rawResponse;
-                                order.phonepeUtr = utr;
-                                order.phonepePaymentMode = paymentMode;
-                            } else {
-                                order.razorpayPaymentId = paymentId;
-                            }
-                            await order.save({ session });
-                        } else {
-                            if (activeGateway === "phonepe") {
-                                order.phonepePaymentId = paymentId;
-                                order.phonepeRawResponse = rawResponse;
-                                order.phonepeUtr = utr;
-                                order.phonepePaymentMode = paymentMode;
-                                await order.save({ session });
-                                await confirmOrderPaymentLogic(
-                                    order._id,
-                                    null,
-                                    null,
-                                    session,
-                                    order.userId
+                    await session.withTransaction(
+                        async () => {
+                            /*
+                             * Reload order INSIDE transaction.
+                             */
+                            const order =
+                                await Order.findById(
+                                    candidate._id
+                                ).session(
+                                    session
                                 );
-                            } else {
+
+                            if (
+                                !order
+                            ) {
+                                throw new ApiError(
+                                    404,
+                                    "Order not found."
+                                );
+                            }
+
+                            /*
+                             * Someone else may have already
+                             * restored/confirmed this order.
+                             */
+                            if (
+                                order._restockDone
+                            ) {
+                                return;
+                            }
+
+                            /*
+                             * Re-check current state.
+                             */
+                            if (
+                                order.orderState !==
+                                "Reserved" ||
+                                order.paymentStatus !==
+                                "Pending"
+                            ) {
+                                return;
+                            }
+
+                            /*
+                             * Payment-link orders keep their
+                             * existing minimal confirmation behavior.
+                             */
+                            const isLinked =
+                                await PaymentLink.findOne(
+                                    {
+                                        orderId:
+                                            order._id
+                                    }
+                                ).session(
+                                    session
+                                );
+
+                            if (
+                                isLinked
+                            ) {
+                                order.abondonedOrder =
+                                    false;
+
+                                order.paymentStatus =
+                                    "Paid";
+
+                                order.paymentDate =
+                                    new Date();
+
+                                if (
+                                    activeGateway ===
+                                    "phonepe"
+                                ) {
+                                    order.phonepePaymentId =
+                                        paymentId;
+
+                                    order.phonepeRawResponse =
+                                        rawResponse;
+
+                                    order.phonepeUtr =
+                                        utr;
+
+                                    order.phonepePaymentMode =
+                                        paymentMode;
+                                } else {
+                                    order.razorpayPaymentId =
+                                        paymentId;
+                                }
+
+                                await order.save({
+                                    session
+                                });
+
+                                return;
+                            }
+
+                            /*
+                             * Razorpay:
+                             * find exact internal Payment record.
+                             */
+                            if (
+                                activeGateway ===
+                                "razorpay"
+                            ) {
+                                const payment =
+                                    await Payment.findOne(
+                                        {
+                                            orderRef:
+                                                order._id,
+
+                                            razorpayOrderId:
+                                                order.razorpayOrderId
+                                        }
+                                    )
+                                        .sort({
+                                            createdAt:
+                                                -1
+                                        })
+                                        .session(
+                                            session
+                                        );
+
+                                if (
+                                    !payment
+                                ) {
+                                    throw new ApiError(
+                                        404,
+                                        `Payment record not found for order ${order.orderId}.`
+                                    );
+                                }
+
+                                /*
+                                 * confirmPaymentRecordPaidLogic
+                                 * owns the payment -> order transition.
+                                 */
+                                await confirmPaymentRecordPaidLogic(
+                                    payment._id,
+                                    paymentId,
+                                    session
+                                );
+
+                                return;
+                            }
+
+                            /*
+                             * Preserve existing PhonePe completion
+                             * flow because its payment mapping is different.
+                             */
+                            if (
+                                activeGateway ===
+                                "phonepe"
+                            ) {
+                                order.phonepePaymentId =
+                                    paymentId;
+
+                                order.phonepeRawResponse =
+                                    rawResponse;
+
+                                order.phonepeUtr =
+                                    utr;
+
+                                order.phonepePaymentMode =
+                                    paymentMode;
+
+                                await order.save({
+                                    session
+                                });
+
                                 await confirmOrderPaymentLogic(
                                     order._id,
-                                    order.razorpayOrderId,
-                                    paymentId,
+                                    null,
+                                    null,
                                     session,
                                     order.userId
                                 );
                             }
                         }
-                    });
-                    console.log(`✅ Order ${order.orderId} confirmed successfully via cron job.`);
-                    continue; // Skip restocking/abandoning
+                    );
+
+                    console.log(
+                        `✅ Order ${candidate.orderId} confirmed successfully via cron job.`
+                    );
+
+                    continue;
                 }
 
-                // If not paid (or no Razorpay ID), proceed with restocking and abandoning
-                console.log(`⏳ Restoring stock and abandoning order: ${order.orderId} (${order._id})`);
-                await session.withTransaction(async () => {
-                    // Restore stock using the logic extracted in the controller
-                    await restoreOrderStockLogic(order._id, session);
+                /*
+                 * =================================================
+                 * NOT PAID → RESTORE
+                 * =================================================
+                 */
+                await session.withTransaction(
+                    async () => {
+                        const order =
+                            await Order.findById(
+                                candidate._id
+                            ).session(
+                                session
+                            );
 
-                    // Update order state to Abandoned and mark as such
-                    await Order.findByIdAndUpdate(
-                        order._id,
-                        {
-                            orderState: "Abandoned",
-                            abondonedOrder: true
-                        },
-                        { session }
-                    );
-                });
-                console.log(`✅ Successfully restored and abandoned order: ${order.orderId}`);
+                        if (
+                            !order
+                        ) {
+                            throw new ApiError(
+                                404,
+                                "Order not found."
+                            );
+                        }
+
+                        /*
+                         * Re-check current state inside transaction.
+                         */
+                        if (
+                            order.orderState !==
+                            "Reserved" ||
+                            order.paymentStatus !==
+                            "Pending"
+                        ) {
+                            return;
+                        }
+
+                        if (
+                            order._restockDone
+                        ) {
+                            return;
+                        }
+
+                        await restoreOrderStockLogic(
+                            order._id,
+                            session
+                        );
+
+                        /*
+                         * IMPORTANT:
+                         * restoreOrderStockLogic has already atomically
+                         * claimed _restockDone.
+                         */
+                        await Order.findByIdAndUpdate(
+                            order._id,
+                            {
+                                $set: {
+                                    orderState:
+                                        "Abandoned",
+
+                                    abondonedOrder:
+                                        true
+                                }
+                            },
+                            {
+                                session
+                            }
+                        );
+                    }
+                );
+
+                console.log(
+                    `✅ Successfully restored and abandoned order: ${candidate.orderId}`
+                );
             } catch (error) {
-                console.error(`❌ Failed to process order ${order._id}:`, error.message);
+                /*
+                 * A concurrent worker may already have completed the
+                 * order. Do not let one failed candidate stop the cron job.
+                 */
+                console.error(
+                    `❌ Failed to process order ${candidate._id}:`,
+                    error.message
+                );
+            } finally {
+                await session.endSession();
             }
         }
-    } catch (error) {
-        console.error("❌ Error in restoreReservedOrders job:", error.message);
-    } finally {
-        session.endSession();
-    }
-};
+    };

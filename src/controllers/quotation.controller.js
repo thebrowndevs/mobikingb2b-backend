@@ -14,6 +14,7 @@ import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { STOCK_TYPES } from "../constants.js";
 import { Address } from "../models/address.model.js";
+import { CompanyDetails } from "../models/company_details.model.js";
 import { logActivity } from "../utils/activityLogger.js";
 import {
     buildOldItemsMap,
@@ -84,6 +85,18 @@ export const createQuotation = asyncHandler(async (req, res) => {
         const cart = await Cart.findById(cartId).populate("items.productId");
         if (!cart || cart.items.length === 0) {
             throw new ApiError(400, "Your cart is empty.");
+        }
+
+        // Server-side subtotal calculation from cart items
+        const cartSubtotal = cart.items.reduce((sum, item) => {
+            return sum + ((item.price || 0) - (item.discount || 0)) * (item.quantity || 0);
+        }, 0);
+
+        // Enforce minimum quotation limit
+        const companySettings = await CompanyDetails.findOne().select("minQuotationLimit").lean();
+        const minQuotationLimit = companySettings?.minQuotationLimit ?? 0;
+        if (minQuotationLimit > 0 && cartSubtotal < minQuotationLimit) {
+            throw new ApiError(400, `Order Request must be of minimum ₹${minQuotationLimit}.`);
         }
 
         const foundAddress = await Address.findById(addressId);

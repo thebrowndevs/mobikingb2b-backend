@@ -15,7 +15,9 @@ const companyDetailsSchema = new mongoose.Schema({
   paymentGatewaySettings: {
     enableRazorpay: { type: Boolean, default: true },
     enablePhonepe: { type: Boolean, default: true }
-  }
+  },
+  minOrderLimit: { type: Number, default: 0 },
+  minQuotationLimit: { type: Number, default: 0 }
 }, { timestamps: true });
 
 export const CompanyDetails = mongoose.model("CompanyDetails", companyDetailsSchema);
