@@ -53,6 +53,12 @@ const paymentSchema = new mongoose.Schema(
         paymentLinkUrl: {
             type: String
         },
+        razorpayOrderId: {
+            type: String
+        },
+        razorpayPaymentId: {
+            type: String
+        },
         notes: {
             type: String
         },

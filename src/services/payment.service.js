@@ -128,6 +128,7 @@ export const confirmPaymentRecordPaidLogic = async (paymentId, razorpayPaymentId
     payment.paidAt = new Date();
     if (razorpayPaymentId) {
         payment.paymentId = razorpayPaymentId;
+        payment.razorpayPaymentId = razorpayPaymentId;
     }
     await payment.save({ session });
 
