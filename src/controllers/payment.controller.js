@@ -20,10 +20,10 @@ export const getPendingPayments = asyncHandler(async (req, res) => {
         .populate({
             path: "orderRef",
             select: "orderId name phoneNo items orderAmount amountPaid remainingAmount paymentStatus subtotal discount deliveryCharge",
-            populate: {
-                path: "items.productId",
-                select: "name images"
-            }
+            // populate: {
+            //     path: "items.productId",
+            //     select: "name images"
+            // }
         })
         .sort({ createdAt: -1 });
 
@@ -36,13 +36,13 @@ export const getPendingPayments = asyncHandler(async (req, res) => {
         couponId: p.couponId,
         orderId: p.orderRef?._id,
         orderIdString: p.orderRef?.orderId,
-        items: p.orderRef?.items?.map(item => ({
-            name: item.name || item.fullName || item.productId?.name || "Product Item",
-            price: item.price || 0,
-            quantity: item.quantity || 1,
-            discount: item.discount || 0,
-            imageUrl: item.productId?.images?.[0] || ""
-        })) || [],
+        // items: p.orderRef?.items?.map(item => ({
+        //     name: item.name || item.fullName || item.productId?.name || "Product Item",
+        //     price: item.price || 0,
+        //     quantity: item.quantity || 1,
+        //     discount: item.discount || 0,
+        //     imageUrl: item.productId?.images?.[0] || ""
+        // })) || [],
         createdAt: p.createdAt,
         orderAmount: p.orderRef?.orderAmount || 0,
         amountPaid: p.orderRef?.amountPaid || 0,
@@ -108,7 +108,10 @@ export const getPaymentById = asyncHandler(async (req, res) => {
         paymentStatus: p.orderRef?.paymentStatus || "Pending",
         orderSubtotal: p.orderRef?.subtotal || 0,
         orderDiscount: p.orderRef?.discount || 0,
-        orderDeliveryCharge: p.orderRef?.deliveryCharge || 0
+        orderDeliveryCharge: p.orderRef?.deliveryCharge || 0,
+        status: p.status,
+        paidAt: p.paidAt,
+        transactionId: p.paymentId || p.razorpayPaymentId
     };
 
     return res.status(200).json(
