@@ -236,8 +236,6 @@ export const syncProductStock2 = async (
         productId,
         {
             totalStock,
-            totalProductStock:
-                totalStock,
             availableStock
         },
         {
