@@ -222,15 +222,15 @@ export const syncProductStock2 = async (
         );
     }
 
-    if (
-        Number(inventory.reservedStock || 0) >
-        totalStock
-    ) {
-        throw new ApiError(
-            500,
-            `Reserved stock exceeds physical stock for product ${productId}.`
-        );
-    }
+    // if (
+    //     Number(inventory.reservedStock || 0) >
+    //     totalStock
+    // ) {
+    //     throw new ApiError(
+    //         500,
+    //         `Reserved stock exceeds physical stock for product ${productId}.`
+    //     );
+    // }
 
     await Product.findByIdAndUpdate(
         productId,
