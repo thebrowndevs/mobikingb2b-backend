@@ -1890,12 +1890,13 @@ const createOnlineOrder =
                                 )
                             );
 
-                            const parentProduct = await Product.findById(
-                                item.productId?._id || item.productId
-                            ).session(session).lean();
+                            const prodId = new mongoose.Types.ObjectId(item.productId?._id || item.productId);
+                            await syncProductStock2(prodId, session);
+
+                            const parentProduct = await Product.findById(prodId).session(session).lean();
 
                             const currentTotalProductStock = parentProduct
-                                ? Math.max(0, (parentProduct.totalProductStock || parentProduct.totalStock || 0) - quantity)
+                                ? (parentProduct.totalProductStock || parentProduct.totalStock || 0)
                                 : 0;
 
                             /*
@@ -1959,23 +1960,6 @@ const createOnlineOrder =
                                         ?._id ||
                                     item.productId
                             });
-                        }
-
-                        /*
-                         * =================================================
-                         * PRODUCT / INVENTORY SYNC
-                         * =================================================
-                         */
-                        for (
-                            const productId of
-                            affectedProductIds
-                        ) {
-                            await syncProductStock2(
-                                new mongoose.Types.ObjectId(
-                                    productId
-                                ),
-                                session
-                            );
                         }
 
                         /*
@@ -2679,10 +2663,13 @@ export const restoreOrderStockLogic =
                 )
             );
 
-            const parentProduct = await Product.findById(productId).session(session).lean();
+            const prodId = new mongoose.Types.ObjectId(productId);
+            await syncProductStock2(prodId, session);
+
+            const parentProduct = await Product.findById(prodId).session(session).lean();
 
             const currentTotalProductStock = parentProduct
-                ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) + quantity
+                ? (parentProduct.totalProductStock || parentProduct.totalStock || 0)
                 : 0;
 
             stockEntries.push({
@@ -2739,23 +2726,6 @@ export const restoreOrderStockLogic =
                         0
                     )
             });
-        }
-
-        /*
-         * =====================================================
-         * SYNC PRODUCT AGGREGATES ONCE PER PRODUCT
-         * =====================================================
-         */
-        for (
-            const productId of
-            affectedProductIds
-        ) {
-            await syncProductStock2(
-                new mongoose.Types.ObjectId(
-                    productId
-                ),
-                session
-            );
         }
 
         /*
