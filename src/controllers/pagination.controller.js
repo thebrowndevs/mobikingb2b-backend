@@ -211,7 +211,7 @@ export const getPaginatedOrders = asyncHandler(async (req, res) => {
       // }
     })
     .populate({
-      path: "coupon",
+      path: "couponsApplied.couponId",
       model: "Coupon",
       select: "code type value percent"
     })

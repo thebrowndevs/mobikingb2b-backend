@@ -4248,6 +4248,10 @@ const updateOrder = asyncHandler(async (req, res) => {
         // If trying to update items/discounts/charges, validate editing timeframe constraints
         const isEditingItems = updates && (updates.items !== undefined || updates.discount !== undefined || updates.discountPercent !== undefined || updates.discountType !== undefined || updates.deliveryCharge !== undefined);
 
+        if (order.couponLocked && isEditingItems) {
+            throw new ApiError(400, "Order is locked because a coupon has been applied. Remove the coupon to edit items or pricing.");
+        }
+
         if (isEditingItems) {
             const canEdit = () => {
                 if (order.shippingType === 'Manual') {
@@ -4546,6 +4550,10 @@ const addItemQuantityInOrder = async (req, res) => {
             const order = await Order.findById(orderId).session(session);
             if (!order) throw new ApiError(404, "Order not found");
 
+            if (order.couponLocked) {
+                throw new ApiError(400, "Order is locked because a coupon has been applied. Remove the coupon to edit items or pricing.");
+            }
+
             const product = await Product.findById(productId)
                 .session(session)
                 .select("variants totalStock fullName sellingPrice basePrice");
@@ -4650,6 +4658,10 @@ const removeItemQuantityInOrder = async (req, res) => {
 
             const order = await Order.findById(orderId).session(session);
             if (!order) throw new ApiError(404, "Order not found");
+
+            if (order.couponLocked) {
+                throw new ApiError(400, "Order is locked because a coupon has been applied. Remove the coupon to edit items or pricing.");
+            }
 
             const product = await Product.findById(productId)
                 .session(session)
@@ -5753,7 +5765,7 @@ const getAllOrdersByUser = asyncHandler(async (req, res) => {
             path: "orders",  // This is the key part
             model: "Order",
             populate: {
-                path: "coupon",
+                path: "couponsApplied.couponId",
                 model: "Coupon",
                 select: "code type value percent"
             }
@@ -7354,10 +7366,10 @@ const recordCallAttempt = asyncHandler(async (req, res) => {
 });
 
 const addOrderPayment = asyncHandler(async (req, res) => {
-    const { orderId, amount, method, status = "Paid", notes, paidAt } = req.body;
+    const { orderId, amount, method, status = "Paid", notes, paidAt, subtotal, discount } = req.body;
 
-    if (!orderId || amount === undefined || !method) {
-        throw new ApiError(400, "orderId, amount, and method are required.");
+    if (!orderId || !method) {
+        throw new ApiError(400, "orderId and method are required.");
     }
 
     if (method === "COD") {
@@ -7369,6 +7381,42 @@ const addOrderPayment = asyncHandler(async (req, res) => {
         throw new ApiError(404, "Order not found.");
     }
 
+    // Check if there is already a pending payment
+    const existingPendingPayment = await Payment.findOne({ orderRef: order._id, status: "Pending" });
+    if (existingPendingPayment) {
+        throw new ApiError(400, "Cannot create a new payment record because there is already a pending payment transaction on this order.");
+    }
+
+    // Check if order is already completely paid
+    if (order.paymentStatus === "Paid" || order.remainingAmount <= 0) {
+        throw new ApiError(400, "Cannot add payment because the order is already completely paid.");
+    }
+
+    // Determine subtotal and discount
+    const resolvedSubtotal = subtotal !== undefined ? Number(subtotal) : (amount !== undefined ? Number(amount) : 0);
+    const resolvedDiscount = Number(discount || 0);
+
+    // Check if coupon is applied to the order and applies to this online payment
+    const couponEntry = (order.couponsApplied && order.couponsApplied.length > 0) ? order.couponsApplied[0] : null;
+    const isCouponApplied = !!couponEntry;
+    const couponValue = isCouponApplied ? Number(couponEntry.appliedValue || 0) : 0;
+
+    const isOnlineMethod = !["mixed", "cash", "cod", "Mixed", "Cash", "COD"].includes(method);
+    const finalCoupon = (isCouponApplied && isOnlineMethod) ? couponValue : 0;
+    const finalCouponId = (isCouponApplied && isOnlineMethod) ? couponEntry.couponId : undefined;
+    const finalCouponCode = (isCouponApplied && isOnlineMethod) ? couponEntry.code : undefined;
+
+    const finalAmount = parseFloat((resolvedSubtotal - resolvedDiscount - finalCoupon).toFixed(2));
+
+    if (finalAmount < 0) {
+        throw new ApiError(400, "Payment amount cannot be negative.");
+    }
+
+    // Check if amount exceeds remaining amount
+    if (finalAmount > order.remainingAmount) {
+        throw new ApiError(400, `Payment amount (₹${finalAmount}) cannot exceed the order's remaining amount (₹${order.remainingAmount}).`);
+    }
+
     let finalStatus = status;
     if (req.user?.role?.toLowerCase() !== "admin") {
         finalStatus = "Pending";
@@ -7378,19 +7426,16 @@ const addOrderPayment = asyncHandler(async (req, res) => {
     try {
         let paymentDoc;
         await session.withTransaction(async () => {
-            const isCouponApplied = !!(order.couponCode || order.coupon);
-            const couponApplied = isCouponApplied ? (order.discount || 0) : 0;
-            const discountApplied = isCouponApplied ? 0 : (order.discount || 0);
-
             paymentDoc = await Payment.create([{
                 orderId: order.orderId,
                 orderRef: order._id,
                 userId: order.userId,
-                amount: Number(amount),
-                subtotal: Number(order.subtotal || 0),
-                discount: Number(discountApplied),
-                coupon: Number(couponApplied),
-                couponId: order.coupon || undefined,
+                amount: finalAmount,
+                subtotal: resolvedSubtotal,
+                discount: resolvedDiscount,
+                coupon: finalCoupon,
+                couponId: finalCouponId,
+                couponCode: finalCouponCode,
                 method,
                 status: finalStatus,
                 notes: notes || "",
@@ -7442,7 +7487,7 @@ const addOrderPayment = asyncHandler(async (req, res) => {
 
 const editOrderPayment = asyncHandler(async (req, res) => {
     const { paymentId } = req.params;
-    const { amount, method, status, notes, paidAt } = req.body;
+    const { amount, method, status, notes, paidAt, subtotal, discount } = req.body;
 
     if (!paymentId) {
         throw new ApiError(400, "Payment ID is required.");
@@ -7455,6 +7500,10 @@ const editOrderPayment = asyncHandler(async (req, res) => {
 
     if (payment.status === "Paid") {
         throw new ApiError(400, "This payment record is Paid and locked. It cannot be edited.");
+    }
+
+    if (payment.couponId || (payment.coupon && payment.coupon > 0)) {
+        throw new ApiError(400, "This payment record has a coupon applied to it and cannot be edited.");
     }
 
     if (method === "COD") {
@@ -7474,16 +7523,26 @@ const editOrderPayment = asyncHandler(async (req, res) => {
     const session = await mongoose.startSession();
     try {
         await session.withTransaction(async () => {
-            payment.amount = amount !== undefined ? Number(amount) : payment.amount;
+            const resolvedSubtotal = subtotal !== undefined ? Number(subtotal) : payment.subtotal;
+            const resolvedDiscount = discount !== undefined ? Number(discount) : payment.discount;
+            const finalAmount = parseFloat((resolvedSubtotal - resolvedDiscount - (payment.coupon || 0)).toFixed(2));
+
+            if (finalAmount < 0) {
+                throw new ApiError(400, "Payment amount cannot be negative.");
+            }
+
+            // Verify if new finalAmount exceeds remainingAmount (excluding this payment's original amount)
+            const remainingExcludingThis = order.remainingAmount + (payment.status === "Paid" ? payment.amount : 0);
+            if (finalAmount > remainingExcludingThis) {
+                throw new ApiError(400, `Payment amount (₹${finalAmount}) cannot exceed the order's remaining amount (₹${remainingExcludingThis}).`);
+            }
+
+            payment.subtotal = resolvedSubtotal;
+            payment.discount = resolvedDiscount;
+            payment.amount = finalAmount;
             payment.method = method || payment.method;
             payment.status = finalStatus;
             payment.notes = notes !== undefined ? notes : payment.notes;
-
-            const isCouponApplied = !!(order.couponCode || order.coupon);
-            payment.subtotal = Number(order.subtotal || 0);
-            payment.discount = isCouponApplied ? 0 : Number(order.discount || 0);
-            payment.coupon = isCouponApplied ? Number(order.discount || 0) : 0;
-            payment.couponId = order.coupon || undefined;
 
             if (finalStatus === "Paid") {
                 payment.paidAt = paidAt ? new Date(paidAt) : (payment.paidAt || new Date());
@@ -7953,6 +8012,13 @@ export const updateOrderItems = asyncHandler(
                         throw new ApiError(
                             404,
                             "Order not found."
+                        );
+                    }
+
+                    if (order.couponLocked) {
+                        throw new ApiError(
+                            400,
+                            "Order is locked because a coupon has been applied. Remove the coupon to edit items or pricing."
                         );
                     }
 

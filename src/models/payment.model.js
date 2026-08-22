@@ -15,7 +15,7 @@ const paymentSchema = new mongoose.Schema(
             ref: "User",
             required: true
         },
-        amount: {
+        amount: { // total orderalue after the discount applied on subtotal, this will get updated if coupon/discount is applied on payment record
             type: Number,
             required: true
         },
@@ -34,6 +34,9 @@ const paymentSchema = new mongoose.Schema(
         couponId: {
             type: mongoose.Schema.Types.ObjectId,
             ref: "Coupon"
+        },
+        couponCode: {
+            type: String
         },
         method: {
             type: String,

@@ -3,10 +3,18 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { Order } from "../models/order.model.js";
+import { Payment } from "../models/payment.model.js";
+import mongoose from "mongoose";
+import {
+    validateCoupon,
+    calculateCouponValue,
+    applyCouponToOrder,
+    removeCouponFromOrder
+} from "../utils/coupon.utils.js";
 
 // CREATE COUPON
 export const createCoupon = asyncHandler(async (req, res) => {
-    let { code, type, value, percent, startDate, endDate, active, phoneNumber, userId, isAdminOnly } = req.body;
+    let { code, type, value, percent, startDate, endDate, active, phoneNumber, userId, isAdminOnly, minCartValue } = req.body;
 
     if (!code || (!value && !percent)) {
         throw new ApiError(400, "Code and either value or percent are required");
@@ -28,7 +36,8 @@ export const createCoupon = asyncHandler(async (req, res) => {
         code, type, value, percent,
         startDate, endDate, active,
         phoneNumber, userId: cleanedUserId,
-        isAdminOnly
+        isAdminOnly,
+        minCartValue: minCartValue || "0"
     });
 
     return res
@@ -38,7 +47,7 @@ export const createCoupon = asyncHandler(async (req, res) => {
 
 // UPDATE COUPON
 export const updateCoupon = asyncHandler(async (req, res) => {
-    const { id, code, type, value, percent, startDate, endDate, active, phoneNumber, userId, isAdminOnly } = req.body;
+    const { id, code, type, value, percent, startDate, endDate, active, phoneNumber, userId, isAdminOnly, minCartValue } = req.body;
 
     const coupon = await Coupon.findById(id);
     if (!coupon) throw new ApiError(404, "Coupon not found");
@@ -51,6 +60,9 @@ export const updateCoupon = asyncHandler(async (req, res) => {
     coupon.startDate = startDate;
     coupon.endDate = endDate;
     coupon.phoneNumber = phoneNumber !== undefined ? phoneNumber : coupon.phoneNumber;
+    if (minCartValue !== undefined) {
+        coupon.minCartValue = minCartValue;
+    }
 
     // Convert empty string userId to undefined to prevent Mongoose BSON casting errors
     if (userId !== undefined) {
@@ -206,5 +218,137 @@ export const getAdminCoupons = asyncHandler(async (req, res) => {
                 hasPrevPage: parsedPage > 1,
             },
         }, "Admin coupons fetched successfully")
+    );
+});
+
+// APPLY COUPON BY ADMIN
+export const applyCouponAdmin = asyncHandler(async (req, res) => {
+    const { orderId, code } = req.body;
+
+    if (!orderId) throw new ApiError(400, "Order ID is required");
+    if (!code) throw new ApiError(400, "Coupon code is required");
+
+    const coupon = await Coupon.findOne({ code, active: true });
+    if (!coupon) throw new ApiError(404, "Coupon not found");
+
+    const order = await Order.findById(orderId);
+    if (!order) throw new ApiError(404, "Order not found");
+
+    // Perform validation checks (throws ApiError if invalid)
+    await validateCoupon({ coupon, userId: order.userId, order, isAdmin: true });
+
+    // Calculate coupon value
+    const discountedAmount = calculateCouponValue({ coupon, order });
+
+    const session = await mongoose.startSession();
+    let paymentUpdated = false;
+    let payment = null;
+
+    try {
+        await session.withTransaction(async () => {
+            // Apply coupon updates to order and potentially payment
+            const result = await applyCouponToOrder({ order, coupon, discountedAmount, session });
+            paymentUpdated = result.paymentUpdated;
+            payment = result.payment;
+
+            // Track coupon usage atomically
+            const updatedCoupon = await Coupon.findOneAndUpdate(
+                {
+                    _id: coupon._id,
+                    "appliedBy.order": { $ne: order._id }
+                },
+                {
+                    $push: {
+                        appliedBy: {
+                            user: order.userId,
+                            order: order._id
+                        }
+                    }
+                },
+                { session, new: true }
+            );
+            if (!updatedCoupon) {
+                throw new ApiError(400, "Coupon has already been applied to this order");
+            }
+        });
+    } catch (err) {
+        throw err;
+    } finally {
+        session.endSession();
+    }
+
+    // Send push notification if payment was updated
+    if (paymentUpdated && payment) {
+        try {
+            const { sendPendingPaymentNotification } = await import("../services/firebase.service.js");
+            sendPendingPaymentNotification(order.userId, order._id, payment._id, payment.amount, order.orderId);
+        } catch (notiErr) {
+            console.error("FCM Notification failed in applyCouponAdmin:", notiErr);
+        }
+    }
+
+    return res.status(200).json(
+        new ApiResponse(200, { order, payment }, "Coupon applied successfully by admin")
+    );
+});
+
+// REMOVE COUPON BY ADMIN
+export const removeCouponAdmin = asyncHandler(async (req, res) => {
+    const { orderId, paymentId } = req.body;
+
+    if (!orderId) throw new ApiError(400, "Order ID is required");
+
+    const order = await Order.findById(orderId);
+    if (!order) throw new ApiError(404, "Order not found");
+
+    if (order.paymentStatus === "Paid") {
+        throw new ApiError(400, "Cannot remove coupon from a paid order");
+    }
+
+    const couponId = order.couponsApplied[0].couponId;
+    const targetPayment = paymentId
+        ? await Payment.findById(paymentId)
+        : await Payment.findOne({ orderRef: order._id, couponId });
+
+    if (targetPayment && targetPayment.status === "Paid") {
+        throw new ApiError(400, "Cannot remove coupon because the discounted payment has already been paid");
+    }
+
+    const session = await mongoose.startSession();
+    let paymentRestored = false;
+    let payment = null;
+
+    try {
+        await session.withTransaction(async () => {
+            // Remove coupon and potentially restore payment
+            const result = await removeCouponFromOrder({ order, paymentId, session });
+            paymentRestored = result.paymentRestored;
+            payment = result.payment;
+
+            // Remove from coupon usage
+            await Coupon.updateOne(
+                { _id: couponId },
+                { $pull: { appliedBy: { user: order.userId, order: order._id } } },
+                { session }
+            );
+        });
+    } catch (err) {
+        throw err;
+    } finally {
+        session.endSession();
+    }
+
+    // Send push notification if payment was restored
+    if (paymentRestored && payment) {
+        try {
+            const { sendPendingPaymentNotification } = await import("../services/firebase.service.js");
+            sendPendingPaymentNotification(order.userId, order._id, payment._id, payment.amount, order.orderId);
+        } catch (notiErr) {
+            console.error("FCM Notification failed in removeCouponAdmin:", notiErr);
+        }
+    }
+
+    return res.status(200).json(
+        new ApiResponse(200, { order, payment }, "Coupon removed successfully by admin")
     );
 });

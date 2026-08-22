@@ -244,12 +244,32 @@ const orderSchema = new mongoose.Schema(
         },
 
         /****************  PRICING  *****************/
-        coupon: {
-            type: mongoose.Schema.Types.ObjectId,
-            ref: "Coupon",
+
+
+        couponLocked: {
+            type: Boolean,
+            default: false
         },
-        couponCode: { type: String },
-        couponType: { type: String },
+        couponsApplied: [{
+            couponId: {
+                type: mongoose.Schema.Types.ObjectId,
+                ref: "Coupon",
+            },
+            appliedValue: Number,
+            code: {
+                type: String,
+                // unique: true
+            },
+            minCartValue: {
+                type: String,
+            },
+            value: {
+                type: String,
+            },
+            percent: {
+                type: String,
+            }
+        }],
         orderAmount: { type: Number, required: true },
         amountPaid: { type: Number, default: 0 },
         remainingAmount: { type: Number, default: 0 },
