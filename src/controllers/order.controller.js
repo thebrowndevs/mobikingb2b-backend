@@ -2669,7 +2669,7 @@ export const restoreOrderStockLogic =
             const parentProduct = await Product.findById(prodId).session(session).lean();
 
             const currentTotalProductStock = parentProduct
-                ? (parentProduct.totalProductStock || parentProduct.totalStock || 0)
+                ? (parentProduct.totalStock || 0)
                 : 0;
 
             stockEntries.push({
