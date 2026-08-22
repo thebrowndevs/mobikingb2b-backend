@@ -16,7 +16,45 @@ export const getPendingPayments = asyncHandler(async (req, res) => {
         throw new ApiError(401, "Unauthorized request.");
     }
 
-    const pending = await Payment.find({ userId, status: "Pending" })
+    const matched = await Payment.aggregate([
+        {
+            $match: {
+                userId: new mongoose.Types.ObjectId(userId),
+                status: "Pending",
+                method: {
+                    $nin: [
+                        "Cash", "COD", "Mixed",
+                        "cash", "cod", "mixed"
+                    ]
+                }
+            }
+        },
+        {
+            $lookup: {
+                from: "orders",
+                localField: "orderRef",
+                foreignField: "_id",
+                as: "orderRef"
+            }
+        },
+        {
+            $unwind: "$orderRef"
+        },
+        {
+            $match: {
+                "orderRef.abondonedOrder": { $ne: true }
+            }
+        },
+        {
+            $project: {
+                _id: 1
+            }
+        }
+    ]);
+
+    const validIds = matched.map(m => m._id);
+
+    const pending = await Payment.find({ _id: { $in: validIds } })
         .populate({
             path: "orderRef",
             select: "orderId name phoneNo items orderAmount amountPaid remainingAmount paymentStatus subtotal discount deliveryCharge",
