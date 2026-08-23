@@ -7392,29 +7392,17 @@ const addOrderPayment = asyncHandler(async (req, res) => {
         throw new ApiError(400, "Cannot add payment because the order is already completely paid.");
     }
 
-    // Determine subtotal and discount
     const resolvedSubtotal = subtotal !== undefined ? Number(subtotal) : (amount !== undefined ? Number(amount) : 0);
     const resolvedDiscount = Number(discount || 0);
+    const paymentAmount = amount !== undefined ? Number(amount) : parseFloat((resolvedSubtotal - resolvedDiscount).toFixed(2));
 
-    // Check if coupon is applied to the order and applies to this online payment
-    const couponEntry = (order.couponsApplied && order.couponsApplied.length > 0) ? order.couponsApplied[0] : null;
-    const isCouponApplied = !!couponEntry;
-    const couponValue = isCouponApplied ? Number(couponEntry.appliedValue || 0) : 0;
-
-    const isOnlineMethod = !["mixed", "cash", "cod", "Mixed", "Cash", "COD"].includes(method);
-    const finalCoupon = (isCouponApplied && isOnlineMethod) ? couponValue : 0;
-    const finalCouponId = (isCouponApplied && isOnlineMethod) ? couponEntry.couponId : undefined;
-    const finalCouponCode = (isCouponApplied && isOnlineMethod) ? couponEntry.code : undefined;
-
-    const finalAmount = parseFloat((resolvedSubtotal - resolvedDiscount - finalCoupon).toFixed(2));
-
-    if (finalAmount < 0) {
+    if (paymentAmount < 0) {
         throw new ApiError(400, "Payment amount cannot be negative.");
     }
 
     // Check if amount exceeds remaining amount
-    if (finalAmount > order.remainingAmount) {
-        throw new ApiError(400, `Payment amount (₹${finalAmount}) cannot exceed the order's remaining amount (₹${order.remainingAmount}).`);
+    if (paymentAmount > order.remainingAmount) {
+        throw new ApiError(400, `Payment amount (₹${paymentAmount}) cannot exceed the order's remaining amount (₹${order.remainingAmount}).`);
     }
 
     let finalStatus = status;
@@ -7430,12 +7418,12 @@ const addOrderPayment = asyncHandler(async (req, res) => {
                 orderId: order.orderId,
                 orderRef: order._id,
                 userId: order.userId,
-                amount: finalAmount,
+                amount: paymentAmount,
                 subtotal: resolvedSubtotal,
                 discount: resolvedDiscount,
-                coupon: finalCoupon,
-                couponId: finalCouponId,
-                couponCode: finalCouponCode,
+                // coupon: 0,
+                // couponId: undefined,
+                // couponCode: undefined,
                 method,
                 status: finalStatus,
                 notes: notes || "",

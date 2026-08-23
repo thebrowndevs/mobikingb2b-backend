@@ -180,35 +180,36 @@ export const createRazorpayOrderForPayment = asyncHandler(async (req, res) => {
     let couponDiscount = 0;
     let couponDoc = null;
 
-    if (couponCode) {
-        // Validate coupon code
-        const coupon = await Coupon.findOne({ code: couponCode, active: true });
-        if (!coupon) {
-            throw new ApiError(404, "Coupon not found or inactive.");
-        }
+    // if (couponCode) {
+    //     // Validate coupon code
+    //     const coupon = await Coupon.findOne({ code: couponCode, active: true });
+    //     if (!coupon) {
+    //         throw new ApiError(404, "Coupon not found or inactive.");
+    //     }
 
-        // Run checks
-        if (coupon.type === "oneTime" && coupon.appliedBy?.some(c => c.user?.toString() === req.user?._id?.toString())) {
-            throw new ApiError(400, "Coupon already redeemed once.");
-        }
-        if (coupon.type === "oneTimeUser" && coupon.userId?.toString() !== req.user?._id?.toString()) {
-            throw new ApiError(400, "Invalid coupon for this user.");
-        }
+    //     // Run checks
+    //     if (coupon.type === "oneTime" && coupon.appliedBy?.some(c => c.user?.toString() === req.user?._id?.toString())) {
+    //         throw new ApiError(400, "Coupon already redeemed once.");
+    //     }
+    //     if (coupon.type === "oneTimeUser" && coupon.userId?.toString() !== req.user?._id?.toString()) {
+    //         throw new ApiError(400, "Invalid coupon for this user.");
+    //     }
 
-        // Calculate discount
-        if (coupon.percent) {
-            couponDiscount = payment.amount * (parseFloat(coupon.percent) * 0.01);
-            if (coupon.value && couponDiscount > coupon.value) {
-                couponDiscount = coupon.value;
-            }
-        } else {
-            couponDiscount = coupon.value || 0;
-        }
+    //     // Calculate discount
+    //     if (coupon.percent) {
+    //         couponDiscount = payment.amount * (parseFloat(coupon.percent) * 0.01);
+    //         if (coupon.value && couponDiscount > coupon.value) {
+    //             couponDiscount = coupon.value;
+    //         }
+    //     } else {
+    //         couponDiscount = coupon.value || 0;
+    //     }
 
-        couponDiscount = Math.min(couponDiscount, finalAmount);
-        finalAmount -= couponDiscount;
-        couponDoc = coupon;
-    }
+    //     couponDiscount = Math.min(couponDiscount, finalAmount);
+    //     finalAmount -= couponDiscount;
+    //     couponDoc = coupon;
+    // }
+
 
     // Initiate Razorpay Order
     const razorpayOrder = await initiateRazorpayPayment(payment._id, finalAmount);
