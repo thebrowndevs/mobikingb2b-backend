@@ -12,7 +12,8 @@ import {
     removeItemQuantityInQuotation,
     recordQuotationCallAttempt,
     getQuotationById,
-    getQuotationActivity
+    getQuotationActivity,
+    toggleQuotationLock
 } from "../controllers/quotation.controller.js";
 import { getPaginatedQuotations } from "../controllers/pagination.controller.js";
 
@@ -25,6 +26,7 @@ router.route("/paginated").get(verifyJWT, getPaginatedQuotations);
 router.route("/status").post(verifyJWT, updateQuotationStatus);
 router.route("/book").post(verifyJWT, bookQuotation);
 router.route("/:id/update-items").put(verifyJWT, updateQuotationItems);
+router.route("/:id/toggle-lock").post(verifyJWT, toggleQuotationLock);
 router.route("/:id/activity").get(verifyJWT, getQuotationActivity);
 router.route("/update").put(verifyJWT, updateQuotation);
 router.route("/items/add").post(verifyJWT, addItemQuantityInQuotation);

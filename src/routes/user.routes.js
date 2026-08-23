@@ -31,7 +31,8 @@ import {
     resetPasswordWithToken,
     getUserCart,
     getMyProfile,
-    verifyCustomerBusiness
+    verifyCustomerBusiness,
+    updateEmployeeDiscountCap
 } from "../controllers/user.controller.js";
 import { verifyJWT } from "../middlewares/auth.middlewares.js";
 import {
@@ -67,6 +68,7 @@ router.route("/customer/signup/email").post(customerSignupByEmail);
 router.route("/customer/login/email").post(customerLoginByEmail);
 router.route("/refresh-token").post(refreshAccessToken)
 router.route("/logout").post(verifyJWT, logoutUser);
+router.route("/employees/:id/discount-cap").put(verifyJWT, updateEmployeeDiscountCap);
 router.route("/employees/:_id").put(verifyJWT, editEmployee);
 router.route("/employees/:_id").delete(verifyJWT, deleteUser);
 router.route("/delete").delete(verifyJWT, deleteUser);

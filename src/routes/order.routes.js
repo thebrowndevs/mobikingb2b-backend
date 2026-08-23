@@ -40,7 +40,8 @@ import {
     updateManualShippingStatus,
     systemCreatedCancel,
     systemCreatedReject,
-    getOrderActivity
+    getOrderActivity,
+    toggleOrderLock
 } from "../controllers/order.controller.js";
 import {
     raisePartialReturnRequest,
@@ -91,6 +92,7 @@ router.route("/manual-ship").post(verifyJWT, manualShipOrder);
 router.route("/manual-ship/status").post(verifyJWT, updateManualShippingStatus);
 
 router.route("/:id/update-items").put(verifyJWT, updateOrderItems);
+router.route("/:id/toggle-lock").post(verifyJWT, toggleOrderLock);
 router.route("/:id/activity").get(verifyJWT, getOrderActivity);
 router.route("/:_id").put(verifyJWT, updateOrder);
 router.route("/items/add").post(verifyJWT, addItemQuantityInOrder);

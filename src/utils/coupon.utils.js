@@ -80,7 +80,7 @@ export const calculateCouponValue = ({ coupon, order }) => {
 /**
  * Transactional helper to apply a coupon on an order document and optionally update payment.
  */
-export const applyCouponToOrder = async ({ order, coupon, discountedAmount, session }) => {
+export const applyCouponToOrder = async ({ order, coupon, discountedAmount, appliedByRole = null, session }) => {
     // 1. Push coupon to order.couponsApplied
     order.couponsApplied = [{
         couponId: coupon._id,
@@ -101,6 +101,9 @@ export const applyCouponToOrder = async ({ order, coupon, discountedAmount, sess
 
     // 4. Lock order items and pricing
     order.couponLocked = true;
+    if (appliedByRole) {
+        order.couponAppliedByRole = appliedByRole;
+    }
 
     // 5. Save order inside transaction session
     await order.save({ session });
@@ -159,6 +162,7 @@ export const removeCouponFromOrder = async ({ order, paymentId, session }) => {
     // 2. Clear applied coupon info and release lock
     order.couponsApplied = [];
     order.couponLocked = false;
+    order.couponAppliedByRole = null;
 
     // 3. Save order
     await order.save({ session });

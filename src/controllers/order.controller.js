@@ -4248,6 +4248,46 @@ const updateOrder = asyncHandler(async (req, res) => {
         // If trying to update items/discounts/charges, validate editing timeframe constraints
         const isEditingItems = updates && (updates.items !== undefined || updates.discount !== undefined || updates.discountPercent !== undefined || updates.discountType !== undefined || updates.deliveryCharge !== undefined);
 
+        if (isEditingItems && order.isLocked && req.user?.role !== 'admin') {
+            throw new ApiError(403, "Order is locked. Contact admin to make changes.");
+        }
+
+        if (isEditingItems && req.user?.role === 'employee') {
+            // Guard: Employee cannot change per-item prices or per-item discounts
+            if (updates.items && Array.isArray(updates.items)) {
+                for (const reqItem of updates.items) {
+                    const matchingOld = order.items.find(
+                        it => (it.productId?._id || it.productId || '').toString() === (reqItem.productId || '').toString() &&
+                            it.variantName === reqItem.variantName
+                    );
+                    if (matchingOld) {
+                        if (Number(reqItem.price) !== Number(matchingOld.price) ||
+                            Number(reqItem.discount || 0) !== Number(matchingOld.discount || 0) ||
+                            Number(reqItem.discountPercent || 0) !== Number(matchingOld.discountPercent || 0)) {
+                            throw new ApiError(
+                                403,
+                                "Employees are not allowed to update item price or discount."
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Guard: Employee cannot edit global discount if any per-item discount exists
+            const hasPerItem = order.items.some(it => (it.discount || 0) > 0) || (updates.items && updates.items.some(it => (it.discount || 0) > 0));
+            if (hasPerItem && (updates.discount !== undefined || updates.discountPercent !== undefined)) {
+                throw new ApiError(403, "Global discount cannot be updated for employees when per-item discounts exist.");
+            }
+
+            // Guard: maxDiscountPercent cap validation
+            if (updates.discountPercent !== undefined) {
+                const user = await User.findById(req.user._id).select("maxDiscountPercent");
+                if (user && user.maxDiscountPercent > 0 && Number(updates.discountPercent) > user.maxDiscountPercent) {
+                    throw new ApiError(400, `Discount percent exceeds your maximum cap of ${user.maxDiscountPercent}%.`);
+                }
+            }
+        }
+
         if (order.couponLocked && isEditingItems) {
             throw new ApiError(400, "Order is locked because a coupon has been applied. Remove the coupon to edit items or pricing.");
         }
@@ -4550,6 +4590,10 @@ const addItemQuantityInOrder = async (req, res) => {
             const order = await Order.findById(orderId).session(session);
             if (!order) throw new ApiError(404, "Order not found");
 
+            if (order.isLocked && req.user?.role !== 'admin') {
+                throw new ApiError(403, "Order is locked. Contact admin to add items.");
+            }
+
             if (order.couponLocked) {
                 throw new ApiError(400, "Order is locked because a coupon has been applied. Remove the coupon to edit items or pricing.");
             }
@@ -4658,6 +4702,10 @@ const removeItemQuantityInOrder = async (req, res) => {
 
             const order = await Order.findById(orderId).session(session);
             if (!order) throw new ApiError(404, "Order not found");
+
+            if (order.isLocked && req.user?.role !== 'admin') {
+                throw new ApiError(403, "Order is locked. Contact admin to modify items.");
+            }
 
             if (order.couponLocked) {
                 throw new ApiError(400, "Order is locked because a coupon has been applied. Remove the coupon to edit items or pricing.");
@@ -8003,6 +8051,46 @@ export const updateOrderItems = asyncHandler(
                         );
                     }
 
+                    if (order.isLocked && req.user?.role !== 'admin') {
+                        throw new ApiError(
+                            403,
+                            "Order is locked. Contact admin to modify items or pricing."
+                        );
+                    }
+
+                    if (req.user?.role === 'employee' && items && Array.isArray(items)) {
+                        // Check if any items have been edited in terms of price or discount
+                        for (const reqItem of items) {
+                            const matchingOld = order.items.find(
+                                it => (it.productId?._id || it.productId || '').toString() === (reqItem.productId || '').toString() &&
+                                    it.variantName === reqItem.variantName
+                            );
+                            if (matchingOld) {
+                                if (Number(reqItem.price) !== Number(matchingOld.price) ||
+                                    Number(reqItem.discount || 0) !== Number(matchingOld.discount || 0) ||
+                                    Number(reqItem.discountPercent || 0) !== Number(matchingOld.discountPercent || 0)) {
+                                    throw new ApiError(
+                                        403,
+                                        "Employees are not allowed to update item price or discount."
+                                    );
+                                }
+                            } else {
+                                // Find product to calculate standard slab price
+                                const product = await Product.findById(reqItem.productId);
+                                if (!product) {
+                                    throw new ApiError(404, `Product not found for ID: ${reqItem.productId}`);
+                                }
+                                const basePrice = calculateB2BItemPrice(product, Math.floor(Number(reqItem.quantity || 1)));
+                                if (Number(reqItem.price) !== Number(basePrice) || Number(reqItem.discount || 0) > 0 || Number(reqItem.discountPercent || 0) > 0) {
+                                    throw new ApiError(
+                                        403,
+                                        "Employees are not allowed to add new items with custom prices or discounts. Please use standard slab pricing."
+                                    );
+                                }
+                            }
+                        }
+                    }
+
                     if (order.couponLocked) {
                         throw new ApiError(
                             400,
@@ -10068,3 +10156,28 @@ const legacy_updateOrder = asyncHandler(async (req, res) => {
 //         new ApiResponse(200, { order }, "Order rejected and stock restored successfully.")
 //     );
 // });
+
+export const toggleOrderLock = asyncHandler(async (req, res) => {
+    if (req.user?.role !== 'admin') {
+        throw new ApiError(403, "Only admins can lock or unlock orders.");
+    }
+    const { id } = req.params;
+    const order = await Order.findById(id);
+    if (!order) {
+        throw new ApiError(404, "Order not found.");
+    }
+    order.isLocked = !order.isLocked;
+    order.lockedBy = order.isLocked ? req.user._id : null;
+    order.lockedAt = order.isLocked ? new Date() : null;
+    await order.save();
+
+    await logActivity({
+        orderId: order._id,
+        action: order.isLocked ? "Order Locked" : "Order Unlocked",
+        remarks: `Order was ${order.isLocked ? 'locked' : 'unlocked'} by admin.`,
+        req
+    });
+
+    return res.status(200).json(new ApiResponse(200, order, `Order successfully ${order.isLocked ? 'locked' : 'unlocked'}`));
+});
+

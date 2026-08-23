@@ -1103,7 +1103,8 @@ const createEmployee = asyncHandler(async (req, res) => {
         name, email, phoneNo,
         password, role,
         permissions, departments,
-        profilePicture, documents
+        profilePicture, documents,
+        maxDiscountPercent
     } = req.body
 
     if (
@@ -1139,6 +1140,7 @@ const createEmployee = asyncHandler(async (req, res) => {
         departments,
         permissions,
         role,
+        maxDiscountPercent: Number(maxDiscountPercent || 0),
         profilePicture: profilePicture ? profilePicture : "",
         documents: documents ? documents : []
     })
@@ -1199,7 +1201,7 @@ const createEmployee = asyncHandler(async (req, res) => {
 const editEmployee = asyncHandler(async (req, res) => {
     // const { _id } = req.user;
     const { _id } = req.params;
-    let { name, email, phoneNo, role, permissions, departments, business } = req.body
+    let { name, email, phoneNo, role, permissions, departments, business, maxDiscountPercent } = req.body
 
     if (
         [name, phoneNo, role].some((field) => field?.trim() === "")
@@ -1236,7 +1238,8 @@ const editEmployee = asyncHandler(async (req, res) => {
         name,
         email,
         phoneNo,
-        role
+        role,
+        maxDiscountPercent: Number(maxDiscountPercent || 0)
     };
 
     if (permissions) {
@@ -2003,6 +2006,25 @@ const verifyCustomerBusiness = asyncHandler(async (req, res) => {
         new ApiResponse(200, user, "Business verification status updated successfully")
     );
 });
+
+export const updateEmployeeDiscountCap = asyncHandler(async (req, res) => {
+    if (req.user?.role !== 'admin') {
+        throw new ApiError(403, "Only admins can set discount caps.");
+    }
+    const { id } = req.params;
+    const { maxDiscountPercent } = req.body;
+
+    const employee = await User.findById(id);
+    if (!employee) {
+        throw new ApiError(404, "Employee not found.");
+    }
+
+    employee.maxDiscountPercent = Number(maxDiscountPercent || 0);
+    await employee.save();
+
+    return res.status(200).json(new ApiResponse(200, employee, "Employee discount cap updated successfully."));
+});
+
 
 export {
     loginUser,

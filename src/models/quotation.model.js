@@ -61,6 +61,17 @@ const quotationSchema = new mongoose.Schema(
             enum: ["flat", "percentage"],
             default: "flat"
         },
+        isLocked: {
+            type: Boolean,
+            default: false
+        },
+        lockedBy: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'User'
+        },
+        lockedAt: {
+            type: Date
+        },
         gst: { type: String },
         subtotal: Number,
 

@@ -984,6 +984,26 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                 throw new ApiError(404, "Quotation not found.");
             }
 
+            if (quotation.isLocked && req.user?.role !== 'admin') {
+                throw new ApiError(403, "Quotation is locked. Contact admin to make changes.");
+            }
+
+            if (req.user?.role === 'employee') {
+                // Guard: Employee cannot edit global discount if any per-item discount exists
+                const hasPerItem = quotation.items.some(it => (it.discount || 0) > 0) || (items && items.some(it => (it.discount || 0) > 0));
+                if (hasPerItem && (discount !== undefined || discountPercent !== undefined)) {
+                    throw new ApiError(403, "Global discount cannot be updated for employees when per-item discounts exist.");
+                }
+
+                // Guard: maxDiscountPercent cap validation
+                if (discountPercent !== undefined) {
+                    const user = await User.findById(req.user._id).select("maxDiscountPercent");
+                    if (user && user.maxDiscountPercent > 0 && Number(discountPercent) > user.maxDiscountPercent) {
+                        throw new ApiError(400, `Discount percent exceeds your maximum cap of ${user.maxDiscountPercent}%.`);
+                    }
+                }
+            }
+
             if (quotation.status === "Booked") {
                 throw new ApiError(400, "Cannot edit a booked quotation.");
             }
@@ -1282,6 +1302,10 @@ export const addItemQuantityInQuotation = asyncHandler(async (req, res) => {
             const quotation = await Quotation.findById(quotationId).session(session);
             if (!quotation) throw new ApiError(404, "Quotation not found.");
 
+            if (quotation.isLocked && req.user?.role !== 'admin') {
+                throw new ApiError(403, "Quotation is locked. Contact admin to make changes.");
+            }
+
             if (["Booked", "Rejected", "Cancelled"].includes(quotation.status)) {
                 throw new ApiError(400, `Cannot add items to a quotation in ${quotation.status} status.`);
             }
@@ -1523,6 +1547,10 @@ export const removeItemQuantityInQuotation = asyncHandler(async (req, res) => {
         await session.withTransaction(async () => {
             const quotation = await Quotation.findById(quotationId).session(session);
             if (!quotation) throw new ApiError(404, "Quotation not found.");
+
+            if (quotation.isLocked && req.user?.role !== 'admin') {
+                throw new ApiError(403, "Quotation is locked. Contact admin to make changes.");
+            }
 
             if (["Booked", "Rejected", "Cancelled"].includes(quotation.status)) {
                 throw new ApiError(400, `Cannot remove items from a quotation in ${quotation.status} status.`);
@@ -1786,6 +1814,39 @@ export const updateQuotationItems =
                             404,
                             "Quotation not found."
                         );
+                    }
+
+                    if (quotation.isLocked && req.user?.role !== 'admin') {
+                        throw new ApiError(
+                            403,
+                            "Quotation is locked. Contact admin to modify items or pricing."
+                        );
+                    }
+
+                    if (req.user?.role === 'employee' && items && Array.isArray(items)) {
+                        // Check if any items have been edited in terms of price or discount
+                        for (const reqItem of items) {
+                            const matchingOld = quotation.items.find(
+                                it => (it.productId?._id || it.productId || '').toString() === (reqItem.productId || '').toString() &&
+                                    it.variantName === reqItem.variantName
+                            );
+                            if (matchingOld) {
+                                if (Number(reqItem.price) !== Number(matchingOld.price) ||
+                                    Number(reqItem.discount || 0) !== Number(matchingOld.discount || 0) ||
+                                    Number(reqItem.discountPercent || 0) !== Number(matchingOld.discountPercent || 0)) {
+                                    throw new ApiError(
+                                        403,
+                                        "Employees are not allowed to update item price or discount."
+                                    );
+                                }
+                            } else {
+                                // Adding a new item in full Edit Items mode is blocked for employees (they should use the standalone Add Item button)
+                                throw new ApiError(
+                                    403,
+                                    "Employees are not allowed to add new items via full edit mode. Use 'Add Item' button."
+                                );
+                            }
+                        }
                     }
 
                     if (
@@ -3150,3 +3211,27 @@ export const getQuotationActivity = asyncHandler(async (req, res) => {
 //         session.endSession();
 //     }
 // });
+
+export const toggleQuotationLock = asyncHandler(async (req, res) => {
+    if (req.user?.role !== 'admin') {
+        throw new ApiError(403, "Only admins can lock or unlock quotations.");
+    }
+    const { id } = req.params;
+    const quotation = await Quotation.findById(id);
+    if (!quotation) {
+        throw new ApiError(404, "Quotation not found.");
+    }
+    quotation.isLocked = !quotation.isLocked;
+    quotation.lockedBy = quotation.isLocked ? req.user._id : null;
+    quotation.lockedAt = quotation.isLocked ? new Date() : null;
+    await quotation.save();
+
+    await logActivity({
+        quotationId: quotation._id,
+        action: quotation.isLocked ? "Quotation Locked" : "Quotation Unlocked",
+        remarks: `Quotation was ${quotation.isLocked ? 'locked' : 'unlocked'} by admin.`,
+        req
+    });
+
+    return res.status(200).json(new ApiResponse(200, quotation, `Quotation successfully ${quotation.isLocked ? 'locked' : 'unlocked'}`));
+});

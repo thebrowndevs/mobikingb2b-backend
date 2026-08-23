@@ -250,6 +250,22 @@ const orderSchema = new mongoose.Schema(
             type: Boolean,
             default: false
         },
+        couponAppliedByRole: {
+            type: String,
+            enum: ['admin', 'employee', 'user'],
+            default: null
+        },
+        isLocked: {
+            type: Boolean,
+            default: false
+        },
+        lockedBy: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'User'
+        },
+        lockedAt: {
+            type: Date
+        },
         couponsApplied: [{
             couponId: {
                 type: mongoose.Schema.Types.ObjectId,

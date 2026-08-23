@@ -168,6 +168,10 @@ const userSchema = new mongoose.Schema({
         of: permissionSchema,
         default: () => new Map()
     },
+    maxDiscountPercent: {
+        type: Number,
+        default: 0
+    },
     queries: [{
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Query'

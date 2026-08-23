@@ -247,7 +247,13 @@ export const applyCouponAdmin = asyncHandler(async (req, res) => {
     try {
         await session.withTransaction(async () => {
             // Apply coupon updates to order and potentially payment
-            const result = await applyCouponToOrder({ order, coupon, discountedAmount, session });
+            const result = await applyCouponToOrder({
+                order,
+                coupon,
+                discountedAmount,
+                appliedByRole: req.user?.role || 'admin',
+                session
+            });
             paymentUpdated = result.paymentUpdated;
             payment = result.payment;
 
@@ -303,6 +309,12 @@ export const removeCouponAdmin = asyncHandler(async (req, res) => {
 
     if (order.paymentStatus === "Paid") {
         throw new ApiError(400, "Cannot remove coupon from a paid order");
+    }
+
+    // Role Hierarchy Rule:
+    // Admin applied coupons cannot be removed by non-admins
+    if (order.couponAppliedByRole === 'admin' && req.user?.role !== 'admin') {
+        throw new ApiError(403, "Coupon was applied by Admin and cannot be removed by your role.");
     }
 
     const couponId = order.couponsApplied[0].couponId;
@@ -381,7 +393,13 @@ export const applyCouponUser = asyncHandler(async (req, res) => {
 
     try {
         await session.withTransaction(async () => {
-            const result = await applyCouponToOrder({ order, coupon, discountedAmount, session });
+            const result = await applyCouponToOrder({
+                order,
+                coupon,
+                discountedAmount,
+                appliedByRole: req.user?.role || 'user',
+                session
+            });
             paymentUpdated = result.paymentUpdated;
             payment = result.payment;
 
@@ -431,6 +449,12 @@ export const removeCouponUser = asyncHandler(async (req, res) => {
 
     if (order.paymentStatus === "Paid") {
         throw new ApiError(400, "Cannot remove coupon from a paid order");
+    }
+
+    // Role Hierarchy Rule:
+    // Admin/Employee applied coupons cannot be removed by users
+    if (['admin', 'employee'].includes(order.couponAppliedByRole) && req.user?.role === 'user') {
+        throw new ApiError(403, "Coupon was applied by staff and cannot be removed by user.");
     }
 
     if (!order.couponsApplied || order.couponsApplied.length === 0) {
