@@ -352,3 +352,121 @@ export const removeCouponAdmin = asyncHandler(async (req, res) => {
         new ApiResponse(200, { order, payment }, "Coupon removed successfully by admin")
     );
 });
+
+// APPLY COUPON BY USER
+export const applyCouponUser = asyncHandler(async (req, res) => {
+    const { orderId, code } = req.body;
+    const userId = req.user?._id;
+
+    if (!orderId) throw new ApiError(400, "Order ID is required");
+    if (!code) throw new ApiError(400, "Coupon code is required");
+
+    const coupon = await Coupon.findOne({ code, active: true });
+    if (!coupon) throw new ApiError(404, "Coupon not found");
+
+    const order = await Order.findById(orderId);
+    if (!order) throw new ApiError(404, "Order not found");
+
+    if (order.userId.toString() !== userId.toString()) {
+        throw new ApiError(403, "You do not have permission to apply a coupon to this order");
+    }
+
+    await validateCoupon({ coupon, userId, order, isAdmin: false });
+
+    const discountedAmount = calculateCouponValue({ coupon, order });
+
+    const session = await mongoose.startSession();
+    let paymentUpdated = false;
+    let payment = null;
+
+    try {
+        await session.withTransaction(async () => {
+            const result = await applyCouponToOrder({ order, coupon, discountedAmount, session });
+            paymentUpdated = result.paymentUpdated;
+            payment = result.payment;
+
+            const updatedCoupon = await Coupon.findOneAndUpdate(
+                {
+                    _id: coupon._id,
+                    "appliedBy.order": { $ne: order._id }
+                },
+                {
+                    $push: {
+                        appliedBy: {
+                            user: userId,
+                            order: order._id
+                        }
+                    }
+                },
+                { session, new: true }
+            );
+            if (!updatedCoupon) {
+                throw new ApiError(400, "Coupon has already been applied to this order");
+            }
+        });
+    } catch (err) {
+        throw err;
+    } finally {
+        session.endSession();
+    }
+
+    return res.status(200).json(
+        new ApiResponse(200, { order, payment }, "Coupon applied successfully")
+    );
+});
+
+// REMOVE COUPON BY USER
+export const removeCouponUser = asyncHandler(async (req, res) => {
+    const { orderId } = req.body;
+    const userId = req.user?._id;
+
+    if (!orderId) throw new ApiError(400, "Order ID is required");
+
+    const order = await Order.findById(orderId);
+    if (!order) throw new ApiError(404, "Order not found");
+
+    if (order.userId.toString() !== userId.toString()) {
+        throw new ApiError(403, "You do not have permission to modify this order");
+    }
+
+    if (order.paymentStatus === "Paid") {
+        throw new ApiError(400, "Cannot remove coupon from a paid order");
+    }
+
+    if (!order.couponsApplied || order.couponsApplied.length === 0) {
+        throw new ApiError(400, "No coupon applied to this order");
+    }
+
+    const couponId = order.couponsApplied[0].couponId;
+    const targetPayment = await Payment.findOne({ orderRef: order._id, couponId });
+
+    if (targetPayment && targetPayment.status === "Paid") {
+        throw new ApiError(400, "Cannot remove coupon because the discounted payment has already been paid");
+    }
+
+    const session = await mongoose.startSession();
+    let paymentRestored = false;
+    let payment = null;
+
+    try {
+        await session.withTransaction(async () => {
+            const result = await removeCouponFromOrder({ order, paymentId: targetPayment?._id, session });
+            paymentRestored = result.paymentRestored;
+            payment = result.payment;
+
+            await Coupon.updateOne(
+                { _id: couponId },
+                { $pull: { appliedBy: { user: userId, order: order._id } } },
+                { session }
+            );
+        });
+    } catch (err) {
+        throw err;
+    } finally {
+        session.endSession();
+    }
+
+    return res.status(200).json(
+        new ApiResponse(200, { order, payment }, "Coupon removed successfully")
+    );
+});

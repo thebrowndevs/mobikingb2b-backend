@@ -9,7 +9,9 @@ import {
     updateCoupon,
     getAdminCoupons,
     applyCouponAdmin,
-    removeCouponAdmin
+    removeCouponAdmin,
+    applyCouponUser,
+    removeCouponUser
 } from "../controllers/coupon.controller.js";
 import { getPaginatedCoupons } from "../controllers/pagination.controller.js";
 
@@ -22,6 +24,8 @@ router.get("/admin/all", verifyJWT, getAdminCoupons);
 router.get("/paginated", verifyJWT, getPaginatedCoupons);
 router.get("/code/:code", verifyJWT, getCouponByCode);
 router.get("/code/validate/:code/:paymentMethod", verifyJWT, checkCouponValid);
+router.post("/apply", verifyJWT, applyCouponUser);
+router.post("/remove", verifyJWT, removeCouponUser);
 router.post("/admin/apply", verifyJWT, applyCouponAdmin);
 router.post("/admin/remove", verifyJWT, removeCouponAdmin);
 router.delete("/:id", verifyJWT, deleteCoupon);

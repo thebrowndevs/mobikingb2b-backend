@@ -633,20 +633,26 @@ export const bookQuotation = asyncHandler(async (req, res) => {
                 const couponApplied = isCouponApplied ? (newOrder.discount || 0) : 0;
                 const discountApplied = isCouponApplied ? 0 : (newOrder.discount || 0);
 
-                const paymentsToCreate = req.body.stages.map(stg => ({
-                    orderId: newOrder.orderId,
-                    orderRef: newOrder._id,
-                    userId: quotation.userId,
-                    amount: Number(stg.amount),
-                    subtotal: Number(newOrder.subtotal || 0),
-                    discount: Number(discountApplied),
-                    coupon: Number(couponApplied),
-                    couponId: newOrder.coupon || undefined,
-                    method: stg.method,
-                    status: stg.status || "Pending",
-                    notes: stg.notes || "",
-                    paidAt: stg.status === "Paid" ? new Date() : undefined
-                }));
+                const paymentsToCreate = req.body.stages.map(stg => {
+                    const resolvedSubtotal = stg.subtotal !== undefined ? Number(stg.subtotal) : Number(stg.amount);
+                    const resolvedDiscount = stg.discount !== undefined ? Number(stg.discount) : Number(discountApplied);
+                    const resolvedCoupon = isCouponApplied ? Number(couponApplied) : 0;
+
+                    return {
+                        orderId: newOrder.orderId,
+                        orderRef: newOrder._id,
+                        userId: quotation.userId,
+                        amount: Number(stg.amount),
+                        subtotal: resolvedSubtotal,
+                        discount: resolvedDiscount,
+                        coupon: resolvedCoupon,
+                        couponId: newOrder.coupon || undefined,
+                        method: stg.method,
+                        status: stg.status || "Pending",
+                        notes: stg.notes || "",
+                        paidAt: stg.status === "Paid" ? new Date() : undefined
+                    };
+                });
                 const insertedPayments = await Payment.insertMany(paymentsToCreate, { session });
 
                 // Call notification for any pending payments

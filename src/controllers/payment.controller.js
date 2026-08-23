@@ -107,7 +107,7 @@ export const getPaymentById = asyncHandler(async (req, res) => {
     const p = await Payment.findById(paymentId)
         .populate({
             path: "orderRef",
-            select: "orderId name phoneNo items orderAmount amountPaid remainingAmount paymentStatus subtotal discount deliveryCharge",
+            select: "orderId name phoneNo items orderAmount amountPaid remainingAmount paymentStatus subtotal discount deliveryCharge couponsApplied",
             populate: {
                 path: "items.productId",
                 select: "name images"
@@ -130,6 +130,7 @@ export const getPaymentById = asyncHandler(async (req, res) => {
         discount: p.discount,
         coupon: p.coupon,
         couponId: p.couponId,
+        couponCode: p.couponCode || "",
         orderId: p.orderRef?._id,
         orderIdString: p.orderRef?.orderId,
         items: p.orderRef?.items?.map(item => ({
@@ -146,6 +147,7 @@ export const getPaymentById = asyncHandler(async (req, res) => {
         paymentStatus: p.orderRef?.paymentStatus || "Pending",
         orderSubtotal: p.orderRef?.subtotal || 0,
         orderDiscount: p.orderRef?.discount || 0,
+        orderCouponsApplied: p.orderRef?.couponsApplied || [],
         orderDeliveryCharge: p.orderRef?.deliveryCharge || 0,
         status: p.status,
         paidAt: p.paidAt,
