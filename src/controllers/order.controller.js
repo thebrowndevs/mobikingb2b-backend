@@ -1033,15 +1033,19 @@ const createCodOrder = asyncHandler(async (req, res) => {
                 if (!foundCoupon) {
                     throw new Error(404, "Coupon not found");
                 }
-                if (foundCoupon?.type == "oneTime" || foundCoupon?.type == "oneTimeUser") {
+                const alreadyLogged = foundCoupon.appliedBy?.some(
+                    c => c?.user?.toString() === req?.user?._id?.toString() &&
+                        c?.order?.toString() === newOrderDoc._id?.toString()
+                );
+                if (!alreadyLogged) {
                     foundCoupon.appliedBy = [
-                        ...foundCoupon?.appliedBy,
+                        ...(foundCoupon?.appliedBy || []),
                         {
                             user: req?.user?._id,
                             order: newOrderDoc._id
                         }
-                    ]
-                    await foundCoupon.save({ session })
+                    ];
+                    await foundCoupon.save({ session });
                 }
             }
 
@@ -1676,6 +1680,48 @@ const createOnlineOrder =
                                 ...couponData,
                                 ...addressDetails,
 
+                                /*
+                                 * Populate couponsApplied[] for admin-panel coupon
+                                 * utilities (applyCouponToOrder / removeCouponFromOrder)
+                                 * and role-based hierarchy guards (couponAppliedByRole).
+                                 *
+                                 * createOnlineOrder is always a user self-checkout,
+                                 * so couponAppliedByRole is always 'user'.
+                                 */
+                                ...(findCoupon
+                                    ? {
+                                        couponsApplied: [
+                                            {
+                                                couponId:
+                                                    findCoupon._id,
+                                                appliedValue:
+                                                    couponDiscount,
+                                                code:
+                                                    findCoupon.code,
+                                                minCartValue:
+                                                    findCoupon.minCartValue,
+                                                value:
+                                                    String(
+                                                        findCoupon.value ??
+                                                        ""
+                                                    ),
+                                                percent:
+                                                    String(
+                                                        findCoupon.percent ??
+                                                        ""
+                                                    )
+                                            }
+                                        ],
+
+                                        couponLocked:
+                                            true,
+
+                                        couponAppliedByRole:
+                                            "user"
+                                    }
+                                    : {}
+                                ),
+
                                 userId,
 
                                 name:
@@ -2043,19 +2089,19 @@ const createOnlineOrder =
                                             finalOrderAmount,
 
                                         subtotal:
-                                            subtotal_amount,
+                                            finalOrderAmount,
 
                                         discount:
                                             0,
 
-                                        coupon:
-                                            isCouponApplied
-                                                ? couponDiscount
-                                                : 0,
+                                        // coupon:
+                                        //     isCouponApplied
+                                        //         ? couponDiscount
+                                        //         : 0,
 
-                                        couponId:
-                                            newOrder.coupon ||
-                                            undefined,
+                                        // couponId:
+                                        //     newOrder.coupon ||
+                                        //     undefined,
 
                                         method:
                                             "Online",

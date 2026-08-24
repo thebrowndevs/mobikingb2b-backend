@@ -37,11 +37,20 @@ export const confirmOrderPaymentLogic = async (orderId, razorpayOrderId, razorpa
 
     const userId = reqUserId || order.userId;
 
-    // 3. Process Coupon usages
-    if (order?.coupon) {
-        let foundCoupon = await Coupon.findById(order?.coupon).session(session);
-        if (foundCoupon?.type === "oneTime" || foundCoupon?.type === "oneTimeUser") {
-            // Check if this user already applied the coupon to prevent double recording
+    // 3. Process Coupon usages — record appliedBy for ALL coupon types via array / flat field
+    const legacyCouponIds = [];
+    if (order?.couponsApplied && order.couponsApplied.length > 0) {
+        order.couponsApplied.forEach(c => {
+            if (c.couponId) legacyCouponIds.push(c.couponId);
+        });
+    } else if (order?.coupon) {
+        legacyCouponIds.push(order.coupon);
+    }
+
+    for (const cId of legacyCouponIds) {
+        let foundCoupon = await Coupon.findById(cId).session(session);
+        if (foundCoupon) {
+            // Idempotency guard: don't double-record the same user+order pair
             const alreadyLogged = foundCoupon.appliedBy?.some(
                 c => c?.user?.toString() === userId?.toString() && c?.order?.toString() === order?._id?.toString()
             );
@@ -438,6 +447,38 @@ export const confirmPaymentRecordPaidLogic =
                     session
                 }
             );
+        }
+
+        /*
+         * COUPON: Record appliedBy for ALL coupon types on full payment.
+         * This MUST run only on the fully-paid path to prevent recording
+         * redemptions for abandoned / failed payments. Supports array & flat field.
+         */
+        const checkoutCouponIds = [];
+        if (order.couponsApplied && order.couponsApplied.length > 0) {
+            order.couponsApplied.forEach(c => {
+                if (c.couponId) checkoutCouponIds.push(c.couponId);
+            });
+        } else if (order.coupon) {
+            checkoutCouponIds.push(order.coupon);
+        }
+
+        for (const cId of checkoutCouponIds) {
+            const couponDoc = await Coupon.findById(cId).session(session);
+            if (couponDoc) {
+                const alreadyLogged = couponDoc.appliedBy?.some(
+                    c =>
+                        c?.user?.toString() === order.userId?.toString() &&
+                        c?.order?.toString() === order._id?.toString()
+                );
+                if (!alreadyLogged) {
+                    couponDoc.appliedBy = [
+                        ...(couponDoc.appliedBy || []),
+                        { user: order.userId, order: order._id }
+                    ];
+                    await couponDoc.save({ session });
+                }
+            }
         }
 
         /*

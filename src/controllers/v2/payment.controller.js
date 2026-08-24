@@ -228,6 +228,44 @@ export const paymentWebhookV2 = asyncHandler(async (req, res) => {
             }
         }
     }
+    else if (event === "payment.failed") {
+        /*
+         * Razorpay fires payment.failed when the user's payment attempt is
+         * declined, timed-out, or cancelled.
+         *
+         * Stock restoration is intentionally NOT triggered here — the existing
+         * holdAbandonedOrder cron / endpoint handles that to avoid race
+         * conditions with any pending retry attempts.
+         *
+         * Coupon state: since coupon.appliedBy is only recorded on successful
+         * payment confirmation (confirmPaymentRecordPaidLogic), a failed payment
+         * automatically leaves the coupon reusable — no rollback needed here.
+         */
+        const failedPayment = payload?.payment?.entity;
+        const razorpayOrderId = failedPayment?.order_id;
+        const razorpayPaymentId = failedPayment?.id;
+        const errorCode = failedPayment?.error_code;
+        const errorDesc = failedPayment?.error_description;
+        const errorSource = failedPayment?.error_source;
+
+        console.warn(
+            `payment.failed: razorpayOrderId=${razorpayOrderId}, ` +
+            `paymentId=${razorpayPaymentId}, error=${errorCode} — ${errorDesc}`
+        );
+
+        if (razorpayOrderId) {
+            // Log failure details on the internal Payment record for support visibility
+            await Payment.findOneAndUpdate(
+                { razorpayOrderId, status: "Pending" },
+                {
+                    $set: {
+                        notes: `Payment failed: [${errorCode}] ${errorDesc} (source: ${errorSource || "unknown"}). ` +
+                            `Razorpay payment ID: ${razorpayPaymentId || "N/A"}.`
+                    }
+                }
+            );
+        }
+    }
 
     return res.status(200).json({ status: "Webhook verified and processed" });
 });
