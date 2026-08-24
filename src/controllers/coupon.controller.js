@@ -4,6 +4,7 @@ import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { Order } from "../models/order.model.js";
 import { Payment } from "../models/payment.model.js";
+import { Cart } from "../models/cart.model.js";
 import mongoose from "mongoose";
 import {
     validateCoupon,
@@ -122,6 +123,16 @@ export const checkCouponValid = asyncHandler(async (req, res) => {
 
     if (coupon?.type == "online" && paymentMethod != coupon?.type) {
         throw new ApiError(400, "Coupon can only be applied if you pay online");
+    }
+
+    if (coupon?.minCartValue && coupon.minCartValue > 0) {
+        const cart = await Cart.findById(req?.user?.cart);
+        if (!cart || Number(cart.totalCartValue || 0) < Number(coupon.minCartValue)) {
+            throw new ApiError(
+                400,
+                `Minimum cart value of Rs. ${coupon.minCartValue} is required to apply this coupon`
+            );
+        }
     }
 
     if (coupon?.type == "oneTime" && coupon?.appliedBy?.some(c => c?.user?.toString() == userId?.toString())) {
