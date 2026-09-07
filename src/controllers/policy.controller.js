@@ -126,12 +126,15 @@ export const updateCompanyDetails = asyncHandler(async (req, res) => {
  * Returns the minimum cart values enforced for Order Requests and direct Buy Now orders.
  */
 export const getCompanyLimits = asyncHandler(async (req, res) => {
-  const details = await CompanyDetails.findOne().select("minOrderLimit minQuotationLimit").lean();
+  const details = await CompanyDetails.findOne()
+    .select("minOrderLimit minQuotationLimit paymentGatewaySettings").lean();
 
   return res.status(200).json(
     new ApiResponse(200, {
       minOrderLimit: details?.minOrderLimit ?? 0,
-      minQuotationLimit: details?.minQuotationLimit ?? 0
+      minQuotationLimit: details?.minQuotationLimit ?? 0,
+      enableRazorpay: details?.paymentGatewaySettings?.enableRazorpay ?? true,
+      enablePhonepe: details?.paymentGatewaySettings?.enablePhonepe ?? true,
     }, "Company limits fetched successfully")
   );
 });

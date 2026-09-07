@@ -26,7 +26,7 @@ import { Counter } from './../models/counter.model.js';
 import { Stock } from '../models/stock.model.js';
 import { STOCK_TYPES, ORDER_TYPES } from '../constants.js';
 import { initiateRazorpayPaymentLink } from '../services/razorpay.service.js';
-import { initiatePhonepePaymentLink } from '../services/phonepe.service.js';
+import { initiatePhonepePaymentLink, initiatePhonepePayment, checkPhonepeOrderStatus } from '../services/phonepe.service.js';
 import { CompanyDetails } from '../models/company_details.model.js';
 import { confirmPaymentRecordPaidLogic } from '../services/payment.service.js';
 import { recalculateOrderTotals, syncItemDiscount, determineSlabForQuantity } from '../utils/pricing.js';
@@ -1109,7 +1109,8 @@ const createOnlineOrder =
                     subtotal,
                     address,
                     addressId,
-                    isAppOrder
+                    isAppOrder,
+                    gateway = "razorpay"
                 } = req.body;
 
                 /*
@@ -1630,30 +1631,35 @@ const createOnlineOrder =
 
                 /*
                  * =====================================================
-                 * CREATE RAZORPAY ORDER
+                 * CREATE GATEWAY ORDER (RAZORPAY OR PHONEPE)
                  * =====================================================
                  */
-                const razorpay =
-                    razorpayConfig();
+                let razorpayOrder = null;
+                let phonepeResponse = null;
 
-                const razorpayOrder =
-                    await razorpay.orders.create(
-                        {
-                            amount:
-                                Math.round(
-                                    finalOrderAmount *
-                                    100
-                                ),
-                            currency:
-                                "INR",
-
-                            receipt:
-                                `rcpt_${uuidv4().split("-")[0]}`,
-
-                            payment_capture:
-                                1
-                        }
+                if (gateway === "phonepe") {
+                    const reqOrigin = req.headers.origin || `${req.protocol}://${req.get('host')}`;
+                    const backendOrigin = `${req.protocol}://${req.get('host')}`;
+                    const callbackUrl = `${backendOrigin}/api/v1/orders/online/phonepe-callback`;
+                    const tempPhonepeOrderId = `ORD_${uuidv4().split("-")[0].toUpperCase()}`;
+                    phonepeResponse = await initiatePhonepePayment(
+                        tempPhonepeOrderId,
+                        finalOrderAmount,
+                        phoneNo.trim(),
+                        reqOrigin,
+                        backendOrigin,
+                        callbackUrl
                     );
+                    phonepeResponse.id = tempPhonepeOrderId;
+                } else {
+                    const razorpay = razorpayConfig();
+                    razorpayOrder = await razorpay.orders.create({
+                        amount: Math.round(finalOrderAmount * 100),
+                        currency: "INR",
+                        receipt: `rcpt_${uuidv4().split("-")[0]}`,
+                        payment_capture: 1
+                    });
+                }
 
                 let newOrder;
                 let newPayment;
@@ -1675,7 +1681,13 @@ const createOnlineOrder =
                         newOrder =
                             new Order({
                                 gateway:
-                                    "razorpay",
+                                    gateway === "phonepe" ? "phonepe" : "razorpay",
+
+                                phonepeOrderId:
+                                    phonepeResponse ? phonepeResponse.id : undefined,
+
+                                razorpayOrderId:
+                                    razorpayOrder ? razorpayOrder.id : undefined,
 
                                 ...couponData,
                                 ...addressDetails,
@@ -1769,7 +1781,12 @@ const createOnlineOrder =
                                 orderId,
 
                                 razorpayOrderId:
-                                    razorpayOrder.id,
+                                    razorpayOrder ? razorpayOrder.id : undefined,
+
+                                phonepeOrderId:
+                                    phonepeResponse ? phonepeResponse.id : undefined,
+
+                                gateway,
 
                                 subtotal:
                                     subtotal_amount,
@@ -2106,11 +2123,17 @@ const createOnlineOrder =
                                         method:
                                             "Online",
 
+                                        gateway:
+                                            gateway === "phonepe" ? "phonepe" : "razorpay",
+
                                         status:
                                             "Pending",
 
                                         razorpayOrderId:
-                                            razorpayOrder.id,
+                                            razorpayOrder ? razorpayOrder.id : undefined,
+
+                                        phonepeOrderId:
+                                            phonepeResponse ? phonepeResponse.id : undefined,
 
                                         notes:
                                             "Auto-created on Buy Now checkout"
@@ -2202,12 +2225,31 @@ const createOnlineOrder =
                             "orders"
                         );
 
+                if (gateway === "phonepe" && phonepeResponse) {
+                    return res.status(201).json(
+                        new ApiResponse(
+                            201,
+                            {
+                                gateway: "phonepe",
+                                url: phonepeResponse.redirectUrl || phonepeResponse.url,
+                                phonepeOrderId: phonepeResponse.id,
+                                newOrderId: newOrder._id,
+                                paymentId: newPayment._id,
+                                user: updatedUser
+                            },
+                            "PhonePe Order Created Successfully"
+                        )
+                    );
+                }
+
                 return res
                     .status(201)
                     .json(
                         new ApiResponse(
                             201,
                             {
+                                gateway: "razorpay",
+
                                 razorpayOrderId:
                                     razorpayOrder.id,
 
@@ -2257,6 +2299,72 @@ const createOnlineOrder =
             }
         }
     );
+
+/* ─────────────────────────────────────────────────────────────────────
+   phonepeCallbackV1 — Handles browser returns / GET queries from PhonePe
+───────────────────────────────────────────────────────────────────── */
+export const phonepeCallbackV1 = asyncHandler(async (req, res) => {
+    const transactionId = req.query.id;
+    if (!transactionId) {
+        return res.status(400).send("Missing transaction identity parameter.");
+    }
+
+    try {
+        let order = await Order.findOne({ phonepeOrderId: transactionId });
+        let paymentRecord = null;
+        if (!order) {
+            paymentRecord = await Payment.findOne({
+                $or: [{ phonepeOrderId: transactionId }, { razorpayOrderId: transactionId }]
+            });
+            if (paymentRecord) {
+                order = await Order.findById(paymentRecord.orderRef);
+            }
+        }
+
+        if (!order && !paymentRecord) {
+            console.error("PhonePe V1 callback record missing for id:", transactionId);
+            return res.status(404).send("Corresponding order or payment record not found.");
+        }
+
+        const phonepeStatus = await checkPhonepeOrderStatus(transactionId);
+        const baseFrontend = process.env.FRONTEND_URL || `${req.protocol}://${req.get('host')}`;
+        const successRedirect = req.query.successRedirect || `${baseFrontend}/account?tab=orders`;
+        const failureRedirect = req.query.failureRedirect || `${baseFrontend}/checkout`;
+
+        if (phonepeStatus.isPaid) {
+            const session = await mongoose.startSession();
+            try {
+                await session.withTransaction(async () => {
+                    if (!paymentRecord && order) {
+                        paymentRecord = await Payment.findOne({ orderRef: order._id }).session(session);
+                    }
+
+                    if (order) {
+                        order.phonepePaymentId = phonepeStatus.paymentId;
+                        order.phonepeRawResponse = phonepeStatus.rawResponse;
+                        order.phonepeUtr = phonepeStatus.utr;
+                        order.phonepePaymentMode = phonepeStatus.paymentMode;
+                        order.abondonedOrder = false;
+                        await order.save({ session });
+                    }
+
+                    if (paymentRecord) {
+                        await confirmPaymentRecordPaidLogic(paymentRecord._id, phonepeStatus.paymentId, session);
+                    }
+                });
+            } finally {
+                await session.endSession();
+            }
+            return res.redirect(successRedirect);
+        } else {
+            return res.redirect(failureRedirect);
+        }
+    } catch (error) {
+        console.error("PhonePe V1 callback processing failure:", error);
+        return res.status(500).send("Internal Callback handler failure");
+    }
+});
+
 
 const verifyPayment =
     async (
@@ -7738,9 +7846,13 @@ const generatePaymentRecordLink = asyncHandler(async (req, res) => {
         const reqOrigin = req.headers.origin || `${req.protocol}://${req.get('host')}`;
         const backendOrigin = `${req.protocol}://${req.get('host')}`;
 
+        const baseFrontend = process.env.FRONTEND_URL || reqOrigin;
+        const successUrl = `${baseFrontend}/payment-status?status=success&amount=${payment.amount}&orderId=${order.orderId}&paymentId=${payment._id}`;
+        const failureUrl = `${baseFrontend}/payment-status?status=failed&amount=${payment.amount}&orderId=${order.orderId}&paymentId=${payment._id}`;
+
         if (gateway === "phonepe") {
             const tempLink = await initiatePhonepePaymentLink(
-                order.orderId, payment.amount, order.phoneNo, reqOrigin, backendOrigin
+                order.orderId, payment.amount, order.phoneNo, reqOrigin, backendOrigin, null, successUrl, failureUrl
             );
             linkResponse = { id: tempLink.id, short_url: tempLink.short_url };
         } else {
@@ -7750,8 +7862,14 @@ const generatePaymentRecordLink = asyncHandler(async (req, res) => {
             linkResponse = { id: tempLink.id, short_url: tempLink.short_url };
         }
 
+        payment.gateway = gateway;
         payment.paymentLinkId = linkResponse.id;
         payment.paymentLinkUrl = linkResponse.short_url;
+        if (gateway === "phonepe") {
+            payment.phonepeOrderId = linkResponse.id;
+        } else {
+            payment.razorpayOrderId = linkResponse.id;
+        }
         await payment.save();
 
         const newPaymentLink = new PaymentLink({

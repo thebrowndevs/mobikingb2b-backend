@@ -3,7 +3,7 @@ import mongoose from 'mongoose';
 import { Order } from '../../models/order.model.js';
 import { PaymentLink } from '../../models/payment_link.model.js';
 import { Payment } from '../../models/payment.model.js';
-import { confirmOrderPaymentLogic } from '../../services/payment.service.js';
+import { confirmPaymentRecordPaidLogic } from '../../services/payment.service.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { ApiResponse } from '../../utils/ApiResponse.js';
 import { logToFile } from '../../utils/logger.js';
@@ -40,35 +40,25 @@ export const paymentWebhookV2 = asyncHandler(async (req, res) => {
         console.log("Processing payment_link.paid:", { paymentLinkId, status });
 
         // Update local PaymentLink status
-        await PaymentLink.findOneAndUpdate(
+        const foundPaymentLink = await PaymentLink.findOneAndUpdate(
             { paymentLink_id: paymentLinkId },
             { status },
             { new: true }
         );
 
-        const orderId = paymentLink?.notes?.orderId;
-        if (orderId) {
-            const order = await Order.findById(orderId);
-            if (order) {
-                if (order.paymentStatus === 'Paid') {
-                    console.log(`Order ${orderId} is already paid. Skipping webhook confirmation.`);
-                    return res.status(200).json({ status: "Already fulfilled" });
-                }
-
-                // Perform minimal update only, as stock & coupons are pre-processed
-                const paymentDate = new Date();
-                await Order.findByIdAndUpdate(
-                    order._id,
-                    {
-                        abondonedOrder: false,
-                        razorpayOrderId: paymentLink?.order_id || order.razorpayOrderId,
-                        razorpayPaymentId: payment?.id || order.razorpayPaymentId,
-                        paymentStatus: "Paid",
-                        paymentDate
-                    },
-                    { new: true }
-                );
-                console.log(`Successfully completed minimal confirmation for payment link order ${orderId}`);
+        if (foundPaymentLink && foundPaymentLink.referenceId) {
+            const session = await mongoose.startSession();
+            try {
+                await session.withTransaction(async () => {
+                    await confirmPaymentRecordPaidLogic(foundPaymentLink.referenceId, payment?.id, session);
+                });
+                console.log(`Successfully confirmed B2B payment request via payment_link.paid: ${foundPaymentLink.referenceId}`);
+                return res.status(200).json({ status: "Payment request confirmed successfully" });
+            } catch (err) {
+                console.error("Webhook processing error in confirmPaymentRecordPaidLogic:", err);
+                return res.status(500).json({ error: err.message });
+            } finally {
+                session.endSession();
             }
         }
     }
@@ -88,94 +78,65 @@ export const paymentWebhookV2 = asyncHandler(async (req, res) => {
 
         console.log(`Processing ${event}:`, { razorpayOrderId, razorpayPaymentId, paymentLinkId });
 
-        if (razorpayOrderId) {
-            const paymentRecord = await Payment.findOne({ razorpayOrderId });
-            if (paymentRecord) {
-                if (paymentRecord.status === "Paid") {
-                    console.log(`Payment record ${paymentRecord._id} is already paid. Skipping webhook confirmation.`);
-                    return res.status(200).json({ status: "Already fulfilled" });
-                }
+        const searchCriteria = [];
+        if (razorpayOrderId) searchCriteria.push({ razorpayOrderId });
+        if (paymentLinkId) searchCriteria.push({ paymentLinkId }, { razorpayOrderId: paymentLinkId });
 
-                const { confirmPaymentRecordPaidLogic } = await import("../../services/payment.service.js");
-                const session = await mongoose.startSession();
-                try {
-                    await session.withTransaction(async () => {
-                        await confirmPaymentRecordPaidLogic(paymentRecord._id, razorpayPaymentId, session);
-                    });
-                    console.log(`Webhook successfully confirmed B2B payment request: ${paymentRecord._id}`);
-                    return res.status(200).json({ status: "Payment request confirmed successfully" });
-                } catch (webhookErr) {
-                    console.error("Webhook B2B payment confirmation failed:", webhookErr);
-                    return res.status(500).json({ error: webhookErr.message });
-                } finally {
-                    session.endSession();
-                }
+        let paymentRecord = searchCriteria.length > 0 ? await Payment.findOne({ $or: searchCriteria }) : null;
+        const order = razorpayOrderId ? await Order.findOne({ razorpayOrderId }) : null;
+
+        if (!paymentRecord && order) {
+            paymentRecord = await Payment.findOne({
+                $or: [{ orderRef: order._id, status: "Pending" }, { orderRef: order._id }]
+            });
+        }
+
+        if (paymentRecord) {
+            if (paymentRecord.status === "Paid") {
+                console.log(`Payment record ${paymentRecord._id} is already paid. Skipping webhook confirmation.`);
+                return res.status(200).json({ status: "Already fulfilled" });
             }
 
-            const order = await Order.findOne({ razorpayOrderId });
-            if (order) {
-                if (order.paymentStatus === 'Paid') {
-                    console.log(`Order ${order._id} is already paid. Skipping webhook confirmation.`);
-                    return res.status(200).json({ status: "Already fulfilled" });
-                }
-
-                // Check if this payment was completed via a Payment Link
-                let isLinked = false;
-                if (paymentLinkId) {
-                    const linkedPayment = await PaymentLink.findOneAndUpdate(
-                        { paymentLink_id: paymentLinkId },
-                        { status: "paid" },
-                        { new: true }
-                    );
-                    if (linkedPayment) {
-                        isLinked = true;
-                        console.log(`Successfully mapped payment link ID: ${paymentLinkId} and updated status to paid.`);
-                    }
-                }
-
-                // Fallback check if payment_link_id was not in the payload but link exists in DB
-                if (!isLinked) {
-                    const linkExists = await PaymentLink.findOne({ orderId: order._id });
-                    if (linkExists) {
-                        isLinked = true;
-                        linkExists.status = "paid";
-                        await linkExists.save();
-                    }
-                }
-
-                if (isLinked) {
-                    console.log(`Payment link match found. Executing minimal confirmation for order ${order._id}`);
-                    const paymentDate = new Date();
-                    order.abondonedOrder = false;
-                    order.paymentStatus = 'Paid';
-                    order.razorpayOrderId = razorpayOrderId;
-                    order.razorpayPaymentId = razorpayPaymentId;
-                    order.paymentDate = paymentDate;
-                    await order.save();
-                } else {
-                    // Regular checkout order confirmation
-                    const session = await mongoose.startSession();
-                    try {
-                        await session.withTransaction(async () => {
-                            await confirmOrderPaymentLogic(
-                                order._id,
-                                razorpayOrderId,
-                                razorpayPaymentId,
-                                session,
-                                order.userId
-                            );
-                        });
-                        console.log(`Successfully confirmed checkout order ${order._id}`);
-                    } catch (err) {
-                        console.error(`Failed to confirm checkout order ${order._id}:`, err);
-                        return res.status(500).json({ message: err.message });
-                    } finally {
-                        session.endSession();
-                    }
-                }
-            } else {
-                console.warn(`Order not found for razorpayOrderId: ${razorpayOrderId}`);
+            const session = await mongoose.startSession();
+            try {
+                await session.withTransaction(async () => {
+                    await confirmPaymentRecordPaidLogic(paymentRecord._id, razorpayPaymentId, session);
+                });
+                console.log(`Webhook successfully confirmed B2B payment request: ${paymentRecord._id}`);
+                return res.status(200).json({ status: "Payment request confirmed successfully" });
+            } catch (webhookErr) {
+                console.error("Webhook B2B payment confirmation failed:", webhookErr);
+                return res.status(500).json({ error: webhookErr.message });
+            } finally {
+                session.endSession();
             }
+        } else if (order) {
+            if (order.paymentStatus === 'Paid') {
+                console.log(`Order ${order._id} is already paid. Skipping webhook confirmation.`);
+                return res.status(200).json({ status: "Already fulfilled" });
+            }
+
+            let isLinked = false;
+            if (paymentLinkId) {
+                const linkedPayment = await PaymentLink.findOneAndUpdate(
+                    { paymentLink_id: paymentLinkId },
+                    { status: "paid" },
+                    { new: true }
+                );
+                if (linkedPayment) isLinked = true;
+            }
+
+            if (isLinked) {
+                const paymentDate = new Date();
+                order.abondonedOrder = false;
+                order.paymentStatus = 'Paid';
+                order.razorpayOrderId = razorpayOrderId;
+                order.razorpayPaymentId = razorpayPaymentId;
+                order.paymentDate = paymentDate;
+                await order.save();
+            }
+        } else {
+            console.warn(`Order or Payment record not found for razorpayOrderId: ${razorpayOrderId}`);
         }
     }
     else if (event === "refund.processed" || event === "refund.speed_processed") {
@@ -185,13 +146,6 @@ export const paymentWebhookV2 = asyncHandler(async (req, res) => {
         const refundAmount = refund?.amount ? refund.amount / 100 : 0;
 
         console.log(`Processing refund success webhook for payment: ${paymentId}, refundId: ${refundId}`);
-        // logToFile("refund_webhook.log", "RAZORPAY_REFUND_SUCCESS", {
-        //     paymentId,
-        //     refundId,
-        //     refundAmount,
-        //     event,
-        //     payload: refund
-        // });
 
         if (paymentId) {
             const order = await Order.findOne({ razorpayPaymentId: paymentId });
@@ -211,12 +165,6 @@ export const paymentWebhookV2 = asyncHandler(async (req, res) => {
         const refundId = refund?.id;
 
         console.log(`Processing refund failed webhook for payment: ${paymentId}, refundId: ${refundId}`);
-        // logToFile("refund_webhook.log", "RAZORPAY_REFUND_FAILED", {
-        //     paymentId,
-        //     refundId,
-        //     event,
-        //     payload: refund
-        // });
 
         if (paymentId) {
             const order = await Order.findOne({ razorpayPaymentId: paymentId });
@@ -229,18 +177,6 @@ export const paymentWebhookV2 = asyncHandler(async (req, res) => {
         }
     }
     else if (event === "payment.failed") {
-        /*
-         * Razorpay fires payment.failed when the user's payment attempt is
-         * declined, timed-out, or cancelled.
-         *
-         * Stock restoration is intentionally NOT triggered here — the existing
-         * holdAbandonedOrder cron / endpoint handles that to avoid race
-         * conditions with any pending retry attempts.
-         *
-         * Coupon state: since coupon.appliedBy is only recorded on successful
-         * payment confirmation (confirmPaymentRecordPaidLogic), a failed payment
-         * automatically leaves the coupon reusable — no rollback needed here.
-         */
         const failedPayment = payload?.payment?.entity;
         const razorpayOrderId = failedPayment?.order_id;
         const razorpayPaymentId = failedPayment?.id;
@@ -254,7 +190,6 @@ export const paymentWebhookV2 = asyncHandler(async (req, res) => {
         );
 
         if (razorpayOrderId) {
-            // Log failure details on the internal Payment record for support visibility
             await Payment.findOneAndUpdate(
                 { razorpayOrderId, status: "Pending" },
                 {
@@ -275,9 +210,8 @@ export const paymentWebhookV2 = asyncHandler(async (req, res) => {
  * Verifies base64 payload, checks signature checksum, and completes transaction.
  */
 export const phonepeWebhookV2 = asyncHandler(async (req, res) => {
-    // console.log("phonepeWebhookV2 called");
-    // console.log("Headers received:", req.headers);
-    // console.log("Body received:", req.body);
+    console.log("phonepeWebhookV2 called");
+    console.log("Body received:", req.body);
 
     const xVerify = req.headers["x-phonepe-checksum-signature"];
 
@@ -286,17 +220,21 @@ export const phonepeWebhookV2 = asyncHandler(async (req, res) => {
         return res.status(400).send("Invalid request structure");
     }
 
-    const saltKey = process.env.PHONEPE_WEBHOOK_SECRET;
+    const saltKey = process.env.PHONEPE_WEBHOOK_SECRET || process.env.PHONEPE_SALT_KEY || "099eb0cd-02cf-4e2a-8aca-3e6c6a4d20a4";
 
     // Calculate expected HMAC signature over raw/JSON stringified body
     const stringifiedBody = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
-    const expectedSignature = crypto
+    const expectedHex = crypto
         .createHmac("sha256", saltKey)
         .update(stringifiedBody)
         .digest("hex");
+    const expectedBase64 = crypto
+        .createHmac("sha256", saltKey)
+        .update(stringifiedBody)
+        .digest("base64");
 
-    if (expectedSignature !== xVerify) {
-        console.error("PhonePe Webhook signature mismatch. Expected:", expectedSignature, "Received:", xVerify);
+    if (expectedHex !== xVerify && expectedBase64 !== xVerify) {
+        console.error("PhonePe Webhook signature mismatch. Expected Base64:", expectedBase64, "Received:", xVerify);
         return res.status(400).send("Invalid signature");
     }
 
@@ -322,51 +260,48 @@ export const phonepeWebhookV2 = asyncHandler(async (req, res) => {
                     );
 
                     let order = null;
+                    let paymentRecord = null;
                     if (isLinked) {
                         order = await Order.findById(isLinked.orderId).session(session);
+                        if (isLinked.referenceId) {
+                            paymentRecord = await Payment.findById(isLinked.referenceId).session(session);
+                        }
                     } else {
                         order = await Order.findOne({ phonepeOrderId: merchantTransactionId }).session(session);
+                        paymentRecord = await Payment.findOne({
+                            $or: [
+                                { phonepeOrderId: merchantTransactionId },
+                                { paymentLinkId: merchantTransactionId }
+                            ]
+                        }).session(session);
+
+                        if (!order && paymentRecord) {
+                            order = await Order.findById(paymentRecord.orderRef).session(session);
+                        }
                     }
 
                     if (order) {
-                        if (order.paymentStatus === 'Paid') {
-                            console.log(`Order ${order._id} already marked Paid. Skipping webhook duplicate run.`);
-                            return;
-                        }
-
                         order.phonepePaymentId = phonepePaymentId;
                         order.phonepeRawResponse = decoded;
                         order.phonepeUtr = utr;
                         order.phonepePaymentMode = paymentMode;
                         await order.save({ session });
 
-                        if (isLinked) {
+                        if (!paymentRecord) {
+                            paymentRecord = await Payment.findOne({
+                                $or: [{ orderRef: order._id, status: "Pending" }, { orderRef: order._id }]
+                            }).session(session);
+                        }
+
+                        if (paymentRecord) {
+                            await confirmPaymentRecordPaidLogic(paymentRecord._id, phonepePaymentId, session);
+                        } else if (isLinked) {
                             // Payment Link minimal confirmation
                             console.log(`Payment link match found for PhonePe webhook. Executing minimal confirmation.`);
                             order.abondonedOrder = false;
                             order.paymentStatus = 'Paid';
                             order.paymentDate = new Date();
                             await order.save({ session });
-
-                            if (isLinked.referenceId) {
-                                await Payment.findByIdAndUpdate(
-                                    isLinked.referenceId,
-                                    {
-                                        status: "Paid",
-                                        paidAt: new Date(),
-                                        notes: `Paid via PhonePe Link. Transaction ID: ${phonepePaymentId}`
-                                    }
-                                ).session(session);
-                            }
-                        } else {
-                            // Standard checkout confirmation
-                            await confirmOrderPaymentLogic(
-                                order._id,
-                                null,
-                                null,
-                                session,
-                                order.userId
-                            );
                         }
                     }
                 });

@@ -4,6 +4,8 @@ import { Payment } from "../models/payment.model.js";
 import { Coupon } from "../models/coupon.model.js";
 import { Order } from "../models/order.model.js";
 import { initiateRazorpayPayment, razorpayConfig } from "../services/razorpay.service.js";
+import { initiatePhonepePaymentLink, checkPhonepeOrderStatus } from "../services/phonepe.service.js";
+import { CompanyDetails } from "../models/company_details.model.js";
 import { confirmPaymentRecordPaidLogic } from "../services/payment.service.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { ApiError } from "../utils/ApiError.js";
@@ -151,7 +153,7 @@ export const getPaymentById = asyncHandler(async (req, res) => {
         orderDeliveryCharge: p.orderRef?.deliveryCharge || 0,
         status: p.status,
         paidAt: p.paidAt,
-        transactionId: p.paymentId || p.razorpayPaymentId
+        transactionId: p.paymentId || p.razorpayPaymentId || p.phonepePaymentId
     };
 
     return res.status(200).json(
@@ -159,12 +161,26 @@ export const getPaymentById = asyncHandler(async (req, res) => {
     );
 });
 
-/* Create Razorpay order for B2B payment request */
-export const createRazorpayOrderForPayment = asyncHandler(async (req, res) => {
-    const { paymentId, couponCode } = req.body;
+/* Create gateway order (Razorpay or PhonePe) for B2B payment request */
+export const createGatewayOrderForPayment = asyncHandler(async (req, res) => {
+    const { paymentId, couponCode, gateway = "razorpay" } = req.body;
 
     if (!paymentId) {
         throw new ApiError(400, "Payment ID is required.");
+    }
+
+    if (!["razorpay", "phonepe"].includes(gateway)) {
+        throw new ApiError(400, "Invalid gateway. Must be 'razorpay' or 'phonepe'.");
+    }
+
+    const settings = await CompanyDetails.findOne();
+    if (settings?.paymentGatewaySettings) {
+        if (gateway === "phonepe" && !settings.paymentGatewaySettings.enablePhonepe) {
+            throw new ApiError(400, "PhonePe payment gateway is currently disabled.");
+        }
+        if (gateway === "razorpay" && !settings.paymentGatewaySettings.enableRazorpay) {
+            throw new ApiError(400, "Razorpay payment gateway is currently disabled.");
+        }
     }
 
     const payment = await Payment.findById(paymentId);
@@ -210,11 +226,44 @@ export const createRazorpayOrderForPayment = asyncHandler(async (req, res) => {
     //     couponDoc = coupon;
     // }
 
+    // ─── PhonePe Branch ────────────────────────────────────────────────────────
+    if (gateway === "phonepe") {
+        const reqOrigin = req.headers.origin || `${req.protocol}://${req.get('host')}`;
+        const backendOrigin = `${req.protocol}://${req.get('host')}`;
 
-    // Initiate Razorpay Order
+        const callbackUrl = `${backendOrigin}/api/v1/payment/phonepe-callback`;
+        const tempLink = await initiatePhonepePaymentLink(
+            String(payment._id),
+            finalAmount,
+            payment.phoneNo || "",
+            reqOrigin,
+            backendOrigin,
+            callbackUrl
+        );
+
+        payment.phonepeOrderId = tempLink.id;
+        payment.phonepeRedirectUrl = tempLink.short_url;
+        payment.gateway = "phonepe";
+        payment.razorpayOrderId = tempLink.id; // Also populate razorpayOrderId for backwards compatibility lookups
+        if (couponDoc) {
+            payment.coupon = couponDiscount;
+            payment.couponId = couponDoc._id;
+        }
+        await payment.save();
+
+        return res.status(200).json(
+            new ApiResponse(200, {
+                gateway: "phonepe",
+                redirectUrl: tempLink.short_url,
+                couponDiscount
+            }, "PhonePe payment session created for B2B payment request successfully.")
+        );
+    }
+
+    // ─── Razorpay Branch ───────────────────────────────────────────────────────
     const razorpayOrder = await initiateRazorpayPayment(payment._id, finalAmount);
 
-    // Save pending coupon/order details in payment doc
+    payment.gateway = "razorpay";
     payment.razorpayOrderId = razorpayOrder.id;
     if (couponDoc) {
         payment.coupon = couponDiscount;
@@ -246,6 +295,61 @@ export const createRazorpayOrderForPayment = asyncHandler(async (req, res) => {
             couponDiscount
         }, "Razorpay order created for B2B payment request successfully.")
     );
+});
+
+// Backward-compatible alias
+export const createRazorpayOrderForPayment = createGatewayOrderForPayment;
+
+/* Verify PhonePe Payment for a B2B Payment request (status poll) */
+export const verifyPhonepeB2BPayment = asyncHandler(async (req, res) => {
+    const { paymentId } = req.body;
+    if (!paymentId) throw new ApiError(400, "Payment ID is required.");
+
+    const payment = await Payment.findById(paymentId);
+    if (!payment) throw new ApiError(404, "Payment record not found.");
+
+    if (payment.userId?.toString() !== req.user?._id?.toString()) {
+        throw new ApiError(403, "You do not have permission to verify this payment.");
+    }
+
+    if (payment.status === "Paid") {
+        return res.status(200).json(
+            new ApiResponse(200, { paid: true }, "Payment already confirmed.")
+        );
+    }
+
+    const orderIdToQuery = payment.phonepeOrderId || payment.razorpayOrderId;
+    if (!orderIdToQuery) {
+        throw new ApiError(400, "No PhonePe order ID associated with this payment.");
+    }
+
+    const phonepeStatus = await checkPhonepeOrderStatus(orderIdToQuery);
+
+    if (!phonepeStatus.isPaid) {
+        return res.status(200).json(
+            new ApiResponse(200, { paid: false }, "Payment not yet completed.")
+        );
+    }
+
+    const session = await mongoose.startSession();
+    try {
+        let updatedResult;
+        await session.withTransaction(async () => {
+            updatedResult = await confirmPaymentRecordPaidLogic(
+                payment._id,
+                phonepeStatus.paymentId || phonepeStatus.transactionId,
+                session
+            );
+        });
+        return res.status(200).json(
+            new ApiResponse(200, updatedResult, "PhonePe B2B payment verified successfully.")
+        );
+    } catch (err) {
+        console.error("PhonePe B2B verification error:", err);
+        throw err;
+    } finally {
+        session.endSession();
+    }
 });
 
 /* Verify Razorpay Payment for Payment request */

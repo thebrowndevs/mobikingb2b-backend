@@ -229,11 +229,8 @@ export const confirmPaymentRecordPaidLogic =
                             new Date(),
 
                         ...(razorpayPaymentId && {
-                            paymentId:
-                                razorpayPaymentId,
-
-                            razorpayPaymentId:
-                                razorpayPaymentId
+                            paymentId: razorpayPaymentId,
+                            ...(payment.gateway === "phonepe" || payment.phonepeOrderId ? { phonepePaymentId: razorpayPaymentId } : { razorpayPaymentId: razorpayPaymentId })
                         })
                     }
                 },

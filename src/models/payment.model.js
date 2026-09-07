@@ -42,6 +42,11 @@ const paymentSchema = new mongoose.Schema(
             type: String,
             required: true
         },
+        gateway: {
+            type: String,
+            enum: ["razorpay", "phonepe"],
+            // default: "razorpay"
+        },
         status: {
             type: String,
             enum: ["Pending", "Paid"],
@@ -60,6 +65,15 @@ const paymentSchema = new mongoose.Schema(
             type: String
         },
         razorpayPaymentId: {
+            type: String
+        },
+        phonepeOrderId: {
+            type: String
+        },
+        phonepePaymentId: {
+            type: String
+        },
+        phonepeRedirectUrl: {
             type: String
         },
         notes: {

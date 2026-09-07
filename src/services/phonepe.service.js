@@ -43,21 +43,26 @@ export const checkPhonepeOrderStatus = async (merchantTransactionId) => {
 /**
  * Initiates standard checkout redirect page for client checkout flows.
  */
-export const initiatePhonepePayment = async (orderId, totalAmount, phone, reqOrigin, backendOrigin) => {
+export const initiatePhonepePayment = async (orderId, totalAmount, phone, reqOrigin, backendOrigin, customCallbackUrl) => {
     const client = getPhonepeClient();
     const baseBackend = process.env.BACKEND_URL || backendOrigin;
     const baseFrontend = process.env.FRONTEND_URL || reqOrigin;
     const frontendSuccessUrl = `${baseFrontend}/account?tab=orders`;
     const frontendFailureUrl = `${baseFrontend}/checkout`;
-    const redirectUrl = `${baseBackend}/api/v2/orders/online/phonepe-callback?id=${orderId}&successRedirect=${encodeURIComponent(frontendSuccessUrl)}&failureRedirect=${encodeURIComponent(frontendFailureUrl)}`;
-    const formattedPhone = phone ? phone.replace(/[^0-9]/g, "") : "";
+    const redirectUrl = customCallbackUrl
+        ? `${customCallbackUrl}?id=${orderId}&successRedirect=${encodeURIComponent(frontendSuccessUrl)}&failureRedirect=${encodeURIComponent(frontendFailureUrl)}`
+        : `${baseBackend}/api/v1/orders/online/phonepe-callback?id=${orderId}&successRedirect=${encodeURIComponent(frontendSuccessUrl)}&failureRedirect=${encodeURIComponent(frontendFailureUrl)}`;
+    let formattedPhone = phone ? phone.replace(/[^0-9]/g, "") : "";
+    if (formattedPhone.length > 10) {
+        formattedPhone = formattedPhone.slice(-10);
+    }
 
     const payRequestBuilder = StandardCheckoutPayRequest.builder()
         .merchantOrderId(orderId)
         .amount(Math.round(totalAmount * 100)) // Amount in paise
         .redirectUrl(redirectUrl);
 
-    if (formattedPhone) {
+    if (formattedPhone && formattedPhone.length === 10) {
         const userLoginDetails = PrefillUserLoginDetails.builder()
             .phoneNumber(formattedPhone)
             .build();
@@ -78,22 +83,27 @@ export const initiatePhonepePayment = async (orderId, totalAmount, phone, reqOri
 /**
  * Initiates PhonePe PG Checkout session link to act as a shareable invoice/payment link.
  */
-export const initiatePhonepePaymentLink = async (orderId, amount, phone, reqOrigin, backendOrigin) => {
+export const initiatePhonepePaymentLink = async (orderId, amount, phone, reqOrigin, backendOrigin, customCallbackUrl, customSuccessUrl, customFailureUrl) => {
     const paymentLinkId = "PL_" + Date.now() + Math.floor(Math.random() * 1000);
     const client = getPhonepeClient();
     const baseBackend = process.env.BACKEND_URL || backendOrigin;
     const baseFrontend = process.env.FRONTEND_URL || reqOrigin;
-    const frontendSuccessUrl = `${baseFrontend}/account?tab=orders`;
-    const frontendFailureUrl = `${baseFrontend}/checkout`;
-    const redirectUrl = `${baseBackend}/api/v2/orders/online/phonepe-callback?id=${paymentLinkId}&successRedirect=${encodeURIComponent(frontendSuccessUrl)}&failureRedirect=${encodeURIComponent(frontendFailureUrl)}`;
-    const formattedPhone = phone ? phone.replace(/[^0-9]/g, "") : "";
+    const frontendSuccessUrl = customSuccessUrl || `${baseFrontend}/payment-status?status=success&orderId=${orderId}`;
+    const frontendFailureUrl = customFailureUrl || `${baseFrontend}/payment-status?status=failed&orderId=${orderId}`;
+    const redirectUrl = customCallbackUrl
+        ? `${customCallbackUrl}?id=${paymentLinkId}&successRedirect=${encodeURIComponent(frontendSuccessUrl)}&failureRedirect=${encodeURIComponent(frontendFailureUrl)}`
+        : `${baseBackend}/api/v1/payment/phonepe-callback?id=${paymentLinkId}&successRedirect=${encodeURIComponent(frontendSuccessUrl)}&failureRedirect=${encodeURIComponent(frontendFailureUrl)}`;
+    let formattedPhone = phone ? phone.replace(/[^0-9]/g, "") : "";
+    if (formattedPhone.length > 10) {
+        formattedPhone = formattedPhone.slice(-10);
+    }
 
     const payRequestBuilder = StandardCheckoutPayRequest.builder()
         .merchantOrderId(paymentLinkId)
         .amount(Math.round(amount * 100))
         .redirectUrl(redirectUrl);
 
-    if (formattedPhone) {
+    if (formattedPhone && formattedPhone.length === 10) {
         const userLoginDetails = PrefillUserLoginDetails.builder()
             .phoneNumber(formattedPhone)
             .build();

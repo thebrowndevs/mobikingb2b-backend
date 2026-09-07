@@ -415,82 +415,54 @@ export const restoreReservedOrders =
                              * Razorpay:
                              * find exact internal Payment record.
                              */
-                            if (
-                                activeGateway ===
-                                "razorpay"
-                            ) {
-                                const payment =
-                                    await Payment.findOne(
-                                        {
-                                            orderRef:
-                                                order._id,
+                            const payment =
+                                await Payment.findOne(
+                                    {
+                                        orderRef:
+                                            order._id,
 
-                                            razorpayOrderId:
-                                                order.razorpayOrderId
-                                        }
-                                    )
-                                        .sort({
-                                            createdAt:
-                                                -1
-                                        })
-                                        .session(
-                                            session
-                                        );
-
-                                if (
-                                    !payment
-                                ) {
-                                    throw new ApiError(
-                                        404,
-                                        `Payment record not found for order ${order.orderId}.`
+                                        $or: [
+                                            { razorpayOrderId: candidate.razorpayOrderId || candidate.phonepeOrderId },
+                                            { phonepeOrderId: candidate.phonepeOrderId || candidate.razorpayOrderId }
+                                        ]
+                                    }
+                                )
+                                    .sort({
+                                        createdAt:
+                                            -1
+                                    })
+                                    .session(
+                                        session
                                     );
-                                }
 
-                                /*
-                                 * confirmPaymentRecordPaidLogic
-                                 * owns the payment -> order transition.
-                                 */
-                                await confirmPaymentRecordPaidLogic(
-                                    payment._id,
-                                    paymentId,
-                                    session
+                            if (
+                                !payment
+                            ) {
+                                throw new ApiError(
+                                    404,
+                                    `Payment record not found for order ${order.orderId}.`
                                 );
+                            }
 
-                                return;
+                            if (activeGateway === "phonepe") {
+                                order.phonepePaymentId = paymentId;
+                                order.phonepeRawResponse = rawResponse;
+                                order.phonepeUtr = utr;
+                                order.phonepePaymentMode = paymentMode;
+                                await order.save({ session });
                             }
 
                             /*
-                             * Preserve existing PhonePe completion
-                             * flow because its payment mapping is different.
+                             * confirmPaymentRecordPaidLogic
+                             * owns the payment -> order transition.
                              */
-                            if (
-                                activeGateway ===
-                                "phonepe"
-                            ) {
-                                order.phonepePaymentId =
-                                    paymentId;
+                            await confirmPaymentRecordPaidLogic(
+                                payment._id,
+                                paymentId,
+                                session
+                            );
 
-                                order.phonepeRawResponse =
-                                    rawResponse;
-
-                                order.phonepeUtr =
-                                    utr;
-
-                                order.phonepePaymentMode =
-                                    paymentMode;
-
-                                await order.save({
-                                    session
-                                });
-
-                                await confirmOrderPaymentLogic(
-                                    order._id,
-                                    null,
-                                    null,
-                                    session,
-                                    order.userId
-                                );
-                            }
+                            return;
                         }
                     );
 

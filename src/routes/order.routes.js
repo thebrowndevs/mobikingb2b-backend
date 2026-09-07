@@ -4,6 +4,7 @@ import { shiprocketAuth } from "../middlewares/shiprocket.middlewares.js";
 import {
     createCodOrder,
     createOnlineOrder, verifyPayment,
+    phonepeCallbackV1,
     getAllOrders, getAllOrdersByUser,
     acceptOrder,
     preShiprocketCancel,
@@ -78,6 +79,7 @@ router.route("/pos/new").post(verifyJWT, createPosOrder);
 router.route("/manual/new").post(verifyJWT, createManualOrder);
 router.route("/cod/new").post(verifyJWT, createCodOrder);
 router.route("/online/new").post(verifyJWT, createOnlineOrder);
+router.route("/online/phonepe-callback").all(phonepeCallbackV1);
 router.route("/online/verify").post(verifyJWT, verifyPayment);
 // router.route("/online/restore").post(verifyJWT, restoreOrderStock);
 router.route("/user").get(verifyJWT, getAllOrdersByUser);
