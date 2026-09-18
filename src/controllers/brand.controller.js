@@ -67,23 +67,106 @@ const updateBrand = asyncHandler(async (req, res) => {
 });
 
 const getBrands = asyncHandler(async (req, res) => {
+    const { searchQuery, search, active } = req.query;
+    let { page, limit } = req.query;
 
-    const allBrands = await Brand.find({
-        active: true
-    });
-
-    if (!allBrands) {
-        throw new ApiError(500, "Could not get brands");
+    const filter = {};
+    if (active !== undefined && active !== null && active !== "" && active !== "all") {
+        filter.active = active === "true" || active === true;
+    } else {
+        filter.active = true;
     }
+
+    const query = searchQuery || search;
+    if (query && query.trim()) {
+        filter.name = { $regex: query.trim(), $options: "i" };
+    }
+
+    if (page !== undefined && limit !== undefined) {
+        page = parseInt(page, 10) || 1;
+        limit = parseInt(limit, 10) || 10;
+        const skip = (page - 1) * limit;
+
+        const totalBrands = await Brand.countDocuments(filter);
+        const totalPages = Math.ceil(totalBrands / limit);
+
+        const brands = await Brand.find(filter)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit);
+
+        return res.status(200).json(
+            new ApiResponse(200, {
+                brands,
+                pagination: {
+                    totalBrands,
+                    totalPages,
+                    currentPage: page,
+                    limit,
+                    hasMore: page < totalPages
+                }
+            }, "Brands fetched successfully")
+        );
+    }
+
+    const allBrands = await Brand.find(filter).sort({ createdAt: -1 });
 
     return res.status(200).json(
         new ApiResponse(200, allBrands, "Brands fetched successfully")
-    )
+    );
+});
 
+const getBrandsAdmin = asyncHandler(async (req, res) => {
+    const { searchQuery, search, active } = req.query;
+    let { page, limit } = req.query;
+
+    const filter = {};
+    if (active !== undefined && active !== null && active !== "" && active !== "all") {
+        filter.active = active === "true" || active === true;
+    }
+
+    const query = searchQuery || search;
+    if (query && query.trim()) {
+        filter.name = { $regex: query.trim(), $options: "i" };
+    }
+
+    if (page !== undefined && limit !== undefined) {
+        page = parseInt(page, 10) || 1;
+        limit = parseInt(limit, 10) || 10;
+        const skip = (page - 1) * limit;
+
+        const totalBrands = await Brand.countDocuments(filter);
+        const totalPages = Math.ceil(totalBrands / limit);
+
+        const brands = await Brand.find(filter)
+            .sort({ createdAt: -1 })
+            .skip(skip)
+            .limit(limit);
+
+        return res.status(200).json(
+            new ApiResponse(200, {
+                brands,
+                pagination: {
+                    totalBrands,
+                    totalPages,
+                    currentPage: page,
+                    limit,
+                    hasMore: page < totalPages
+                }
+            }, "Brands fetched successfully for admin")
+        );
+    }
+
+    const allBrands = await Brand.find(filter).sort({ createdAt: -1 });
+
+    return res.status(200).json(
+        new ApiResponse(200, allBrands, "Brands fetched successfully for admin")
+    );
 });
 
 export {
     createBrand,
     updateBrand,
-    getBrands
+    getBrands,
+    getBrandsAdmin
 }

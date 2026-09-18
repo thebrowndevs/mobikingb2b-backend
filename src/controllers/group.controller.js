@@ -13,7 +13,7 @@ const createGroup = asyncHandler(async (req, res) => {
         webBanner, isWebBannerVisible, webBackgroundColor, isWebBgColorVisible,
         appBanner, isAppBannerVisible, appBackgroundColor, isAppBgColorVisible,
         bannerLink, placement, active,
-        products, categories, parentCategories
+        products, categories, parentCategories, brands, images
     } = req.body;
 
     const groupHeading = heading || name;
@@ -42,7 +42,9 @@ const createGroup = asyncHandler(async (req, res) => {
         active: active ?? true,
         products: products || [],
         categories: categories || [],
-        parentCategories: parentCategories || []
+        parentCategories: parentCategories || [],
+        brands: brands || [],
+        images: images || []
     });
 
     if (!newGroup) {
@@ -60,7 +62,7 @@ const editGroup = asyncHandler(async (req, res) => {
         webBanner, isWebBannerVisible, webBackgroundColor, isWebBgColorVisible,
         appBanner, isAppBannerVisible, appBackgroundColor, isAppBgColorVisible,
         bannerLink, placement, active,
-        products, categories, parentCategories
+        products, categories, parentCategories, brands, images
     } = req.body;
 
     if (!req?.params?._id) {
@@ -96,7 +98,9 @@ const editGroup = asyncHandler(async (req, res) => {
             active: active !== undefined ? active : foundGroup.active,
             products: products !== undefined ? products : foundGroup.products,
             categories: categories !== undefined ? categories : foundGroup.categories,
-            parentCategories: parentCategories !== undefined ? parentCategories : foundGroup.parentCategories
+            parentCategories: parentCategories !== undefined ? parentCategories : foundGroup.parentCategories,
+            brands: brands !== undefined ? brands : foundGroup.brands,
+            images: images !== undefined ? images : foundGroup.images
         },
         { new: true }
     );
@@ -430,7 +434,7 @@ const getAllGroups = asyncHandler(async (req, res) => {
 });
 
 const getAllGroupsAdmin = asyncHandler(async (req, res) => {
-    let { page = 1, limit = 10, searchQuery = "" } = req.query;
+    let { page = 1, limit = 10, searchQuery = "", active, groupType, appCategoryGroup, webHomeGroup, appHomeGroup } = req.query;
 
     page = parseInt(page, 10);
     limit = parseInt(limit, 10);
@@ -441,6 +445,60 @@ const getAllGroupsAdmin = asyncHandler(async (req, res) => {
             { name: { $regex: searchQuery, $options: "i" } },
             { heading: { $regex: searchQuery, $options: "i" } }
         ];
+    }
+
+    if (active !== undefined && active !== null && active !== "" && active !== "all") {
+        query.active = active === "true" || active === true;
+    }
+
+    if (groupType && groupType !== "all") {
+        query.groupType = groupType;
+    }
+
+    if (appCategoryGroup !== undefined && appCategoryGroup !== null && appCategoryGroup !== "" && appCategoryGroup !== "all") {
+        const isTrue = appCategoryGroup === "true" || appCategoryGroup === true;
+        if (isTrue) {
+            query.appCategoryGroup = true;
+        } else {
+            query.$and = query.$and || [];
+            query.$and.push({
+                $or: [
+                    { appCategoryGroup: false },
+                    { appCategoryGroup: { $exists: false } }
+                ]
+            });
+        }
+    }
+
+    if (webHomeGroup !== undefined && webHomeGroup !== null && webHomeGroup !== "" && webHomeGroup !== "all") {
+        const isTrue = webHomeGroup === "true" || webHomeGroup === true;
+        if (isTrue) {
+            query.webHomeGroup = true;
+        } else {
+            query.$and = query.$and || [];
+            query.$and.push({
+                $or: [
+                    { webHomeGroup: false },
+                    { webHomeGroup: { $exists: false } }
+                ]
+            });
+        }
+    }
+
+    if (appHomeGroup !== undefined && appHomeGroup !== null && appHomeGroup !== "" && appHomeGroup !== "all") {
+        if (appHomeGroup === "true" || appHomeGroup === true) {
+            query.appHomeGroup = { $exists: true, $not: { $size: 0 } };
+        } else if (appHomeGroup === "false" || appHomeGroup === false) {
+            query.$and = query.$and || [];
+            query.$and.push({
+                $or: [
+                    { appHomeGroup: { $exists: false } },
+                    { appHomeGroup: { $size: 0 } }
+                ]
+            });
+        } else if (mongoose.isValidObjectId(appHomeGroup)) {
+            query.appHomeGroup = appHomeGroup;
+        }
     }
 
     const totalGroups = await Group.countDocuments(query);
@@ -457,6 +515,16 @@ const getAllGroupsAdmin = asyncHandler(async (req, res) => {
             path: 'parentCategories',
             model: 'Category',
             select: 'name slug'
+        })
+        .populate({
+            path: 'brands',
+            model: 'Brand',
+            select: 'name image'
+        })
+        .populate({
+            path: 'appHomeGroup',
+            model: 'AppHomeTab',
+            select: 'name active'
         })
         .sort({ createdAt: -1 })
         .skip(skip)

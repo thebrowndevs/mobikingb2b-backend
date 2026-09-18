@@ -37,7 +37,7 @@ const getAppTabGroups = asyncHandler(async (req, res) => {
     const groupsRaw = await Group.find({ _id: { $in: paginatedIds }, active: true })
         .select("name heading groupType placement bannerLink active appBanner isAppBannerVisible appBackgroundColor isAppBgColorVisible products")
         .lean();
-    
+
     // Sort to match sequence order
     const idStrings = paginatedIds.map(id => id.toString());
     const groups = groupsRaw.sort((a, b) => idStrings.indexOf(a._id.toString()) - idStrings.indexOf(b._id.toString()));
@@ -274,6 +274,13 @@ const createAppTabAdmin = asyncHandler(async (req, res) => {
         groups: groups || []
     });
 
+    if (groups && Array.isArray(groups) && groups.length > 0) {
+        await Group.updateMany(
+            { _id: { $in: groups } },
+            { $addToSet: { appHomeGroup: newTab._id } }
+        );
+    }
+
     return res.status(201).json(new ApiResponse(201, newTab, "App Home Tab created successfully"));
 });
 
@@ -285,6 +292,8 @@ const updateAppTabAdmin = asyncHandler(async (req, res) => {
     if (!tab) {
         throw new ApiError(404, "App Home Tab not found");
     }
+
+    const oldGroups = (tab.groups || []).map(id => id.toString());
 
     const updatedTab = await AppHomeTab.findByIdAndUpdate(
         tabId,
@@ -298,18 +307,42 @@ const updateAppTabAdmin = asyncHandler(async (req, res) => {
         { new: true }
     ).populate('groups');
 
+    if (groups !== undefined && Array.isArray(groups)) {
+        const newGroupIds = groups.map(id => id.toString());
+        const addedGroups = newGroupIds.filter(id => !oldGroups.includes(id));
+        const removedGroups = oldGroups.filter(id => !newGroupIds.includes(id));
+
+        if (addedGroups.length > 0) {
+            await Group.updateMany(
+                { _id: { $in: addedGroups } },
+                { $addToSet: { appHomeGroup: tab._id } }
+            );
+        }
+        if (removedGroups.length > 0) {
+            await Group.updateMany(
+                { _id: { $in: removedGroups } },
+                { $pull: { appHomeGroup: tab._id } }
+            );
+        }
+    }
+
     return res.status(200).json(new ApiResponse(200, updatedTab, "App Home Tab updated successfully"));
 });
 
 const deleteAppTabAdmin = asyncHandler(async (req, res) => {
     const { tabId } = req.params;
-    
+
     const tab = await AppHomeTab.findById(tabId);
     if (!tab) {
         throw new ApiError(404, "App Home Tab not found");
     }
 
     await AppHomeTab.findByIdAndDelete(tabId);
+
+    await Group.updateMany(
+        { appHomeGroup: tabId },
+        { $pull: { appHomeGroup: tabId } }
+    );
 
     return res.status(200).json(new ApiResponse(200, null, "App Home Tab deleted successfully"));
 });
@@ -321,7 +354,7 @@ const reorderAppTabsAdmin = asyncHandler(async (req, res) => {
     }
 
     await Promise.all(
-        orderedIds.map((id, index) => 
+        orderedIds.map((id, index) =>
             AppHomeTab.findByIdAndUpdate(id, { sequenceNo: index })
         )
     );

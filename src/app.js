@@ -43,6 +43,7 @@ import couponRouter from './routes/coupon.routes.js'
 import blogRouter from './routes/blog.routes.js'
 import onboardingRouter from './routes/onboarding.routes.js'
 import quotationRouter from './routes/quotation.routes.js'
+import categoryPageRouter from './routes/category_page.routes.js'
 
 // v2 routes import
 import productRouterV2 from './routes/v2/product.routes.js'
@@ -60,6 +61,7 @@ app.use("/api/v1/brands", brandRouter)
 app.use("/api/v1/products", productRouter)
 app.use("/api/v1/groups", groupRouter)
 app.use("/api/v1/home", homeRouter)
+app.use("/api/v1/category-page", categoryPageRouter)
 app.use("/api/v1/cart", cartRouter)
 app.use("/api/v1/media", mediaRouter)
 app.use("/api/v1/orders", orderRouter)

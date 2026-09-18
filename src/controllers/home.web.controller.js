@@ -1,5 +1,6 @@
 import { Group } from "../models/group.model.js";
 import { Product } from "../models/product.model.js";
+import { Brand } from "../models/brand.model.js";
 import { WebsiteHome } from "../models/websiteHome.model.js";
 import { Home } from "../models/home.model.js";
 import { ApiError } from "../utils/ApiError.js";
@@ -73,7 +74,7 @@ const getWebsiteGroups = asyncHandler(async (req, res) => {
 
     const groupsWithProducts = await Promise.all(
         groups.map(async (group) => {
-            if (group.groupType === 'subcategories') {
+            if (group.groupType === 'subcategories' || group.groupType === 'subcategory') {
                 const subcategoryIds = group.categories || [];
                 const subcategories = await SubCategory.find({ _id: { $in: subcategoryIds }, active: true })
                     .select("name slug photos")
@@ -86,7 +87,7 @@ const getWebsiteGroups = asyncHandler(async (req, res) => {
                     subcategories: sortedSubcategories,
                     totalItems: sortedSubcategories.length
                 };
-            } else if (group.groupType === 'categories') {
+            } else if (group.groupType === 'categories' || group.groupType === 'category') {
                 const categoryIds = group.parentCategories || [];
                 const categories = await Category.find({ _id: { $in: categoryIds }, active: true })
                     .select("name slug image")
@@ -98,6 +99,24 @@ const getWebsiteGroups = asyncHandler(async (req, res) => {
                     ...group,
                     categories: sortedCategories,
                     totalItems: sortedCategories.length
+                };
+            } else if (group.groupType === 'brand') {
+                const brandIds = group.brands || [];
+                const brands = await Brand.find({ _id: { $in: brandIds }, active: true })
+                    .select("name image")
+                    .lean();
+                const idStrings = brandIds.map(id => id.toString());
+                const sortedBrands = brands.sort((a, b) => idStrings.indexOf(a._id.toString()) - idStrings.indexOf(b._id.toString()));
+                return {
+                    ...group,
+                    brands: sortedBrands,
+                    totalItems: sortedBrands.length
+                };
+            } else if (group.groupType === 'image') {
+                return {
+                    ...group,
+                    images: group.images || [],
+                    totalItems: (group.images || []).length
                 };
             } else {
                 const productIds = group.products || [];
@@ -298,6 +317,9 @@ const updateWebsiteHomeLayoutAdmin = asyncHandler(async (req, res) => {
         latestLayout = await WebsiteHome.create({ active: true });
     }
 
+    const oldGroups = (latestLayout.groups || []).map(id => id.toString());
+    const oldMovingCats = (latestLayout.movingCategories || []).map(id => id.toString());
+
     const updated = await WebsiteHome.findByIdAndUpdate(
         latestLayout._id,
         {
@@ -316,6 +338,32 @@ const updateWebsiteHomeLayoutAdmin = asyncHandler(async (req, res) => {
             path: 'groups',
             model: 'Group'
         });
+
+    if (groups !== undefined && Array.isArray(groups)) {
+        const newGroupIds = groups.map(id => id.toString());
+        const addedGroups = newGroupIds.filter(id => !oldGroups.includes(id));
+        const removedGroups = oldGroups.filter(id => !newGroupIds.includes(id));
+
+        if (addedGroups.length > 0) {
+            await Group.updateMany({ _id: { $in: addedGroups } }, { $set: { webHomeGroup: true } });
+        }
+        if (removedGroups.length > 0) {
+            await Group.updateMany({ _id: { $in: removedGroups } }, { $set: { webHomeGroup: false } });
+        }
+    }
+
+    if (movingCategories !== undefined && Array.isArray(movingCategories)) {
+        const newCatIds = movingCategories.map(id => id.toString());
+        const addedCats = newCatIds.filter(id => !oldMovingCats.includes(id));
+        const removedCats = oldMovingCats.filter(id => !newCatIds.includes(id));
+
+        if (addedCats.length > 0) {
+            await SubCategory.updateMany({ _id: { $in: addedCats } }, { $set: { webHomeCategory: true } });
+        }
+        if (removedCats.length > 0) {
+            await SubCategory.updateMany({ _id: { $in: removedCats } }, { $set: { webHomeCategory: false } });
+        }
+    }
 
     sendRouteReloadNotification("/home/website");
 

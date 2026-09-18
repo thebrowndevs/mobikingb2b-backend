@@ -21,6 +21,7 @@ const subCatgeorySchema = new mongoose.Schema({
         type: Boolean,
         default: true
     },
+    webHomeCategory: { type: Boolean, default: false },
     deliveryCharge: {
         type: Number,
         default: 0

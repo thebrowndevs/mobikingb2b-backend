@@ -179,6 +179,7 @@ export const getAdminCoupons = asyncHandler(async (req, res) => {
         limit = 10,
         startDate,
         endDate,
+        active,
     } = req.query;
 
     const searchQuery = req?.query?.searchQuery?.trim();
@@ -188,6 +189,10 @@ export const getAdminCoupons = asyncHandler(async (req, res) => {
     const skip = (parsedPage - 1) * parsedLimit;
 
     const filter = {};
+
+    if (active !== undefined && active !== null && active !== "" && active !== "all") {
+        filter.active = active === "true" || active === true;
+    }
 
     // Date range filter
     if (startDate && endDate) {

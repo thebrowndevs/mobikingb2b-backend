@@ -13,14 +13,14 @@ const groupSchema = new mongoose.Schema({
     },
     groupType: {
         type: String,
-        enum: ['categories', 'subcategories', 'products'],
+        enum: ['categories', 'subcategories', 'products', 'image', 'brand'],
         required: true
     },
     heading: {
         type: String,
         required: true
     },
-    
+
     // Website specific styling
     webBanner: {
         type: String
@@ -65,6 +65,12 @@ const groupSchema = new mongoose.Schema({
         type: Boolean,
         default: true
     },
+    appCategoryGroup: { type: Boolean, default: false },
+    webHomeGroup: { type: Boolean, default: false },
+    appHomeGroup: [{
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'AppHomeTab'
+    }],
     products: [{
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Product'
@@ -76,6 +82,21 @@ const groupSchema = new mongoose.Schema({
     parentCategories: [{
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Category'
+    }],
+    brands: [{
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Brand'
+    }],
+    images: [{
+        desktopUrl: {
+            type: String,
+        },
+        mobileUrl: {
+            type: String,
+        },
+        redirectUrl: {
+            type: String
+        }
     }]
 }, { timestamps: true });
 

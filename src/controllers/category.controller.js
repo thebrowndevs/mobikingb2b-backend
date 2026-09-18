@@ -111,10 +111,14 @@ const getAllCategorySlugs = asyncHandler(async (req, res) => {
 });
 
 const getAllCategories = asyncHandler(async (req, res) => {
-    const { searchQuery, search } = req.query;
+    const { searchQuery, search, active } = req.query;
     let { page, limit } = req.query;
     const query = searchQuery || search;
     const filter = {};
+
+    if (active !== undefined && active !== null && active !== "" && active !== "all") {
+        filter.active = active === "true" || active === true;
+    }
 
     if (query && query.trim()) {
         const words = query.trim().split(/\s+/).filter(Boolean);
@@ -474,13 +478,21 @@ const getAllSubCategorySlugs = asyncHandler(async (req, res) => {
 });
 
 const getAllSubCategories = asyncHandler(async (req, res) => {
-    const { parentCategory, categoryId, searchQuery, search } = req.query;
+    const { parentCategory, categoryId, searchQuery, search, webHomeCategory, active } = req.query;
     let { page, limit } = req.query;
     const filter = {};
 
     const categoryFilter = parentCategory || categoryId;
     if (categoryFilter && categoryFilter.trim()) {
         filter.parentCategory = categoryFilter.trim();
+    }
+
+    if (active !== undefined && active !== null && active !== "" && active !== "all") {
+        filter.active = active === "true" || active === true;
+    }
+
+    if (webHomeCategory !== undefined && webHomeCategory !== null && webHomeCategory !== "" && webHomeCategory !== "all") {
+        filter.webHomeCategory = webHomeCategory === "true" || webHomeCategory === true;
     }
 
     const query = searchQuery || search;
