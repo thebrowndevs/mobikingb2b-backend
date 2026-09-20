@@ -4402,8 +4402,8 @@ const updateOrder = asyncHandler(async (req, res) => {
         // If trying to update items/discounts/charges, validate editing timeframe constraints
         const isEditingItems = updates && (updates.items !== undefined || updates.discount !== undefined || updates.discountPercent !== undefined || updates.discountType !== undefined || updates.deliveryCharge !== undefined);
 
-        if (isEditingItems && order.isLocked && req.user?.role !== 'admin') {
-            throw new ApiError(403, "Order is locked. Contact admin to make changes.");
+        if (isEditingItems && order.isLocked) {
+            throw new ApiError(403, "Order is locked. Unlock the order to make changes.");
         }
 
         if (isEditingItems && req.user?.role === 'employee') {
@@ -4744,8 +4744,8 @@ const addItemQuantityInOrder = async (req, res) => {
             const order = await Order.findById(orderId).session(session);
             if (!order) throw new ApiError(404, "Order not found");
 
-            if (order.isLocked && req.user?.role !== 'admin') {
-                throw new ApiError(403, "Order is locked. Contact admin to add items.");
+            if (order.isLocked) {
+                throw new ApiError(403, "Order is locked. Unlock the order to add items.");
             }
 
             if (order.couponLocked) {
@@ -4857,8 +4857,8 @@ const removeItemQuantityInOrder = async (req, res) => {
             const order = await Order.findById(orderId).session(session);
             if (!order) throw new ApiError(404, "Order not found");
 
-            if (order.isLocked && req.user?.role !== 'admin') {
-                throw new ApiError(403, "Order is locked. Contact admin to modify items.");
+            if (order.isLocked) {
+                throw new ApiError(403, "Order is locked. Unlock the order to modify items.");
             }
 
             if (order.couponLocked) {
@@ -7495,6 +7495,10 @@ const markAsDeliveredManually = asyncHandler(async (req, res) => {
         throw new ApiError(400, `Cannot mark order as delivered from status: ${order.status}`);
     }
 
+    if (order.paymentStatus !== "Paid" || (order.remainingAmount !== undefined && order.remainingAmount > 0)) {
+        throw new ApiError(400, "Cannot mark order as delivered until the order payment is completely paid.");
+    }
+
     order.status = 'Delivered';
     order.deliveredAt = new Date();
     await order.save();
@@ -7568,7 +7572,7 @@ const recordCallAttempt = asyncHandler(async (req, res) => {
 });
 
 const addOrderPayment = asyncHandler(async (req, res) => {
-    const { orderId, amount, method, status = "Paid", notes, paidAt, subtotal, discount } = req.body;
+    const { orderId, amount, method, status = "Paid", notes, paidAt, subtotal, discount, transactionId, paymentId } = req.body;
 
     if (!orderId || !method) {
         throw new ApiError(400, "orderId and method are required.");
@@ -7608,9 +7612,11 @@ const addOrderPayment = asyncHandler(async (req, res) => {
     }
 
     let finalStatus = status;
-    if (req.user?.role?.toLowerCase() !== "admin") {
+    if (req.user?.role?.toLowerCase() !== "admin" || method === "Online") {
         finalStatus = "Pending";
     }
+
+    const resolvedTxnId = (transactionId || paymentId || "").trim() || undefined;
 
     const session = await mongoose.startSession();
     try {
@@ -7623,11 +7629,9 @@ const addOrderPayment = asyncHandler(async (req, res) => {
                 amount: paymentAmount,
                 subtotal: resolvedSubtotal,
                 discount: resolvedDiscount,
-                // coupon: 0,
-                // couponId: undefined,
-                // couponCode: undefined,
                 method,
                 status: finalStatus,
+                paymentId: resolvedTxnId,
                 notes: notes || "",
                 paidAt: finalStatus === "Paid" ? (paidAt ? new Date(paidAt) : new Date()) : undefined
             }], { session });
@@ -7655,6 +7659,17 @@ const addOrderPayment = asyncHandler(async (req, res) => {
                 order.paymentStatus = "Pending";
             }
 
+            // Single pending payment record paymentMode recalculation check
+            const allOrderPayments = await Payment.find({ orderRef: order._id }).session(session);
+            const pendingPaymentsList = allOrderPayments.filter(p => p.status === "Pending");
+            if (pendingPaymentsList.length === 1 && allOrderPayments.length === 1) {
+                if (pendingPaymentsList[0].amount >= order.orderAmount) {
+                    order.paymentMode = "complete";
+                } else {
+                    order.paymentMode = "parcel";
+                }
+            }
+
             await order.save({ session });
 
             await logActivity({
@@ -7677,7 +7692,7 @@ const addOrderPayment = asyncHandler(async (req, res) => {
 
 const editOrderPayment = asyncHandler(async (req, res) => {
     const { paymentId } = req.params;
-    const { amount, method, status, notes, paidAt, subtotal, discount } = req.body;
+    const { amount, method, status, notes, paidAt, subtotal, discount, transactionId, paymentId: bodyPaymentId } = req.body;
 
     if (!paymentId) {
         throw new ApiError(400, "Payment ID is required.");
@@ -7706,7 +7721,7 @@ const editOrderPayment = asyncHandler(async (req, res) => {
     }
 
     let finalStatus = status || payment.status;
-    if (req.user?.role?.toLowerCase() !== "admin") {
+    if (req.user?.role?.toLowerCase() !== "admin" || (method || payment.method) === "Online") {
         finalStatus = "Pending";
     }
 
@@ -7725,6 +7740,11 @@ const editOrderPayment = asyncHandler(async (req, res) => {
             const remainingExcludingThis = order.remainingAmount + (payment.status === "Paid" ? payment.amount : 0);
             if (finalAmount > remainingExcludingThis) {
                 throw new ApiError(400, `Payment amount (₹${finalAmount}) cannot exceed the order's remaining amount (₹${remainingExcludingThis}).`);
+            }
+
+            const resolvedTxnId = (transactionId || bodyPaymentId);
+            if (resolvedTxnId !== undefined) {
+                payment.paymentId = resolvedTxnId.trim() || undefined;
             }
 
             payment.subtotal = resolvedSubtotal;
@@ -7752,8 +7772,9 @@ const editOrderPayment = asyncHandler(async (req, res) => {
             }
 
             // Recalculate order payment totals
-            const allPayments = await Payment.find({ orderRef: order._id, status: "Paid" }).session(session);
-            const totalPaid = allPayments.reduce((sum, p) => sum + p.amount, 0);
+            const allPayments = await Payment.find({ orderRef: order._id }).session(session);
+            const paidPayments = allPayments.filter(p => p.status === "Paid");
+            const totalPaid = paidPayments.reduce((sum, p) => sum + p.amount, 0);
 
             order.amountPaid = totalPaid;
             order.remainingAmount = Math.max(0, order.orderAmount - totalPaid);
@@ -7763,6 +7784,18 @@ const editOrderPayment = asyncHandler(async (req, res) => {
                 order.paymentDate = new Date();
             } else {
                 order.paymentStatus = "Pending";
+            }
+
+            // Universal Single Pending Payment Record Edit Rule:
+            // If the order has exactly 1 pending payment record, update order.paymentMode dynamically
+            const pendingPayments = allPayments.filter(p => p.status === "Pending");
+            if (pendingPayments.length === 1 && allPayments.length === 1) {
+                const singlePending = pendingPayments[0];
+                if (singlePending.amount >= order.orderAmount) {
+                    order.paymentMode = "complete";
+                } else {
+                    order.paymentMode = "parcel";
+                }
             }
 
             await order.save({ session });
@@ -7992,6 +8025,9 @@ const updateManualShippingStatus = asyncHandler(async (req, res) => {
     order.shippingStatus = shippingStatus;
 
     if (shippingStatus === "delivered") {
+        if (order.paymentStatus !== "Paid" || (order.remainingAmount !== undefined && order.remainingAmount > 0)) {
+            throw new ApiError(400, "Cannot mark order as delivered until the order payment is completely paid.");
+        }
         order.status = "Delivered";
         order.deliveredAt = statusDate.toISOString();
     } else if (shippingStatus === "rto initiated") {
@@ -8215,10 +8251,10 @@ export const updateOrderItems = asyncHandler(
                         );
                     }
 
-                    if (order.isLocked && req.user?.role !== 'admin') {
+                    if (order.isLocked) {
                         throw new ApiError(
                             403,
-                            "Order is locked. Contact admin to modify items or pricing."
+                            "Order is locked. Unlock the order to modify items or pricing."
                         );
                     }
 

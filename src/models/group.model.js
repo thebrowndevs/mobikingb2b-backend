@@ -65,6 +65,10 @@ const groupSchema = new mongoose.Schema({
         type: Boolean,
         default: true
     },
+    hideName: {
+        type: Boolean,
+        default: false
+    },
     appCategoryGroup: { type: Boolean, default: false },
     webHomeGroup: { type: Boolean, default: false },
     appHomeGroup: [{

@@ -637,6 +637,8 @@ export const bookQuotation = asyncHandler(async (req, res) => {
                     const resolvedSubtotal = stg.subtotal !== undefined ? Number(stg.subtotal) : Number(stg.amount);
                     const resolvedDiscount = stg.discount !== undefined ? Number(stg.discount) : Number(discountApplied);
                     const resolvedCoupon = isCouponApplied ? Number(couponApplied) : 0;
+                    const stageMethod = stg.method || newOrder.method;
+                    const stageStatus = stageMethod === "Online" ? "Pending" : (stg.status || "Pending");
 
                     return {
                         orderId: newOrder.orderId,
@@ -647,10 +649,11 @@ export const bookQuotation = asyncHandler(async (req, res) => {
                         discount: resolvedDiscount,
                         coupon: resolvedCoupon,
                         couponId: newOrder.coupon || undefined,
-                        method: stg.method,
-                        status: stg.status || "Pending",
+                        method: stageMethod,
+                        status: stageStatus,
+                        paymentId: (stg.paymentId || stg.transactionId || "").trim() || undefined,
                         notes: stg.notes || "",
-                        paidAt: stg.status === "Paid" ? new Date() : undefined
+                        paidAt: stageStatus === "Paid" ? new Date() : undefined
                     };
                 });
                 const insertedPayments = await Payment.insertMany(paymentsToCreate, { session });
@@ -665,6 +668,14 @@ export const bookQuotation = asyncHandler(async (req, res) => {
                     }
                 } catch (notiErr) {
                     console.error("FCM Notification failed in bookQuotation:", notiErr);
+                }
+
+                // Dynamic Payment Mode calculation
+                const totalStageAmount = paymentsToCreate.reduce((sum, p) => sum + p.amount, 0);
+                if (totalStageAmount >= quotation.orderAmount) {
+                    newOrder.paymentMode = "complete";
+                } else {
+                    newOrder.paymentMode = "parcel";
                 }
 
                 // Calculate amountPaid and remainingAmount
@@ -984,8 +995,8 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                 throw new ApiError(404, "Quotation not found.");
             }
 
-            if (quotation.isLocked && req.user?.role !== 'admin') {
-                throw new ApiError(403, "Quotation is locked. Contact admin to make changes.");
+            if (quotation.isLocked) {
+                throw new ApiError(403, "Quotation is locked. Unlock the quotation to make changes.");
             }
 
             if (req.user?.role === 'employee') {
@@ -1302,8 +1313,8 @@ export const addItemQuantityInQuotation = asyncHandler(async (req, res) => {
             const quotation = await Quotation.findById(quotationId).session(session);
             if (!quotation) throw new ApiError(404, "Quotation not found.");
 
-            if (quotation.isLocked && req.user?.role !== 'admin') {
-                throw new ApiError(403, "Quotation is locked. Contact admin to make changes.");
+            if (quotation.isLocked) {
+                throw new ApiError(403, "Quotation is locked. Unlock the quotation to make changes.");
             }
 
             if (["Booked", "Rejected", "Cancelled"].includes(quotation.status)) {
@@ -1548,8 +1559,8 @@ export const removeItemQuantityInQuotation = asyncHandler(async (req, res) => {
             const quotation = await Quotation.findById(quotationId).session(session);
             if (!quotation) throw new ApiError(404, "Quotation not found.");
 
-            if (quotation.isLocked && req.user?.role !== 'admin') {
-                throw new ApiError(403, "Quotation is locked. Contact admin to make changes.");
+            if (quotation.isLocked) {
+                throw new ApiError(403, "Quotation is locked. Unlock the quotation to make changes.");
             }
 
             if (["Booked", "Rejected", "Cancelled"].includes(quotation.status)) {
@@ -1816,10 +1827,10 @@ export const updateQuotationItems =
                         );
                     }
 
-                    if (quotation.isLocked && req.user?.role !== 'admin') {
+                    if (quotation.isLocked) {
                         throw new ApiError(
                             403,
-                            "Quotation is locked. Contact admin to modify items or pricing."
+                            "Quotation is locked. Unlock the quotation to modify items or pricing."
                         );
                     }
 

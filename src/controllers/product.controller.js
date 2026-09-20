@@ -57,7 +57,7 @@ const createProduct = asyncHandler(async (req, res) => {
         throw new ApiError(409, `Category not found`);
     }
 
-    if (brandId) {
+    if (brandId && brandId !== "null" && brandId !== "undefined" && String(brandId).trim() !== "") {
         if (!mongoose.Types.ObjectId.isValid(brandId)) {
             throw new ApiError(409, `Valid brandId not found`);
         }
@@ -902,7 +902,7 @@ const editProduct = asyncHandler(async (req, res) => {
         }
     }
 
-    if (brandId) {
+    if (brandId && brandId !== "null" && brandId !== "undefined" && String(brandId).trim() !== "") {
         if (!mongoose.Types.ObjectId.isValid(brandId)) {
             throw new ApiError(409, `Valid brandId not found`);
         }
@@ -935,7 +935,9 @@ const editProduct = asyncHandler(async (req, res) => {
         name: name?.trim() || foundProduct?.name,
         fullName: fullName?.trim() || foundProduct?.fullName,
         description: description?.trim() || foundProduct?.description,
-        brand: brandId ? brandId : foundProduct?.brand ? foundProduct?.brand : null,
+        brand: (brandId && brandId !== "null" && brandId !== "undefined" && String(brandId).trim() !== "")
+            ? brandId
+            : (brandId === "" || brandId === null || brandId === "null" ? null : foundProduct?.brand || null),
         slug,
         hsn: hsn === "" ? null : hsn || foundProduct?.hsn,
         sku: sku === "" ? null : sku || foundProduct?.sku,

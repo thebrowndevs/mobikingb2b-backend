@@ -250,6 +250,10 @@ export const applyCouponAdmin = asyncHandler(async (req, res) => {
     const order = await Order.findById(orderId);
     if (!order) throw new ApiError(404, "Order not found");
 
+    if (order.isLocked) {
+        throw new ApiError(403, "Order is locked. Unlock the order to apply coupon.");
+    }
+
     // Perform validation checks (throws ApiError if invalid)
     await validateCoupon({ coupon, userId: order.userId, order, isAdmin: true });
 
@@ -322,6 +326,10 @@ export const removeCouponAdmin = asyncHandler(async (req, res) => {
 
     const order = await Order.findById(orderId);
     if (!order) throw new ApiError(404, "Order not found");
+
+    if (order.isLocked) {
+        throw new ApiError(403, "Order is locked. Unlock the order to remove coupon.");
+    }
 
     if (order.paymentStatus === "Paid") {
         throw new ApiError(400, "Cannot remove coupon from a paid order");

@@ -12,7 +12,7 @@ const createGroup = asyncHandler(async (req, res) => {
         name, slug, groupType, heading,
         webBanner, isWebBannerVisible, webBackgroundColor, isWebBgColorVisible,
         appBanner, isAppBannerVisible, appBackgroundColor, isAppBgColorVisible,
-        bannerLink, placement, active,
+        bannerLink, placement, active, hideName,
         products, categories, parentCategories, brands, images
     } = req.body;
 
@@ -40,6 +40,7 @@ const createGroup = asyncHandler(async (req, res) => {
         bannerLink: bannerLink || "",
         placement: placement || "scroll",
         active: active ?? true,
+        hideName: !!hideName,
         products: products || [],
         categories: categories || [],
         parentCategories: parentCategories || [],
@@ -61,7 +62,7 @@ const editGroup = asyncHandler(async (req, res) => {
         name, slug, groupType, heading,
         webBanner, isWebBannerVisible, webBackgroundColor, isWebBgColorVisible,
         appBanner, isAppBannerVisible, appBackgroundColor, isAppBgColorVisible,
-        bannerLink, placement, active,
+        bannerLink, placement, active, hideName,
         products, categories, parentCategories, brands, images
     } = req.body;
 
@@ -96,6 +97,7 @@ const editGroup = asyncHandler(async (req, res) => {
             bannerLink: bannerLink !== undefined ? bannerLink : foundGroup.bannerLink,
             placement: placement || foundGroup.placement || "scroll",
             active: active !== undefined ? active : foundGroup.active,
+            hideName: hideName !== undefined ? !!hideName : foundGroup.hideName,
             products: products !== undefined ? products : foundGroup.products,
             categories: categories !== undefined ? categories : foundGroup.categories,
             parentCategories: parentCategories !== undefined ? parentCategories : foundGroup.parentCategories,
