@@ -346,3 +346,70 @@ export const phonepeWebhookV2 = asyncHandler(async (req, res) => {
 
     return res.status(200).json({ status: "Webhook received and verified" });
 });
+
+
+/**
+ * HDFC SmartGateway Webhook V2
+ * Handles asynchronous order completion, failure, and refunds
+ */
+export const hdfcWebhookV2 = asyncHandler(async (req, res) => {
+    console.log("hdfcWebhookV2 payload received:", JSON.stringify(req.body));
+    const event = req.body.event || req.body.action || "";
+    const orderData = req.body.content?.order || req.body.order || req.body;
+    const orderId = orderData?.order_id || orderData?.id;
+    const paymentId = orderData?.txn_id || orderData?.payment_id || "N/A";
+    const status = orderData?.status || "";
+
+    if (!orderId) {
+        console.warn("HDFC Webhook missing order_id");
+        return res.status(400).json({ status: "Missing order_id" });
+    }
+
+    if (event === "ORDER_SUCCEEDED" || status === "CHARGED") {
+        const session = await mongoose.startSession();
+        try {
+            await session.withTransaction(async () => {
+                let order = await Order.findOne({
+                    $or: [{ hdfcOrderId: orderId }, { _id: mongoose.isValidObjectId(orderId) ? orderId : null }]
+                }).session(session);
+
+                let paymentRecord = await Payment.findOne({
+                    $or: [
+                        { hdfcOrderId: orderId },
+                        { _id: mongoose.isValidObjectId(orderId) ? orderId : null },
+                        { orderId: orderId }
+                    ]
+                }).session(session);
+
+                if (!order && paymentRecord && paymentRecord.orderRef) {
+                    order = await Order.findById(paymentRecord.orderRef).session(session);
+                }
+
+                if (order) {
+                    order.hdfcPaymentId = paymentId;
+                    order.hdfcRawResponse = req.body;
+                    order.abondonedOrder = false;
+                    await order.save({ session });
+
+                    if (!paymentRecord) {
+                        paymentRecord = await Payment.findOne({
+                            $or: [{ orderRef: order._id, status: "Pending" }, { orderRef: order._id }]
+                        }).session(session);
+                    }
+                }
+
+                if (paymentRecord && paymentRecord.status !== "Paid") {
+                    await confirmPaymentRecordPaidLogic(paymentRecord._id, paymentId, session);
+                    console.log(`HDFC Webhook successfully confirmed B2B payment request: ${paymentRecord._id}`);
+                }
+            });
+        } catch (err) {
+            console.error("HDFC Webhook transaction error:", err);
+            return res.status(500).json({ error: err.message });
+        } finally {
+            session.endSession();
+        }
+    }
+
+    return res.status(200).json({ status: "HDFC Webhook processed successfully" });
+});

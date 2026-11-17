@@ -5,6 +5,7 @@ import {
     createCodOrder,
     createOnlineOrder, verifyPayment,
     phonepeCallbackV1,
+    hdfcCallback,
     getAllOrders, getAllOrdersByUser,
     acceptOrder,
     preShiprocketCancel,
@@ -80,6 +81,7 @@ router.route("/manual/new").post(verifyJWT, createManualOrder);
 router.route("/cod/new").post(verifyJWT, createCodOrder);
 router.route("/online/new").post(verifyJWT, createOnlineOrder);
 router.route("/online/phonepe-callback").all(phonepeCallbackV1);
+router.route("/online/hdfc-callback").all(hdfcCallback);
 router.route("/online/verify").post(verifyJWT, verifyPayment);
 // router.route("/online/restore").post(verifyJWT, restoreOrderStock);
 router.route("/user").get(verifyJWT, getAllOrdersByUser);

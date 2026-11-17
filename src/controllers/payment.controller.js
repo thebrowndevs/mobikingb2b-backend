@@ -5,6 +5,7 @@ import { Coupon } from "../models/coupon.model.js";
 import { Order } from "../models/order.model.js";
 import { initiateRazorpayPayment, razorpayConfig } from "../services/razorpay.service.js";
 import { initiatePhonepePaymentLink, checkPhonepeOrderStatus } from "../services/phonepe.service.js";
+import { initiateHdfcSession, checkHdfcOrderStatus } from "../services/hdfc.service.js";
 import { CompanyDetails } from "../models/company_details.model.js";
 import { confirmPaymentRecordPaidLogic } from "../services/payment.service.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
@@ -169,8 +170,8 @@ export const createGatewayOrderForPayment = asyncHandler(async (req, res) => {
         throw new ApiError(400, "Payment ID is required.");
     }
 
-    if (!["razorpay", "phonepe"].includes(gateway)) {
-        throw new ApiError(400, "Invalid gateway. Must be 'razorpay' or 'phonepe'.");
+    if (!["razorpay", "phonepe", "hdfc"].includes(gateway)) {
+        throw new ApiError(400, "Invalid gateway. Must be 'razorpay', 'phonepe', or 'hdfc'.");
     }
 
     const settings = await CompanyDetails.findOne();
@@ -180,6 +181,9 @@ export const createGatewayOrderForPayment = asyncHandler(async (req, res) => {
         }
         if (gateway === "razorpay" && !settings.paymentGatewaySettings.enableRazorpay) {
             throw new ApiError(400, "Razorpay payment gateway is currently disabled.");
+        }
+        if (gateway === "hdfc" && !settings.paymentGatewaySettings.enableHdfc) {
+            throw new ApiError(400, "HDFC payment gateway is currently disabled.");
         }
     }
 
@@ -257,6 +261,49 @@ export const createGatewayOrderForPayment = asyncHandler(async (req, res) => {
                 redirectUrl: tempLink.short_url,
                 couponDiscount
             }, "PhonePe payment session created for B2B payment request successfully.")
+        );
+    }
+
+    // ─── HDFC Branch ───────────────────────────────────────────────────────────
+    if (gateway === "hdfc") {
+        const reqOrigin = req.headers.origin || process.env.FRONTEND_URL || "http://localhost:3001";
+        const backendOrigin = `${req.protocol}://${req.get('host')}`;
+        const baseFrontend = (process.env.FRONTEND_URL && !process.env.FRONTEND_URL.includes("localhost:8000") && !process.env.FRONTEND_URL.includes("localhost:3000"))
+            ? process.env.FRONTEND_URL
+            : (reqOrigin && !reqOrigin.includes("localhost:8000") && !reqOrigin.includes("localhost:3000"))
+                ? reqOrigin
+                : "http://localhost:3001";
+        const successUrl = `${baseFrontend}/payment-status?status=success&amount=${finalAmount}&orderId=${payment.orderId}&paymentId=${payment._id}`;
+        const failureUrl = `${baseFrontend}/payment-status?status=failed&amount=${finalAmount}&orderId=${payment.orderId}&paymentId=${payment._id}`;
+        const pendingUrl = `${baseFrontend}/payment-status?status=pending&amount=${finalAmount}&orderId=${payment.orderId}&paymentId=${payment._id}`;
+        const callbackUrl = `${backendOrigin}/api/v1/payment/hdfc-callback?id=${payment._id}&origin=${encodeURIComponent(baseFrontend)}&successRedirect=${encodeURIComponent(successUrl)}&failureRedirect=${encodeURIComponent(failureUrl)}&pendingRedirect=${encodeURIComponent(pendingUrl)}&type=payment_link`;
+
+        const hdfcSession = await initiateHdfcSession({
+            orderId: String(payment._id),
+            amount: finalAmount,
+            customerPhone: payment.phoneNo || (req.user?.phoneNo || ""),
+            customerEmail: req.user?.email || "orders@mobiking.in",
+            customerId: String(payment.userId || req.user?._id),
+            returnUrl: callbackUrl,
+            description: `B2B Payment Request #${payment._id}`
+        });
+
+        payment.hdfcOrderId = hdfcSession.orderId;
+        payment.hdfcSessionId = hdfcSession.sessionId;
+        payment.hdfcRedirectUrl = hdfcSession.redirectUrl;
+        payment.gateway = "hdfc";
+        if (couponDoc) {
+            payment.coupon = couponDiscount;
+            payment.couponId = couponDoc._id;
+        }
+        await payment.save();
+
+        return res.status(200).json(
+            new ApiResponse(200, {
+                gateway: "hdfc",
+                redirectUrl: hdfcSession.redirectUrl,
+                couponDiscount
+            }, "HDFC SmartGateway payment session created for B2B payment request successfully.")
         );
     }
 
@@ -347,6 +394,51 @@ export const verifyPhonepeB2BPayment = asyncHandler(async (req, res) => {
     } catch (err) {
         console.error("PhonePe B2B verification error:", err);
         throw err;
+    } finally {
+        session.endSession();
+    }
+});
+
+/* Verify HDFC Payment for B2B Payment request */
+export const verifyHdfcB2BPayment = asyncHandler(async (req, res) => {
+    const { paymentId } = req.body;
+    if (!paymentId) throw new ApiError(400, "Payment ID is required.");
+
+    const payment = await Payment.findById(paymentId);
+    if (!payment) throw new ApiError(404, "Payment record not found.");
+
+    if (payment.userId?.toString() !== req.user?._id?.toString()) {
+        throw new ApiError(403, "You do not have permission to verify this payment.");
+    }
+
+    if (payment.status === "Paid") {
+        return res.status(200).json(
+            new ApiResponse(200, { paid: true }, "Payment already confirmed.")
+        );
+    }
+
+    const orderIdToQuery = payment.hdfcOrderId || String(payment._id);
+    const hdfcStatus = await checkHdfcOrderStatus(orderIdToQuery);
+
+    if (!hdfcStatus.isPaid) {
+        return res.status(200).json(
+            new ApiResponse(200, { paid: false, status: hdfcStatus.status }, "Payment not yet completed.")
+        );
+    }
+
+    const session = await mongoose.startSession();
+    try {
+        let updatedResult;
+        await session.withTransaction(async () => {
+            updatedResult = await confirmPaymentRecordPaidLogic(
+                payment._id,
+                hdfcStatus.paymentId,
+                session
+            );
+        });
+        return res.status(200).json(
+            new ApiResponse(200, { paid: true, payment: updatedResult }, "Payment verified and marked Paid.")
+        );
     } finally {
         session.endSession();
     }

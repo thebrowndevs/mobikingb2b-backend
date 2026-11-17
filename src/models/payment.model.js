@@ -44,7 +44,7 @@ const paymentSchema = new mongoose.Schema(
         },
         gateway: {
             type: String,
-            enum: ["razorpay", "phonepe"],
+            enum: ["razorpay", "phonepe", "hdfc"],
             // default: "razorpay"
         },
         status: {
@@ -74,6 +74,18 @@ const paymentSchema = new mongoose.Schema(
             type: String
         },
         phonepeRedirectUrl: {
+            type: String
+        },
+        hdfcOrderId: {
+            type: String
+        },
+        hdfcSessionId: {
+            type: String
+        },
+        hdfcPaymentId: {
+            type: String
+        },
+        hdfcRedirectUrl: {
             type: String
         },
         notes: {

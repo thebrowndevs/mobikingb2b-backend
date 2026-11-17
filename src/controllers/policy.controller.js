@@ -98,7 +98,8 @@ export const updateCompanyDetails = asyncHandler(async (req, res) => {
   if (paymentGatewaySettings) {
     updateFields.paymentGatewaySettings = {
       enableRazorpay: paymentGatewaySettings.enableRazorpay !== undefined ? !!paymentGatewaySettings.enableRazorpay : true,
-      enablePhonepe: paymentGatewaySettings.enablePhonepe !== undefined ? !!paymentGatewaySettings.enablePhonepe : true
+      enablePhonepe: paymentGatewaySettings.enablePhonepe !== undefined ? !!paymentGatewaySettings.enablePhonepe : true,
+      enableHdfc: paymentGatewaySettings.enableHdfc !== undefined ? !!paymentGatewaySettings.enableHdfc : false
     };
   }
 
@@ -135,6 +136,7 @@ export const getCompanyLimits = asyncHandler(async (req, res) => {
       minQuotationLimit: details?.minQuotationLimit ?? 0,
       enableRazorpay: details?.paymentGatewaySettings?.enableRazorpay ?? true,
       enablePhonepe: details?.paymentGatewaySettings?.enablePhonepe ?? true,
+      enableHdfc: details?.paymentGatewaySettings?.enableHdfc ?? false,
     }, "Company limits fetched successfully")
   );
 });

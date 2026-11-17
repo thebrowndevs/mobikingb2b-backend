@@ -179,7 +179,7 @@ const orderSchema = new mongoose.Schema(
         /****************  PAYMENT FIELDS  *****************/
         gateway: {
             type: String,
-            enum: ["razorpay", "phonepe"],
+            enum: ["razorpay", "phonepe", "hdfc"],
             required: false
         },
         razorpayOrderId: String,
@@ -189,6 +189,10 @@ const orderSchema = new mongoose.Schema(
         phonepeRawResponse: mongoose.Schema.Types.Mixed,
         phonepeUtr: String,
         phonepePaymentMode: String,
+        hdfcOrderId: String,
+        hdfcSessionId: String,
+        hdfcPaymentId: String,
+        hdfcRawResponse: mongoose.Schema.Types.Mixed,
         refundId: String,
         refundAmount: Number,
         refundStatus: {

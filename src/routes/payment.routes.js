@@ -7,14 +7,16 @@ import {
     createRazorpayOrderForPayment,
     verifyRazorpayPayment,
     verifyPhonepeB2BPayment,
+    verifyHdfcB2BPayment,
     getPaymentById
 } from "../controllers/payment.controller.js";
-import { phonepeCallbackV1 } from "../controllers/order.controller.js";
+import { phonepeCallbackV1, hdfcCallback } from "../controllers/order.controller.js";
 
 const router = Router();
 
-// Unauthenticated PhonePe browser return callback
+// Unauthenticated PhonePe / HDFC browser return callback
 router.route("/phonepe-callback").all(phonepeCallbackV1);
+router.route("/hdfc-callback").all(hdfcCallback);
 
 // Admin / Public payment link routes
 router.route("/link").post(verifyJWT, generatePaymentLink);
@@ -32,5 +34,6 @@ router.route("/create-razorpay-order").post(verifyJWT, createRazorpayOrderForPay
 // Payment verification
 router.route("/verify").post(verifyJWT, verifyRazorpayPayment);
 router.route("/verify-phonepe").post(verifyJWT, verifyPhonepeB2BPayment);
+router.route("/verify-hdfc").post(verifyJWT, verifyHdfcB2BPayment);
 
 export default router;

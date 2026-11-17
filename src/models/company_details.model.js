@@ -14,7 +14,8 @@ const companyDetailsSchema = new mongoose.Schema({
   logoImage: { type: String, trim: true }, // optional reference to the image file / url
   paymentGatewaySettings: {
     enableRazorpay: { type: Boolean, default: true },
-    enablePhonepe: { type: Boolean, default: true }
+    enablePhonepe: { type: Boolean, default: true },
+    enableHdfc: { type: Boolean, default: false }
   },
   minOrderLimit: { type: Number, default: 0 },
   minQuotationLimit: { type: Number, default: 0 }

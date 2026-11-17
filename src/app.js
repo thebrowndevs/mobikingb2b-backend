@@ -52,7 +52,7 @@ import paymentRouterV2 from './routes/v2/payment.routes.js'
 
 import { startAbandonedCartScheduler, startDeleteAbandonedOrderScheduler, startRestoreReservedOrdersScheduler } from './scheduler/abandonedCart.scheduler.js';
 import { paymentLinkWebhook } from "./controllers/order.controller.js"
-import { paymentWebhookV2, phonepeWebhookV2 } from "./controllers/v2/payment.controller.js"
+import { paymentWebhookV2, phonepeWebhookV2, hdfcWebhookV2 } from "./controllers/v2/payment.controller.js"
 
 //routes declaration
 app.use("/api/v1/users", userRouter)
@@ -82,6 +82,7 @@ app.use("/api/v1/onboarding", onboardingRouter)
 app.use("/api/v1/quotations", quotationRouter)
 app.use("/api/v1/webhook/payment", paymentWebhookV2)
 app.use("/api/v2/payment/phonepe-webhook", phonepeWebhookV2)
+app.use("/api/v2/payment/hdfc-webhook", hdfcWebhookV2)
 
 app.get('/', (req, res) => {
     res.json({

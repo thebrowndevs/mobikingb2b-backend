@@ -27,6 +27,7 @@ import { Stock } from '../models/stock.model.js';
 import { STOCK_TYPES, ORDER_TYPES } from '../constants.js';
 import { initiateRazorpayPaymentLink } from '../services/razorpay.service.js';
 import { initiatePhonepePaymentLink, initiatePhonepePayment, checkPhonepeOrderStatus } from '../services/phonepe.service.js';
+import { initiateHdfcSession, checkHdfcOrderStatus } from '../services/hdfc.service.js';
 import { CompanyDetails } from '../models/company_details.model.js';
 import { confirmPaymentRecordPaidLogic } from '../services/payment.service.js';
 import { recalculateOrderTotals, syncItemDiscount, determineSlabForQuantity } from '../utils/pricing.js';
@@ -1636,6 +1637,7 @@ const createOnlineOrder =
                  */
                 let razorpayOrder = null;
                 let phonepeResponse = null;
+                let hdfcResponse = null;
 
                 if (gateway === "phonepe") {
                     const reqOrigin = req.headers.origin || `${req.protocol}://${req.get('host')}`;
@@ -1651,6 +1653,19 @@ const createOnlineOrder =
                         callbackUrl
                     );
                     phonepeResponse.id = tempPhonepeOrderId;
+                } else if (gateway === "hdfc") {
+                    const reqOrigin = req.headers.origin || process.env.FRONTEND_URL || "http://localhost:3000";
+                    const backendOrigin = `${req.protocol}://${req.get('host')}`;
+                    const tempHdfcOrderId = `ORD_${uuidv4().split("-")[0].toUpperCase()}`;
+                    const callbackUrl = `${backendOrigin}/api/v1/orders/online/hdfc-callback?id=${tempHdfcOrderId}&origin=${encodeURIComponent(reqOrigin)}`;
+                    hdfcResponse = await initiateHdfcSession({
+                        orderId: tempHdfcOrderId,
+                        amount: finalOrderAmount,
+                        customerPhone: phoneNo.trim(),
+                        customerEmail: email,
+                        customerId: userId,
+                        returnUrl: callbackUrl
+                    });
                 } else {
                     const razorpay = razorpayConfig();
                     razorpayOrder = await razorpay.orders.create({
@@ -1680,11 +1695,16 @@ const createOnlineOrder =
 
                         newOrder =
                             new Order({
-                                gateway:
-                                    gateway === "phonepe" ? "phonepe" : "razorpay",
+                                gateway,
 
                                 phonepeOrderId:
                                     phonepeResponse ? phonepeResponse.id : undefined,
+
+                                hdfcOrderId:
+                                    hdfcResponse ? hdfcResponse.orderId : undefined,
+
+                                hdfcSessionId:
+                                    hdfcResponse ? hdfcResponse.sessionId : undefined,
 
                                 razorpayOrderId:
                                     razorpayOrder ? razorpayOrder.id : undefined,
@@ -2123,8 +2143,7 @@ const createOnlineOrder =
                                         method:
                                             "Online",
 
-                                        gateway:
-                                            gateway === "phonepe" ? "phonepe" : "razorpay",
+                                        gateway,
 
                                         status:
                                             "Pending",
@@ -2134,6 +2153,18 @@ const createOnlineOrder =
 
                                         phonepeOrderId:
                                             phonepeResponse ? phonepeResponse.id : undefined,
+
+                                        phonepeRedirectUrl:
+                                            phonepeResponse ? (phonepeResponse.redirectUrl || phonepeResponse.url) : undefined,
+
+                                        hdfcOrderId:
+                                            hdfcResponse ? hdfcResponse.orderId : undefined,
+
+                                        hdfcSessionId:
+                                            hdfcResponse ? hdfcResponse.sessionId : undefined,
+
+                                        hdfcRedirectUrl:
+                                            hdfcResponse ? hdfcResponse.redirectUrl : undefined,
 
                                         notes:
                                             "Auto-created on Buy Now checkout"
@@ -2238,6 +2269,24 @@ const createOnlineOrder =
                                 user: updatedUser
                             },
                             "PhonePe Order Created Successfully"
+                        )
+                    );
+                }
+
+                if (gateway === "hdfc" && hdfcResponse) {
+                    return res.status(201).json(
+                        new ApiResponse(
+                            201,
+                            {
+                                gateway: "hdfc",
+                                url: hdfcResponse.redirectUrl,
+                                hdfcOrderId: hdfcResponse.orderId,
+                                hdfcSessionId: hdfcResponse.sessionId,
+                                newOrderId: newOrder._id,
+                                paymentId: newPayment._id,
+                                user: updatedUser
+                            },
+                            "HDFC SmartGateway Order Created Successfully"
                         )
                     );
                 }
@@ -2362,6 +2411,128 @@ export const phonepeCallbackV1 = asyncHandler(async (req, res) => {
     } catch (error) {
         console.error("PhonePe V1 callback processing failure:", error);
         return res.status(500).send("Internal Callback handler failure");
+    }
+});
+
+export const hdfcCallback = asyncHandler(async (req, res) => {
+    // HDFC can send order identifier via query (?id=... or ?order_id=...) or body
+    const orderId = req.query.id || req.query.order_id || req.body?.order_id;
+    if (!orderId) {
+        return res.status(400).send("Missing HDFC order identity parameter.");
+    }
+
+    try {
+        let order = await Order.findOne({
+            $or: [
+                { hdfcOrderId: orderId },
+                { _id: mongoose.isValidObjectId(orderId) ? orderId : null },
+                { orderId: orderId }
+            ]
+        });
+        let paymentRecord = null;
+        if (!order) {
+            paymentRecord = await Payment.findOne({
+                $or: [
+                    { hdfcOrderId: orderId },
+                    { _id: mongoose.isValidObjectId(orderId) ? orderId : null },
+                    { orderId: orderId }
+                ]
+            });
+            if (paymentRecord && paymentRecord.orderRef) {
+                order = await Order.findById(paymentRecord.orderRef);
+            }
+        }
+        if (!paymentRecord && order) {
+            paymentRecord = await Payment.findOne({
+                $or: [
+                    { hdfcOrderId: orderId },
+                    { orderRef: order._id }
+                ]
+            });
+        }
+
+        if (!order && !paymentRecord) {
+            console.error("HDFC callback record missing for orderId:", orderId);
+            return res.status(404).send("Corresponding order or payment record not found.");
+        }
+
+        const hdfcStatus = await checkHdfcOrderStatus(orderId);
+
+        // Safe frontend origin resolution (always website port 3001, never backend 8000 or admin 3000)
+        let baseFrontend = (req.query.origin ? decodeURIComponent(req.query.origin) : null) || process.env.FRONTEND_URL || "http://localhost:3001";
+        if (baseFrontend.includes("localhost:8000") || baseFrontend.includes("localhost:3000")) {
+            baseFrontend = "http://localhost:3001";
+        }
+
+        // Determine flow type:
+        // - Direct Buy from Web: /account?tab=orders on success, /checkout on failure
+        // - Payment Link / Installment Checkout (/checkout/payment/[paymentId]): /payment-status?status=success... or /payment-status?status=failed...
+        const isDirectBuy = req.query.type === "direct_buy" || (!paymentRecord && order);
+        const orderIdentifier = order?.orderId || order?._id || orderId;
+        const paymentIdentifier = paymentRecord?._id || orderId;
+        const transactionAmount = paymentRecord?.amount || order?.amount || "";
+        const paymentRef = hdfcStatus.paymentId && hdfcStatus.paymentId !== "N/A" ? hdfcStatus.paymentId : "";
+
+        let successRedirect = req.query.successRedirect;
+        let pendingRedirect = req.query.pendingRedirect;
+        let failureRedirect = req.query.failureRedirect;
+
+        if (isDirectBuy) {
+            if (!successRedirect) successRedirect = `${baseFrontend}/account?tab=orders&status=success&orderId=${orderIdentifier}`;
+            if (!pendingRedirect) pendingRedirect = `${baseFrontend}/account?tab=orders&status=pending&orderId=${orderIdentifier}`;
+            if (!failureRedirect) failureRedirect = `${baseFrontend}/checkout?status=failed&orderId=${orderIdentifier}`;
+        } else {
+            if (!successRedirect) {
+                successRedirect = `${baseFrontend}/payment-status?status=success&amount=${transactionAmount}&orderId=${orderIdentifier}&paymentId=${paymentIdentifier}&ref=${paymentRef}`;
+            }
+            if (!pendingRedirect) {
+                pendingRedirect = `${baseFrontend}/payment-status?status=pending&amount=${transactionAmount}&orderId=${orderIdentifier}&paymentId=${paymentIdentifier}&ref=${paymentRef}`;
+            }
+            if (!failureRedirect) {
+                failureRedirect = `${baseFrontend}/payment-status?status=failed&amount=${transactionAmount}&orderId=${orderIdentifier}&paymentId=${paymentIdentifier}`;
+            }
+        }
+
+        if (hdfcStatus.isPaid) {
+            const session = await mongoose.startSession();
+            try {
+                await session.withTransaction(async () => {
+                    if (!paymentRecord && order) {
+                        paymentRecord = await Payment.findOne({ orderRef: order._id }).session(session);
+                    }
+
+                    if (order) {
+                        order.hdfcPaymentId = hdfcStatus.paymentId;
+                        order.hdfcRawResponse = hdfcStatus.rawResponse;
+                        order.abondonedOrder = false;
+                        await order.save({ session });
+                    }
+
+                    if (paymentRecord) {
+                        await confirmPaymentRecordPaidLogic(paymentRecord._id, hdfcStatus.paymentId, session);
+                    }
+                });
+            } finally {
+                await session.endSession();
+            }
+            return res.redirect(successRedirect);
+        } else if (hdfcStatus.isPending) {
+            console.log(`HDFC Payment is currently in non-terminal state (${hdfcStatus.status}) for order ${orderId}. Leaving order as pending.`);
+            if (order) {
+                if (hdfcStatus.paymentId && hdfcStatus.paymentId !== "N/A") {
+                    order.hdfcPaymentId = hdfcStatus.paymentId;
+                }
+                order.hdfcRawResponse = hdfcStatus.rawResponse;
+                await order.save();
+            }
+            return res.redirect(pendingRedirect);
+        } else {
+            console.warn(`HDFC Payment failed for order ${orderId}. Current status: ${hdfcStatus.status}`);
+            return res.redirect(failureRedirect);
+        }
+    } catch (error) {
+        console.error("HDFC callback processing failure:", error);
+        return res.status(500).send("Internal HDFC Callback handler failure");
     }
 });
 
@@ -7837,8 +8008,8 @@ const generatePaymentRecordLink = asyncHandler(async (req, res) => {
         throw new ApiError(400, "Payment ID is required.");
     }
 
-    if (!gateway || !["razorpay", "phonepe"].includes(gateway)) {
-        throw new ApiError(400, "Invalid or missing gateway. Must be 'razorpay' or 'phonepe'.");
+    if (!gateway || !["razorpay", "phonepe", "hdfc"].includes(gateway)) {
+        throw new ApiError(400, "Invalid or missing gateway. Must be 'razorpay', 'phonepe', or 'hdfc'.");
     }
 
     // Check gateway toggles in CompanyDetails
@@ -7849,6 +8020,9 @@ const generatePaymentRecordLink = asyncHandler(async (req, res) => {
         }
         if (gateway === "razorpay" && !settings.paymentGatewaySettings.enableRazorpay) {
             throw new ApiError(400, "Razorpay payment gateway is currently disabled.");
+        }
+        if (gateway === "hdfc" && !settings.paymentGatewaySettings.enableHdfc) {
+            throw new ApiError(400, "HDFC payment gateway is currently disabled.");
         }
     }
 
@@ -7888,6 +8062,21 @@ const generatePaymentRecordLink = asyncHandler(async (req, res) => {
                 order.orderId, payment.amount, order.phoneNo, reqOrigin, backendOrigin, null, successUrl, failureUrl
             );
             linkResponse = { id: tempLink.id, short_url: tempLink.short_url };
+        } else if (gateway === "hdfc") {
+            const callbackUrl = `${backendOrigin}/api/v1/payment/hdfc-callback?id=${payment._id}&origin=${encodeURIComponent(reqOrigin)}&successRedirect=${encodeURIComponent(successUrl)}&failureRedirect=${encodeURIComponent(failureUrl)}`;
+            const hdfcSession = await initiateHdfcSession({
+                orderId: String(payment._id),
+                amount: payment.amount,
+                customerPhone: order.phoneNo,
+                customerEmail: order.customerEmail || "",
+                customerId: String(order.userId),
+                returnUrl: callbackUrl,
+                description: `Payment for Order #${order.orderId}`
+            });
+            linkResponse = { id: hdfcSession.sessionId, short_url: hdfcSession.redirectUrl };
+            payment.hdfcOrderId = hdfcSession.orderId;
+            payment.hdfcSessionId = hdfcSession.sessionId;
+            payment.hdfcRedirectUrl = hdfcSession.redirectUrl;
         } else {
             const tempLink = await initiateRazorpayPaymentLink(
                 order.orderId, payment.amount, order.name, order.phoneNo
