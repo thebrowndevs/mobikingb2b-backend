@@ -11,6 +11,8 @@ import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { Brand } from "../models/brand.model.js";
+import { CompanyDetails } from "../models/company_details.model.js";
+import { calculateProductDeliveryCharge } from "../utils/deliveryCharge.js";
 import { createStockEntry } from "../services/stock.service.js";
 import { STOCK_TYPES } from "../constants.js";
 import ExcelJS from "exceljs";
@@ -35,7 +37,10 @@ const createProduct = asyncHandler(async (req, res) => {
         rating, reviewCount,
         sellingPrice,
         discount, moq,
-        webVisibility, appVisibility
+        webVisibility, appVisibility,
+        dimensions,
+        length, breadth, height,
+        baseDeliveryCharge
     } = req.body;
 
     //Validate details
@@ -94,6 +99,41 @@ const createProduct = asyncHandler(async (req, res) => {
     const discountVal = parseOptionalNumber(discount);
     const moqVal = parseOptionalNumber(moq);
 
+    let dimensionsObj = {
+        length: 0,
+        breadth: 0,
+        height: 0,
+        volume: 0,
+        volumetricWeight: 0
+    };
+    let calculatedBaseCharge = 0;
+
+    const len = parseOptionalNumber(length ?? dimensions?.length);
+    const brd = parseOptionalNumber(breadth ?? dimensions?.breadth);
+    const hgt = parseOptionalNumber(height ?? dimensions?.height);
+
+    if (len !== null || brd !== null || hgt !== null) {
+        const details = await CompanyDetails.findOne().lean();
+        const config = details?.deliveryChargeSettings;
+        const calc = calculateProductDeliveryCharge({
+            length: len || 0,
+            breadth: brd || 0,
+            height: hgt || 0,
+            quantity: 1,
+            config
+        });
+        dimensionsObj = {
+            length: len || 0,
+            breadth: brd || 0,
+            height: hgt || 0,
+            volume: calc.unitVolume,
+            volumetricWeight: calc.unitVolumetricWeight
+        };
+        calculatedBaseCharge = calc.unitBaseCharge;
+    } else if (baseDeliveryCharge !== undefined && baseDeliveryCharge !== null) {
+        calculatedBaseCharge = parseOptionalNumber(baseDeliveryCharge) || 0;
+    }
+
     //create new product
     const newProduct = await Product.create({
         name, fullName, description,
@@ -118,7 +158,9 @@ const createProduct = asyncHandler(async (req, res) => {
         regularPrice: regularPriceVal,
         rating: ratingVal,
         reviewCount: reviewCountVal,
-        moq: moqVal !== null ? moqVal : 1
+        moq: moqVal !== null ? moqVal : 1,
+        dimensions: dimensionsObj,
+        baseDeliveryCharge: calculatedBaseCharge
     });
     if (!newProduct) {
         throw new ApiError(409, "Could not create product");
@@ -880,7 +922,10 @@ const editProduct = asyncHandler(async (req, res) => {
         rating, reviewCount,
         sellingPrice,
         discount, moq,
-        webVisibility, appVisibility
+        webVisibility, appVisibility,
+        dimensions,
+        length, breadth, height,
+        baseDeliveryCharge
     } = req.body;
 
     //Validations
@@ -931,6 +976,36 @@ const editProduct = asyncHandler(async (req, res) => {
         maxPrice = Math.max(...prices);
     }
 
+    let dimensionsObj = foundProduct?.dimensions || { length: 0, breadth: 0, height: 0, volume: 0, volumetricWeight: 0 };
+    let calculatedBaseDeliveryCharge = foundProduct?.baseDeliveryCharge ?? 0;
+
+    const hasDimInput = length !== undefined || breadth !== undefined || height !== undefined || dimensions !== undefined;
+    if (hasDimInput) {
+        const len = parseOptionalNumber(length ?? dimensions?.length) ?? foundProduct?.dimensions?.length ?? 0;
+        const brd = parseOptionalNumber(breadth ?? dimensions?.breadth) ?? foundProduct?.dimensions?.breadth ?? 0;
+        const hgt = parseOptionalNumber(height ?? dimensions?.height) ?? foundProduct?.dimensions?.height ?? 0;
+
+        const details = await CompanyDetails.findOne().lean();
+        const config = details?.deliveryChargeSettings;
+        const calc = calculateProductDeliveryCharge({
+            length: len,
+            breadth: brd,
+            height: hgt,
+            quantity: 1,
+            config
+        });
+        dimensionsObj = {
+            length: len,
+            breadth: brd,
+            height: hgt,
+            volume: calc.unitVolume,
+            volumetricWeight: calc.unitVolumetricWeight
+        };
+        calculatedBaseDeliveryCharge = calc.unitBaseCharge;
+    } else if (baseDeliveryCharge !== undefined && baseDeliveryCharge !== null) {
+        calculatedBaseDeliveryCharge = parseOptionalNumber(baseDeliveryCharge) ?? foundProduct?.baseDeliveryCharge ?? 0;
+    }
+
     const updates = {
         name: name?.trim() || foundProduct?.name,
         fullName: fullName?.trim() || foundProduct?.fullName,
@@ -941,8 +1016,6 @@ const editProduct = asyncHandler(async (req, res) => {
         slug,
         hsn: hsn === "" ? null : hsn || foundProduct?.hsn,
         sku: sku === "" ? null : sku || foundProduct?.sku,
-        gst: gst !== undefined ? parseOptionalNumber(gst) : foundProduct?.gst,
-        discount: discount !== undefined ? parseOptionalNumber(discount) : foundProduct?.discount,
         active: active !== undefined ? active : foundProduct?.active,
         webVisibility: webVisibility !== undefined ? webVisibility : foundProduct?.webVisibility,
         appVisibility: appVisibility !== undefined ? appVisibility : foundProduct?.appVisibility,
@@ -951,22 +1024,34 @@ const editProduct = asyncHandler(async (req, res) => {
         maxPrice,
         descriptionPoints: descriptionPoints || foundProduct?.descriptionPoints,
         keyInformation: keyInformation || foundProduct?.keyInformation,
-        basePrice: basePrice !== undefined ? parseOptionalNumber(basePrice) : foundProduct?.basePrice,
-        regularPrice: regularPrice !== undefined ? parseOptionalNumber(regularPrice) : foundProduct?.regularPrice,
         category: categoryId || foundProduct?.category,
         images: images ? images : foundProduct?.images,
         tags: tags ? tags : foundProduct?.tags,
-        rating: rating !== undefined ? parseOptionalNumber(rating) : foundProduct?.rating,
-        reviewCount: reviewCount !== undefined ? parseOptionalNumber(reviewCount) : foundProduct?.reviewCount,
-        moq: moq !== undefined ? parseOptionalNumber(moq) : foundProduct?.moq
-    }
+        dimensions: dimensionsObj,
+        baseDeliveryCharge: calculatedBaseDeliveryCharge
+    };
+
+    if (gst !== undefined) updates.gst = parseOptionalNumber(gst);
+    if (discount !== undefined) updates.discount = parseOptionalNumber(discount);
+    if (basePrice !== undefined) updates.basePrice = parseOptionalNumber(basePrice);
+    if (regularPrice !== undefined) updates.regularPrice = parseOptionalNumber(regularPrice);
+    if (rating !== undefined) updates.rating = parseOptionalNumber(rating);
+    if (reviewCount !== undefined) updates.reviewCount = parseOptionalNumber(reviewCount);
+    if (moq !== undefined) updates.moq = parseOptionalNumber(moq);
+
+    // Clean undefined keys so Mongoose never casts undefined fields
+    Object.keys(updates).forEach(key => {
+        if (updates[key] === undefined) {
+            delete updates[key];
+        }
+    });
 
     const updatedProduct = await Product.findByIdAndUpdate(
         { _id },
         {
-            ...updates
+            $set: updates
         },
-        { new: true }
+        { returnDocument: 'after' }
     ).populate("category stock groups variants").exec();
     if (!updatedProduct) {
         throw new ApiError(409, "Could not update product");

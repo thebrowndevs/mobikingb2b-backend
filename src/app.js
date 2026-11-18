@@ -7,12 +7,10 @@ import { ApiError } from "./utils/ApiError.js"
 
 const app = express()
 
-app.use(cors(
-    // {
-    //     origin: process.env.CORS_ORIGIN,
-    //     credentials: true
-    // }
-))
+app.use(cors({
+    origin: true,
+    credentials: true
+}))
 
 app.use(compression())
 

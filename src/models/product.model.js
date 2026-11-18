@@ -1,5 +1,19 @@
 import mongoose from "mongoose";
 
+const formatDecimalNumber = (v) => {
+    if (v === null || v === undefined) return v;
+    const num = Number(v);
+    if (isNaN(num)) return undefined;
+    return parseFloat(num.toFixed(3));
+};
+
+const validateDecimalPlaces = (v) => {
+    if (v === null || v === undefined) return true;
+    const num = Number(v);
+    if (isNaN(num)) return false;
+    return /^\d+(\.\d{1,3})?$/.test(num.toFixed(3));
+};
+
 const sellingPriceSchema = new mongoose.Schema({
     type: {
         type: String,
@@ -15,12 +29,10 @@ const sellingPriceSchema = new mongoose.Schema({
             type: Number,
             required: true,
             min: 0,
-            set: v => parseFloat(Number(v).toFixed(3)),
+            set: formatDecimalNumber,
             validate: {
-                validator: function (v) {
-                    return /^\d+(\.\d{3})?$/.test(v.toFixed(3));
-                },
-                message: props => `${props.value} is not valid. Must have exactly 3 decimal places.`
+                validator: validateDecimalPlaces,
+                message: props => `${props.value} is not valid. Must have at most 3 decimal places.`
             }
         }
     }]
@@ -88,23 +100,19 @@ const productSchema = new mongoose.Schema({
     minPrice: {
         type: Number,
         default: 0,
-        set: v => parseFloat(Number(v).toFixed(3)),
+        set: formatDecimalNumber,
         validate: {
-            validator: function (v) {
-                return /^\d+(\.\d{3})?$/.test(v.toFixed(3));
-            },
-            message: props => `${props.value} is not valid. Must have exactly 3 decimal places.`
+            validator: validateDecimalPlaces,
+            message: props => `${props.value} is not valid. Must have at most 3 decimal places.`
         }
     },
     maxPrice: {
         type: Number,
         default: 0,
-        set: v => parseFloat(Number(v).toFixed(3)),
+        set: formatDecimalNumber,
         validate: {
-            validator: function (v) {
-                return /^\d+(\.\d{3})?$/.test(v.toFixed(3));
-            },
-            message: props => `${props.value} is not valid. Must have exactly 3 decimal places.`
+            validator: validateDecimalPlaces,
+            message: props => `${props.value} is not valid. Must have at most 3 decimal places.`
         }
     },
     webVisibility: {
@@ -126,23 +134,19 @@ const productSchema = new mongoose.Schema({
     basePrice: {
         type: Number,
         min: 0,
-        set: v => parseFloat(Number(v).toFixed(3)),
+        set: formatDecimalNumber,
         validate: {
-            validator: function (v) {
-                return /^\d+(\.\d{3})?$/.test(v.toFixed(3));
-            },
-            message: props => `${props.value} is not valid. Must have exactly 3 decimal places.`
+            validator: validateDecimalPlaces,
+            message: props => `${props.value} is not valid. Must have at most 3 decimal places.`
         }
     },
     regularPrice: {
         type: Number,
         min: 0,
-        set: v => parseFloat(Number(v).toFixed(3)),
+        set: formatDecimalNumber,
         validate: {
-            validator: function (v) {
-                return /^\d+(\.\d{3})?$/.test(v.toFixed(3));
-            },
-            message: props => `${props.value} is not valid. Must have exactly 3 decimal places.`
+            validator: validateDecimalPlaces,
+            message: props => `${props.value} is not valid. Must have at most 3 decimal places.`
         }
     },
     rating: {
@@ -212,6 +216,19 @@ const productSchema = new mongoose.Schema({
     inventory: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Inventory'
+    },
+    // --- PHYSICAL DIMENSIONS & VOLUMETRIC ATTRIBUTES ---
+    dimensions: {
+        length: { type: Number, default: 0, min: 0 },          // in cm
+        breadth: { type: Number, default: 0, min: 0 },         // in cm
+        height: { type: Number, default: 0, min: 0 },          // in cm
+        volume: { type: Number, default: 0, min: 0 },          // in cm³ (L * B * H * 1.2)
+        volumetricWeight: { type: Number, default: 0, min: 0 } // in kg (Volume / 5000)
+    },
+    baseDeliveryCharge: {
+        type: Number,
+        default: 0,
+        min: 0
     }
 }, { timestamps: true });
 

@@ -18,7 +18,13 @@ const companyDetailsSchema = new mongoose.Schema({
     enableHdfc: { type: Boolean, default: false }
   },
   minOrderLimit: { type: Number, default: 0 },
-  minQuotationLimit: { type: Number, default: 0 }
+  minQuotationLimit: { type: Number, default: 0 },
+  deliveryChargeSettings: {
+    firstKgCharge: { type: Number, default: 100 },
+    additionalKgCharge: { type: Number, default: 70 },
+    volumeMultiplier: { type: Number, default: 1.2 },
+    volumetricDivisor: { type: Number, default: 5000 }
+  }
 }, { timestamps: true });
 
 export const CompanyDetails = mongoose.model("CompanyDetails", companyDetailsSchema);
