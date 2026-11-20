@@ -1,4 +1,5 @@
 import { Product } from "../models/product.model.js";
+import { CompanyDetails } from "../models/company_details.model.js";
 import { ApiError } from "./ApiError.js";
 
 export const determineSlabForQuantity = (product, quantity) => {
@@ -86,7 +87,15 @@ export const syncGlobalDiscountWithType = (entity, subtotalFixed) => {
  */
 export const recalculateQuotationTotalsWebsite = async (quotation, session, keepDeliveryCharge = false) => {
     let subtotal = 0;
-    const categoryCharges = new Map();
+    const company = await CompanyDetails.findOne().select("deliveryChargeSettings").lean();
+    const deliverySettings = company?.deliveryChargeSettings || {
+        firstKgCharge: 100,
+        additionalKgCharge: 60,
+        volumeMultiplier: 1.2,
+        volumetricDivisor: 5000
+    };
+    let totalConsignmentWeight = 0;
+    const productWeightMap = new Map();
 
     const productQuantities = new Map();
     for (const item of quotation.items) {
@@ -123,19 +132,65 @@ export const recalculateQuotationTotalsWebsite = async (quotation, session, keep
 
         subtotal += (item.price - item.discount) * item.quantity;
 
-        if (product.category) {
-            const categoryId = product.category._id.toString();
-            const deliveryCharge = product.category.deliveryCharge || 0;
-            if (deliveryCharge > 0 && !categoryCharges.has(categoryId)) {
-                categoryCharges.set(categoryId, deliveryCharge);
-            }
+        // Volumetric calculation
+        let itemUnitVolWeight = 0;
+        let itemTotalVolWeight = 0;
+        let itemVolume = 0;
+        let l = 0, b = 0, h = 0;
+
+        if (product.dimensions) {
+            l = Math.max(0, Number(product.dimensions.length) || 0);
+            b = Math.max(0, Number(product.dimensions.breadth) || 0);
+            h = Math.max(0, Number(product.dimensions.height) || 0);
+            const multiplier = Number(deliverySettings.volumeMultiplier) || 1.2;
+            const divisor = Number(deliverySettings.volumetricDivisor) || 5000;
+            itemVolume = l * b * h * multiplier;
+            itemUnitVolWeight = divisor > 0 ? (itemVolume / divisor) : 0;
+            itemTotalVolWeight = itemUnitVolWeight * item.quantity;
         }
+
+        totalConsignmentWeight += itemTotalVolWeight;
+
+        const prodId = String(product._id || item.productId);
+        productWeightMap.set(prodId, (productWeightMap.get(prodId) || 0) + itemTotalVolWeight);
+
+        item.dimensions = {
+            length: l,
+            breadth: b,
+            height: h,
+            volume: parseFloat(itemVolume.toFixed(2))
+        };
+        item.unitVolumetricWeight = parseFloat(itemUnitVolWeight.toFixed(3));
+        item.totalVolumetricWeight = parseFloat(itemTotalVolWeight.toFixed(3));
     }
 
     if (!keepDeliveryCharge) {
-        const values = Array.from(categoryCharges.values());
-        const totalDeliveryCharge = Math.max(...values, 0);
-        quotation.deliveryCharge = parseFloat(totalDeliveryCharge.toFixed(2));
+        let totalDeliveryCharge = 0;
+        let additionalUnits = 0;
+        const firstKg = Number(deliverySettings.firstKgCharge) || 100;
+        const addKg = Number(deliverySettings.additionalKgCharge) || 60;
+
+        for (const [pId, pWeight] of productWeightMap.entries()) {
+            if (pWeight > 0) {
+                if (pWeight <= 1.0) {
+                    totalDeliveryCharge += firstKg;
+                } else {
+                    const addUnits = Math.ceil(pWeight - 1.0);
+                    additionalUnits += addUnits;
+                    totalDeliveryCharge += firstKg + (addUnits * addKg);
+                }
+            }
+        }
+        totalDeliveryCharge = Math.round(totalDeliveryCharge);
+        quotation.deliveryCharge = totalDeliveryCharge;
+        quotation.totalVolumetricWeight = parseFloat(totalConsignmentWeight.toFixed(3));
+        quotation.deliveryChargeBreakdown = {
+            billableWeightKg: parseFloat(totalConsignmentWeight.toFixed(3)),
+            firstKgCharge: Number(deliverySettings.firstKgCharge) || 100,
+            additionalKgCharge: Number(deliverySettings.additionalKgCharge) || 60,
+            additionalKgUnits: additionalUnits,
+            calculatedCharge: totalDeliveryCharge
+        };
     } else {
         quotation.deliveryCharge = parseFloat((quotation.deliveryCharge || 0).toFixed(2));
     }
@@ -154,7 +209,15 @@ export const recalculateQuotationTotalsWebsite = async (quotation, session, keep
  */
 export const recalculateQuotationTotalsAdmin = async (quotation, session, keepReceivedPrices = true, keepDeliveryCharge = false) => {
     let subtotal = 0;
-    const categoryCharges = new Map();
+    const company = await CompanyDetails.findOne().select("deliveryChargeSettings").lean();
+    const deliverySettings = company?.deliveryChargeSettings || {
+        firstKgCharge: 100,
+        additionalKgCharge: 60,
+        volumeMultiplier: 1.2,
+        volumetricDivisor: 5000
+    };
+    let totalConsignmentWeight = 0;
+    const productWeightMap = new Map();
 
     const productQuantities = new Map();
     for (const item of quotation.items) {
@@ -200,19 +263,65 @@ export const recalculateQuotationTotalsAdmin = async (quotation, session, keepRe
 
         subtotal += (item.price - item.discount) * item.quantity;
 
-        if (product.category) {
-            const categoryId = product.category._id.toString();
-            const deliveryCharge = product.category.deliveryCharge || 0;
-            if (deliveryCharge > 0 && !categoryCharges.has(categoryId)) {
-                categoryCharges.set(categoryId, deliveryCharge);
-            }
+        // Volumetric calculation
+        let itemUnitVolWeight = 0;
+        let itemTotalVolWeight = 0;
+        let itemVolume = 0;
+        let l = 0, b = 0, h = 0;
+
+        if (product.dimensions) {
+            l = Math.max(0, Number(product.dimensions.length) || 0);
+            b = Math.max(0, Number(product.dimensions.breadth) || 0);
+            h = Math.max(0, Number(product.dimensions.height) || 0);
+            const multiplier = Number(deliverySettings.volumeMultiplier) || 1.2;
+            const divisor = Number(deliverySettings.volumetricDivisor) || 5000;
+            itemVolume = l * b * h * multiplier;
+            itemUnitVolWeight = divisor > 0 ? (itemVolume / divisor) : 0;
+            itemTotalVolWeight = itemUnitVolWeight * item.quantity;
         }
+
+        totalConsignmentWeight += itemTotalVolWeight;
+
+        const prodId = String(product._id || item.productId);
+        productWeightMap.set(prodId, (productWeightMap.get(prodId) || 0) + itemTotalVolWeight);
+
+        item.dimensions = {
+            length: l,
+            breadth: b,
+            height: h,
+            volume: parseFloat(itemVolume.toFixed(2))
+        };
+        item.unitVolumetricWeight = parseFloat(itemUnitVolWeight.toFixed(3));
+        item.totalVolumetricWeight = parseFloat(itemTotalVolWeight.toFixed(3));
     }
 
     if (!keepDeliveryCharge) {
-        const values = Array.from(categoryCharges.values());
-        const totalDeliveryCharge = Math.max(...values, 0);
-        quotation.deliveryCharge = parseFloat(totalDeliveryCharge.toFixed(2));
+        let totalDeliveryCharge = 0;
+        let additionalUnits = 0;
+        const firstKg = Number(deliverySettings.firstKgCharge) || 100;
+        const addKg = Number(deliverySettings.additionalKgCharge) || 60;
+
+        for (const [pId, pWeight] of productWeightMap.entries()) {
+            if (pWeight > 0) {
+                if (pWeight <= 1.0) {
+                    totalDeliveryCharge += firstKg;
+                } else {
+                    const addUnits = Math.ceil(pWeight - 1.0);
+                    additionalUnits += addUnits;
+                    totalDeliveryCharge += firstKg + (addUnits * addKg);
+                }
+            }
+        }
+        totalDeliveryCharge = Math.round(totalDeliveryCharge);
+        quotation.deliveryCharge = totalDeliveryCharge;
+        quotation.totalVolumetricWeight = parseFloat(totalConsignmentWeight.toFixed(3));
+        quotation.deliveryChargeBreakdown = {
+            billableWeightKg: parseFloat(totalConsignmentWeight.toFixed(3)),
+            firstKgCharge: Number(deliverySettings.firstKgCharge) || 100,
+            additionalKgCharge: Number(deliverySettings.additionalKgCharge) || 60,
+            additionalKgUnits: additionalUnits,
+            calculatedCharge: totalDeliveryCharge
+        };
     } else {
         quotation.deliveryCharge = parseFloat((quotation.deliveryCharge || 0).toFixed(2));
     }
@@ -230,7 +339,15 @@ export const recalculateQuotationTotalsAdmin = async (quotation, session, keepRe
  */
 export const recalculateOrderTotals = async (order, session, keepDeliveryCharge = false) => {
     let subtotal = 0;
-    const categoryCharges = new Map();
+    const company = await CompanyDetails.findOne().select("deliveryChargeSettings").lean();
+    const deliverySettings = company?.deliveryChargeSettings || {
+        firstKgCharge: 100,
+        additionalKgCharge: 60,
+        volumeMultiplier: 1.2,
+        volumetricDivisor: 5000
+    };
+    let totalConsignmentWeight = 0;
+    const productWeightMap = new Map();
 
     for (const item of order.items) {
         const p = await Product.findById(item.productId)
@@ -240,20 +357,68 @@ export const recalculateOrderTotals = async (order, session, keepDeliveryCharge 
         if (p) {
             syncItemDiscountWithType(item, item.price);
             subtotal += (item.price - (item.discount || 0)) * item.quantity;
-            if (p.category) {
-                const categoryId = p.category._id.toString();
-                const deliveryCharge = p.category.deliveryCharge || 0;
-                if (deliveryCharge > 0 && !categoryCharges.has(categoryId)) {
-                    categoryCharges.set(categoryId, deliveryCharge);
-                }
+
+            let itemUnitVolWeight = 0;
+            let itemTotalVolWeight = 0;
+            let itemVolume = 0;
+            let l = 0, b = 0, h = 0;
+
+            if (p.dimensions) {
+                l = Math.max(0, Number(p.dimensions.length) || 0);
+                b = Math.max(0, Number(p.dimensions.breadth) || 0);
+                h = Math.max(0, Number(p.dimensions.height) || 0);
+                const multiplier = Number(deliverySettings.volumeMultiplier) || 1.2;
+                const divisor = Number(deliverySettings.volumetricDivisor) || 5000;
+                itemVolume = l * b * h * multiplier;
+                itemUnitVolWeight = divisor > 0 ? (itemVolume / divisor) : 0;
+                itemTotalVolWeight = itemUnitVolWeight * item.quantity;
             }
+
+            totalConsignmentWeight += itemTotalVolWeight;
+
+            const pId = String(item.productId?._id || item.productId || "");
+            if (pId) {
+                productWeightMap.set(pId, (productWeightMap.get(pId) || 0) + itemTotalVolWeight);
+            }
+
+            item.dimensions = {
+                length: l,
+                breadth: b,
+                height: h,
+                volume: parseFloat(itemVolume.toFixed(2))
+            };
+            item.unitVolumetricWeight = parseFloat(itemUnitVolWeight.toFixed(3));
+            item.totalVolumetricWeight = parseFloat(itemTotalVolWeight.toFixed(3));
         }
     }
 
     if (!keepDeliveryCharge) {
-        const values = Array.from(categoryCharges.values());
-        const totalDeliveryCharge = Math.max(...values, 0);
-        order.deliveryCharge = parseFloat(totalDeliveryCharge.toFixed(2));
+        let totalDeliveryCharge = 0;
+        let additionalUnits = 0;
+        const firstKg = Number(deliverySettings.firstKgCharge) || 100;
+        const addKg = Number(deliverySettings.additionalKgCharge) || 60;
+
+        for (const [pId, pWeight] of productWeightMap.entries()) {
+            if (pWeight > 0) {
+                if (pWeight <= 1.0) {
+                    totalDeliveryCharge += firstKg;
+                } else {
+                    const addUnits = Math.ceil(pWeight - 1.0);
+                    additionalUnits += addUnits;
+                    totalDeliveryCharge += firstKg + (addUnits * addKg);
+                }
+            }
+        }
+        totalDeliveryCharge = Math.round(totalDeliveryCharge);
+        order.deliveryCharge = totalDeliveryCharge;
+        order.totalVolumetricWeight = parseFloat(totalConsignmentWeight.toFixed(3));
+        order.deliveryChargeBreakdown = {
+            billableWeightKg: parseFloat(totalConsignmentWeight.toFixed(3)),
+            firstKgCharge: Number(deliverySettings.firstKgCharge) || 100,
+            additionalKgCharge: Number(deliverySettings.additionalKgCharge) || 60,
+            additionalKgUnits: additionalUnits,
+            calculatedCharge: totalDeliveryCharge
+        };
     } else {
         order.deliveryCharge = parseFloat((order.deliveryCharge || 0).toFixed(2));
     }

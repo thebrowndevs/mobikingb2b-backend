@@ -121,7 +121,7 @@ export const updateCompanyDetails = asyncHandler(async (req, res) => {
     volumetricDivisor: details.deliveryChargeSettings.volumetricDivisor,
   } : {
     firstKgCharge: 100,
-    additionalKgCharge: 70,
+    additionalKgCharge: 60,
     volumeMultiplier: 1.2,
     volumetricDivisor: 5000,
   };
@@ -207,7 +207,7 @@ export const streamDeliverySettingsMigration = asyncHandler(async (req, res) => 
   const details = await CompanyDetails.findOne().lean();
   const config = details?.deliveryChargeSettings || {
     firstKgCharge: 100,
-    additionalKgCharge: 70,
+    additionalKgCharge: 60,
     volumeMultiplier: 1.2,
     volumetricDivisor: 5000
   };
@@ -332,7 +332,7 @@ export const migrateDeliverySettingsBatch = asyncHandler(async (req, res) => {
   const details = await CompanyDetails.findOne().lean();
   const config = details?.deliveryChargeSettings || {
     firstKgCharge: 100,
-    additionalKgCharge: 70,
+    additionalKgCharge: 60,
     volumeMultiplier: 1.2,
     volumetricDivisor: 5000,
   };

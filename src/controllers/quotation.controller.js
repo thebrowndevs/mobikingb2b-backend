@@ -92,12 +92,79 @@ export const createQuotation = asyncHandler(async (req, res) => {
             return sum + ((item.price || 0) - (item.discount || 0)) * (item.quantity || 0);
         }, 0);
 
-        // Enforce minimum quotation limit
-        const companySettings = await CompanyDetails.findOne().select("minQuotationLimit").lean();
-        const minQuotationLimit = companySettings?.minQuotationLimit ?? 0;
+        // Enforce minimum quotation limit and load delivery settings
+        const companyDetails = await CompanyDetails.findOne().select("minQuotationLimit deliveryChargeSettings").lean();
+        const minQuotationLimit = companyDetails?.minQuotationLimit ?? 0;
         if (minQuotationLimit > 0 && cartSubtotal < minQuotationLimit) {
             throw new ApiError(400, `Order Request must be of minimum ₹${minQuotationLimit}.`);
         }
+
+        const deliverySettings = companyDetails?.deliveryChargeSettings || {
+            firstKgCharge: 100,
+            additionalKgCharge: 60,
+            volumeMultiplier: 1.2,
+            volumetricDivisor: 5000
+        };
+
+        let totalOrderVolumetricWeight = 0;
+        const productWeightMap = new Map();
+
+        // Calculate volumetric weight for cart items
+        for (const item of cart.items) {
+            const product = item.productId;
+            const qty = Number(item.quantity) || 1;
+            let itemUnitVolWeight = 0;
+            let itemTotalVolWeight = 0;
+            let itemVolume = 0;
+            let l = 0, b = 0, h = 0;
+
+            if (product?.dimensions) {
+                l = Math.max(0, Number(product.dimensions.length) || 0);
+                b = Math.max(0, Number(product.dimensions.breadth) || 0);
+                h = Math.max(0, Number(product.dimensions.height) || 0);
+                const multiplier = Number(deliverySettings.volumeMultiplier) || 1.2;
+                const divisor = Number(deliverySettings.volumetricDivisor) || 5000;
+                itemVolume = l * b * h * multiplier;
+                itemUnitVolWeight = divisor > 0 ? (itemVolume / divisor) : 0;
+                itemTotalVolWeight = itemUnitVolWeight * qty;
+            }
+
+            totalOrderVolumetricWeight += itemTotalVolWeight;
+
+            const prodId = String(product?._id || item.productId || "");
+            if (prodId) {
+                productWeightMap.set(prodId, (productWeightMap.get(prodId) || 0) + itemTotalVolWeight);
+            }
+
+            item.dimensions = {
+                length: l,
+                breadth: b,
+                height: h,
+                volume: parseFloat(itemVolume.toFixed(2))
+            };
+            item.unitVolumetricWeight = parseFloat(itemUnitVolWeight.toFixed(3));
+            item.totalVolumetricWeight = parseFloat(itemTotalVolWeight.toFixed(3));
+        }
+
+        let calculatedDeliveryCharge = 0;
+        let additionalUnits = 0;
+        const firstKg = Number(deliverySettings.firstKgCharge) || 100;
+        const addKg = Number(deliverySettings.additionalKgCharge) || 60;
+
+        for (const [pId, pWeight] of productWeightMap.entries()) {
+            if (pWeight > 0) {
+                if (pWeight <= 1.0) {
+                    calculatedDeliveryCharge += firstKg;
+                } else {
+                    const addUnits = Math.ceil(pWeight - 1.0);
+                    additionalUnits += addUnits;
+                    calculatedDeliveryCharge += firstKg + (addUnits * addKg);
+                }
+            }
+        }
+        calculatedDeliveryCharge = Math.round(calculatedDeliveryCharge);
+        // Website user quotation uses the exact calculated delivery charge
+        const finalDeliveryCharge = calculatedDeliveryCharge;
 
         const foundAddress = await Address.findById(addressId);
         if (!foundAddress) {
@@ -125,11 +192,19 @@ export const createQuotation = asyncHandler(async (req, res) => {
             addressId,
             ...addressDetails,
             coupon,
-            subtotal,
+            subtotal: parseFloat(cartSubtotal.toFixed(2)),
             discount,
             discountPercent,
-            deliveryCharge,
-            orderAmount,
+            deliveryCharge: finalDeliveryCharge,
+            totalVolumetricWeight: parseFloat(totalOrderVolumetricWeight.toFixed(3)),
+            deliveryChargeBreakdown: {
+                billableWeightKg: parseFloat(totalOrderVolumetricWeight.toFixed(3)),
+                firstKgCharge: firstKg,
+                additionalKgCharge: addKg,
+                additionalKgUnits: additionalUnits,
+                calculatedCharge: calculatedDeliveryCharge
+            },
+            orderAmount: parseFloat((Math.max(0, cartSubtotal - (discount || 0)) + finalDeliveryCharge).toFixed(2)),
             status: "New",
             isAppOrder: req.body.isAppOrder || false,
             type: req.body.type || "Regular",
@@ -218,6 +293,11 @@ export const createQuotation = asyncHandler(async (req, res) => {
                     quoteItem.purchaseSets = allocatedSets;
                     quoteItem.variantId = variant._id;
                     quoteItem.sku = String(variant._id);
+                    if (item.dimensions) {
+                        quoteItem.dimensions = item.dimensions;
+                        quoteItem.unitVolumetricWeight = item.unitVolumetricWeight;
+                        quoteItem.totalVolumetricWeight = item.totalVolumetricWeight;
+                    }
                 }
 
                 await variant.save({ session });

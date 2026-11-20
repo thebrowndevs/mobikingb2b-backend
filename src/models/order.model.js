@@ -295,6 +295,14 @@ const orderSchema = new mongoose.Schema(
         remainingAmount: { type: Number, default: 0 },
         shippingType: { type: String, enum: ["Manual", "Partner"], default: "Manual" },
         deliveryCharge: { type: Number, default: 0 },
+        totalVolumetricWeight: { type: Number, default: 0 },
+        deliveryChargeBreakdown: {
+            billableWeightKg: Number,
+            firstKgCharge: Number,
+            additionalKgCharge: Number,
+            additionalKgUnits: Number,
+            calculatedCharge: Number
+        },
         discount: { type: Number, default: 0 },
         discountPercent: { type: Number, default: 0 },
         discountType: {

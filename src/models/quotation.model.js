@@ -54,6 +54,14 @@ const quotationSchema = new mongoose.Schema(
         couponType: { type: String },
         orderAmount: { type: Number, required: true },
         deliveryCharge: { type: Number, default: 0 },
+        totalVolumetricWeight: { type: Number, default: 0 },
+        deliveryChargeBreakdown: {
+            billableWeightKg: Number,
+            firstKgCharge: Number,
+            additionalKgCharge: Number,
+            additionalKgUnits: Number,
+            calculatedCharge: Number
+        },
         discount: { type: Number, default: 0 },
         discountPercent: { type: Number, default: 0 },
         discountType: {

@@ -66,6 +66,14 @@ export const itemsSchema = new mongoose.Schema({
         type: Number,
         default: 0
     },
+    dimensions: {
+        length: { type: Number, default: 0 },
+        breadth: { type: Number, default: 0 },
+        height: { type: Number, default: 0 },
+        volume: { type: Number, default: 0 }
+    },
+    unitVolumetricWeight: { type: Number, default: 0 },
+    totalVolumetricWeight: { type: Number, default: 0 },
     returnQuantity: {
         type: Number,
     },
