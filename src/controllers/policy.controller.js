@@ -87,6 +87,7 @@ export const updateCompanyDetails = asyncHandler(async (req, res) => {
     paymentGatewaySettings,
     minOrderLimit,
     minQuotationLimit,
+    minQuotationQty,
     deliveryChargeSettings
   } = req.body;
 
@@ -111,6 +112,9 @@ export const updateCompanyDetails = asyncHandler(async (req, res) => {
   }
   if (minQuotationLimit !== undefined && minQuotationLimit !== null) {
     updateFields.minQuotationLimit = Number(minQuotationLimit);
+  }
+  if (minQuotationQty !== undefined && minQuotationQty !== null) {
+    updateFields.minQuotationQty = Number(minQuotationQty);
   }
 
   // Capture previous delivery charge settings for rollback / scope detection
@@ -172,12 +176,13 @@ export const updateCompanyDetails = asyncHandler(async (req, res) => {
  */
 export const getCompanyLimits = asyncHandler(async (req, res) => {
   const details = await CompanyDetails.findOne()
-    .select("minOrderLimit minQuotationLimit paymentGatewaySettings deliveryChargeSettings").lean();
+    .select("minOrderLimit minQuotationLimit minQuotationQty paymentGatewaySettings deliveryChargeSettings").lean();
 
   return res.status(200).json(
     new ApiResponse(200, {
       minOrderLimit: details?.minOrderLimit ?? 0,
       minQuotationLimit: details?.minQuotationLimit ?? 0,
+      minQuotationQty: details?.minQuotationQty ?? 0,
       enableRazorpay: details?.paymentGatewaySettings?.enableRazorpay ?? true,
       enablePhonepe: details?.paymentGatewaySettings?.enablePhonepe ?? true,
       enableHdfc: details?.paymentGatewaySettings?.enableHdfc ?? false,

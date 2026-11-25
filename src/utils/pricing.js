@@ -4,12 +4,6 @@ import { ApiError } from "./ApiError.js";
 
 export const determineSlabForQuantity = (product, quantity) => {
     if (!product.sellingPrice) return null;
-    if (product.sellingPrice.type === "fixed") {
-        if (product.sellingPrice.slabs && product.sellingPrice.slabs.length > 0) {
-            return { quantity: product.sellingPrice.slabs[0].quantity, price: product.sellingPrice.slabs[0].price };
-        }
-        return { quantity: 1, price: product.basePrice || 0 };
-    }
 
     const slabs = product.sellingPrice.slabs || [];
     if (slabs.length === 0) return { quantity: 1, price: product.basePrice || 0 };

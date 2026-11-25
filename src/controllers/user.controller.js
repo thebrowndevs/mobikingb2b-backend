@@ -14,6 +14,7 @@ import { Address } from './../models/address.model.js';
 import { sendOtpEmail, sendPasswordResetEmail } from "../utils/emailService.js";
 import crypto from "crypto";
 import { Variant } from "../models/variant.model.js";
+import { recalculateCartPrices } from "./cart.controller.js";
 
 // ******************************************************
 //                  USER AUTH CONTROLLERS
@@ -838,14 +839,10 @@ const getUserCart = asyncHandler(async (req, res) => {
         validItems.push(item);
     }
 
-    if (updated) {
-        cart.items = validItems;
+    cart.items = validItems;
+    const pricesChanged = await recalculateCartPrices(cart);
 
-        cart.totalCartValue = cart.items.reduce(
-            (sum, item) => sum + (item.price * item.quantity),
-            0
-        );
-
+    if (updated || pricesChanged) {
         await cart.save();
     }
 

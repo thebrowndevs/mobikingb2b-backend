@@ -19,6 +19,7 @@ const companyDetailsSchema = new mongoose.Schema({
   },
   minOrderLimit: { type: Number, default: 0 },
   minQuotationLimit: { type: Number, default: 0 },
+  minQuotationQty: { type: Number, default: 0 },
   deliveryChargeSettings: {
     firstKgCharge: { type: Number, default: 100 },
     additionalKgCharge: { type: Number, default: 70 },

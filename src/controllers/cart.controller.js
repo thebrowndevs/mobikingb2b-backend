@@ -5,21 +5,25 @@ import { ApiResponse } from '../utils/ApiResponse.js';
 import { asyncHandler } from '../utils/asyncHandler.js';
 import { Product } from './../models/product.model.js';
 import { Variant } from '../models/variant.model.js';
+import { determineSlabForQuantity } from '../utils/pricing.js';
 
 // Helper to recalculate selling prices of all items in cart dynamically based on product slabs
-async function recalculateCartPrices(cart) {
+export async function recalculateCartPrices(cart) {
     if (!cart || !cart.items || cart.items.length === 0) {
+        const changed = Boolean(cart && cart.totalCartValue !== 0);
         if (cart) {
             cart.totalCartValue = 0;
         }
-        return;
+        return changed;
     }
+
+    let hasChanges = false;
 
     // Group items by productId to find total product quantity
     const productQuantities = {};
     for (const item of cart.items) {
         if (!item.productId) continue;
-        const pId = item.productId.toString();
+        const pId = (item.productId._id || item.productId).toString();
         productQuantities[pId] = (productQuantities[pId] || 0) + item.quantity;
     }
 
@@ -30,34 +34,43 @@ async function recalculateCartPrices(cart) {
 
         const totalQty = productQuantities[pId];
 
-        // Determine price from slabs based on totalQty
-        let activeSlab = product.sellingPrice?.slabs?.[0] || { quantity: 60, price: product.basePrice || 0 };
-        if (product.sellingPrice?.slabs && product.sellingPrice.slabs.length > 0) {
-            const sortedSlabs = [...product.sellingPrice.slabs].sort((a, b) => b.quantity - a.quantity);
-            for (const slab of sortedSlabs) {
-                if (totalQty >= slab.quantity) {
-                    activeSlab = slab;
-                    break;
-                }
-            }
-        }
+        // Determine price from slabs based on totalQty using authoritative pricing helper
+        const activeSlab = determineSlabForQuantity(product, totalQty) || {
+            quantity: product.moq || 1,
+            price: product.basePrice || 0
+        };
 
         // Update all items of this product in cart
         for (const item of cart.items) {
-            if (item.productId && item.productId.toString() === pId) {
-                item.price = activeSlab.price;
-                item.appliedSlab = {
-                    quantity: activeSlab.quantity,
-                    price: activeSlab.price
-                };
+            const itemPid = (item.productId?._id || item.productId)?.toString();
+            if (itemPid === pId) {
+                if (
+                    item.price !== activeSlab.price ||
+                    item.appliedSlab?.quantity !== activeSlab.quantity ||
+                    item.appliedSlab?.price !== activeSlab.price
+                ) {
+                    item.price = activeSlab.price;
+                    item.appliedSlab = {
+                        quantity: activeSlab.quantity,
+                        price: activeSlab.price
+                    };
+                    hasChanges = true;
+                }
             }
         }
     }
 
     // Recalculate total value
-    cart.totalCartValue = cart.items.reduce((total, item) => {
+    const newTotalCartValue = cart.items.reduce((total, item) => {
         return total + item.quantity * item.price;
     }, 0);
+
+    if (cart.totalCartValue !== newTotalCartValue) {
+        cart.totalCartValue = newTotalCartValue;
+        hasChanges = true;
+    }
+
+    return hasChanges;
 }
 
 const addProductInCart = asyncHandler(async (req, res) => {

@@ -52,6 +52,7 @@ import {
     recalculateQuotationTotalsWebsite,
     recalculateQuotationTotalsAdmin
 } from "../utils/pricing.js";
+import { recalculateCartPrices } from "./cart.controller.js";
 
 /**
  * Creates a new B2B Quotation from the user's cart.
@@ -87,16 +88,34 @@ export const createQuotation = asyncHandler(async (req, res) => {
             throw new ApiError(400, "Your cart is empty.");
         }
 
+        // Re-resolve live product slab prices before creating quotation
+        const pricesChanged = await recalculateCartPrices(cart);
+        if (pricesChanged) {
+            await cart.save();
+        }
+
         // Server-side subtotal calculation from cart items
         const cartSubtotal = cart.items.reduce((sum, item) => {
             return sum + ((item.price || 0) - (item.discount || 0)) * (item.quantity || 0);
         }, 0);
 
         // Enforce minimum quotation limit and load delivery settings
-        const companyDetails = await CompanyDetails.findOne().select("minQuotationLimit deliveryChargeSettings").lean();
+        const companyDetails = await CompanyDetails.findOne().select("minQuotationLimit minQuotationQty deliveryChargeSettings").lean();
         const minQuotationLimit = companyDetails?.minQuotationLimit ?? 0;
-        if (minQuotationLimit > 0 && cartSubtotal < minQuotationLimit) {
-            throw new ApiError(400, `Order Request must be of minimum ₹${minQuotationLimit}.`);
+        const minQuotationQty = companyDetails?.minQuotationQty ?? 0;
+
+        if (minQuotationLimit > 0 || minQuotationQty > 0) {
+            const totalCartQty = cart.items.reduce((sum, item) => sum + Number(item.quantity || 0), 0);
+
+            const meetsAmount = minQuotationLimit > 0 && cartSubtotal >= minQuotationLimit;
+            const meetsQty = minQuotationQty > 0 && totalCartQty >= minQuotationQty;
+
+            if (!meetsAmount && !meetsQty) {
+                const parts = [];
+                if (minQuotationLimit > 0) parts.push(`subtotal of at least ₹${minQuotationLimit.toLocaleString()}`);
+                if (minQuotationQty > 0) parts.push(`at least ${minQuotationQty} total units in cart`);
+                throw new ApiError(400, `Order Request requires ${parts.join(" or ")}.`);
+            }
         }
 
         const deliverySettings = companyDetails?.deliveryChargeSettings || {
@@ -478,22 +497,18 @@ export const updateQuotationStatus = asyncHandler(async (req, res) => {
                         }
 
                         await variant.save({ session });
-                        await syncProductStock(item.productId, session);
 
-                        // Update parent product availableStock
-                        const parentProduct = await Product.findByIdAndUpdate(
-                            item.productId,
-                            { $inc: { availableStock: qty } },
-                            { new: true, session }
-                        );
-                        const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
-
-                        // Reduce Inventory reservedStock
+                        // Reduce Inventory reservedStock BEFORE syncProductStock validation
                         const inventory = await Inventory.findOne({ product: item.productId }).session(session);
                         if (inventory) {
                             inventory.reservedStock = Math.max(0, inventory.reservedStock - qty);
                             await inventory.save({ session });
                         }
+
+                        await syncProductStock(item.productId, session);
+
+                        const parentProduct = await Product.findById(item.productId).session(session);
+                        const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
 
                         // Queue Stock Log (Virtual - cancelled/rejected/hold)
                         let logType = STOCK_TYPES.CANCELLED;
@@ -559,12 +574,7 @@ export const updateQuotationStatus = asyncHandler(async (req, res) => {
                     await variant.save({ session });
                     await syncProductStock(item.productId, session);
 
-                    // Deduct parent product availableStock
-                    const parentProduct = await Product.findByIdAndUpdate(
-                        item.productId,
-                        { $inc: { availableStock: -qty } },
-                        { new: true, session }
-                    );
+                    const parentProduct = await Product.findById(item.productId).session(session);
                     const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
 
                     // Increase Inventory reservedStock
@@ -857,19 +867,19 @@ export const bookQuotation = asyncHandler(async (req, res) => {
                         orderItem.appliedSlab = item.appliedSlab;
                     }
 
+                    // Deduct reserved stock from Inventory BEFORE syncProductStock validation
+                    const inventory = await Inventory.findOne({ product: item.productId }).session(session);
+                    if (inventory && !quotation.reservedStockRestored) {
+                        inventory.reservedStock = Math.max(0, inventory.reservedStock - qty);
+                        await inventory.save({ session });
+                    }
+
                     // Sync parent product and inventory stock levels
                     await syncProductStock(item.productId, session);
 
                     // Fetch parent product to get updated totalProductStock for logging
                     const parentProduct = await Product.findById(item.productId).session(session);
                     const currentTotalProductStock = parentProduct ? (parentProduct.totalProductStock || parentProduct.totalStock || 0) : 0;
-
-                    // Deduct reserved stock from Inventory if not restored
-                    const inventory = await Inventory.findOne({ product: item.productId }).session(session);
-                    if (inventory && !quotation.reservedStockRestored) {
-                        inventory.reservedStock = Math.max(0, inventory.reservedStock - qty);
-                        await inventory.save({ session });
-                    }
 
                     // 3. Queue Physical 'purchase' Stock Log
                     stockEntries.push({
@@ -1098,8 +1108,8 @@ export const updateQuotation = asyncHandler(async (req, res) => {
             if (quotation.status === "Booked") {
                 throw new ApiError(400, "Cannot edit a booked quotation.");
             }
-            // Step 1: If stock is currently reserved, restore the old reservation first
-            if (!quotation.reservedStockRestored) {
+            // Step 1: If items are being replaced and stock is currently reserved, restore the old reservation first
+            if (items && Array.isArray(items) && !quotation.reservedStockRestored) {
                 for (const item of quotation.items) {
                     const qty = Math.floor(Number(item.quantity));
                     if (qty <= 0) continue;
@@ -1130,14 +1140,15 @@ export const updateQuotation = asyncHandler(async (req, res) => {
                         }
 
                         await variant.save({ session });
-                        await syncProductStock(item.productId, session);
 
-                        // Reduce Inventory reservedStock
+                        // Reduce Inventory reservedStock BEFORE syncProductStock validation
                         const inventory = await Inventory.findOne({ product: item.productId }).session(session);
                         if (inventory) {
                             inventory.reservedStock = Math.max(0, inventory.reservedStock - qty);
                             await inventory.save({ session });
                         }
+
+                        await syncProductStock(item.productId, session);
                     }
                 }
             }
