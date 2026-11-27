@@ -3,7 +3,7 @@ import mongoose from 'mongoose';
 import { Order } from '../../models/order.model.js';
 import { PaymentLink } from '../../models/payment_link.model.js';
 import { Payment } from '../../models/payment.model.js';
-import { confirmPaymentRecordPaidLogic } from '../../services/payment.service.js';
+import { confirmPaymentRecordPaidLogic, syncRefundWebhookResult } from '../../services/payment.service.js';
 import { asyncHandler } from '../../utils/asyncHandler.js';
 import { ApiResponse } from '../../utils/ApiResponse.js';
 import { logToFile } from '../../utils/logger.js';
@@ -147,33 +147,32 @@ export const paymentWebhookV2 = asyncHandler(async (req, res) => {
 
         console.log(`Processing refund success webhook for payment: ${paymentId}, refundId: ${refundId}`);
 
-        if (paymentId) {
-            const order = await Order.findOne({ razorpayPaymentId: paymentId });
-            if (order) {
-                order.refundId = refundId;
-                order.refundAmount = refundAmount;
-                order.refundStatus = "Success";
-                order.refundedAt = new Date();
-                await order.save();
-                console.log(`Updated refund status to Success for order: ${order.orderId}`);
-            }
+        if (paymentId || refundId) {
+            await syncRefundWebhookResult({
+                paymentFilter: paymentId ? { $or: [{ razorpayPaymentId: paymentId }, { paymentId }] } : null,
+                orderFilter: paymentId ? { razorpayPaymentId: paymentId } : null,
+                refundId,
+                refundAmount,
+                isSuccess: true
+            });
         }
     }
     else if (event === "refund.failed") {
         const refund = payload?.refund?.entity;
         const paymentId = refund?.payment_id;
         const refundId = refund?.id;
+        const refundAmount = refund?.amount ? refund.amount / 100 : 0;
 
         console.log(`Processing refund failed webhook for payment: ${paymentId}, refundId: ${refundId}`);
 
-        if (paymentId) {
-            const order = await Order.findOne({ razorpayPaymentId: paymentId });
-            if (order) {
-                order.refundId = refundId;
-                order.refundStatus = "Failed";
-                await order.save();
-                console.log(`Updated refund status to Failed for order: ${order.orderId}`);
-            }
+        if (paymentId || refundId) {
+            await syncRefundWebhookResult({
+                paymentFilter: paymentId ? { $or: [{ razorpayPaymentId: paymentId }, { paymentId }] } : null,
+                orderFilter: paymentId ? { razorpayPaymentId: paymentId } : null,
+                refundId,
+                refundAmount,
+                isSuccess: false
+            });
         }
     }
     else if (event === "payment.failed") {
@@ -316,31 +315,30 @@ export const phonepeWebhookV2 = asyncHandler(async (req, res) => {
         const refundAmount = decoded.payload?.amount ? decoded.payload.amount / 100 : 0;
 
         console.log(`Processing PhonePe refund success webhook: originalId=${merchantTransactionId}, refundId=${refundId}`);
-        if (merchantTransactionId) {
-            const order = await Order.findOne({ phonepeOrderId: merchantTransactionId });
-            if (order) {
-                order.refundId = refundId;
-                order.refundAmount = refundAmount;
-                order.refundStatus = "Success";
-                order.refundedAt = new Date();
-                await order.save();
-                console.log(`Updated refund status to Success for PhonePe order: ${order.orderId}`);
-            }
+        if (merchantTransactionId || refundId) {
+            await syncRefundWebhookResult({
+                paymentFilter: merchantTransactionId ? { phonepeOrderId: merchantTransactionId } : null,
+                orderFilter: merchantTransactionId ? { phonepeOrderId: merchantTransactionId } : null,
+                refundId,
+                refundAmount,
+                isSuccess: true
+            });
         }
     }
     else if (decoded.type === 'REFUND_FAILED') {
         const merchantTransactionId = decoded.payload?.originalMerchantOrderId || decoded.payload?.merchantOrderId;
         const refundId = decoded.payload?.refundId || decoded.payload?.transactionId;
+        const refundAmount = decoded.payload?.amount ? decoded.payload.amount / 100 : 0;
 
         console.log(`Processing PhonePe refund failed webhook: originalId=${merchantTransactionId}, refundId=${refundId}`);
-        if (merchantTransactionId) {
-            const order = await Order.findOne({ phonepeOrderId: merchantTransactionId });
-            if (order) {
-                order.refundId = refundId;
-                order.refundStatus = "Failed";
-                await order.save();
-                console.log(`Updated refund status to Failed for PhonePe order: ${order.orderId}`);
-            }
+        if (merchantTransactionId || refundId) {
+            await syncRefundWebhookResult({
+                paymentFilter: merchantTransactionId ? { phonepeOrderId: merchantTransactionId } : null,
+                orderFilter: merchantTransactionId ? { phonepeOrderId: merchantTransactionId } : null,
+                refundId,
+                refundAmount,
+                isSuccess: false
+            });
         }
     }
 
@@ -409,6 +407,31 @@ export const hdfcWebhookV2 = asyncHandler(async (req, res) => {
         } finally {
             session.endSession();
         }
+    }
+    else if (event === "ORDER_REFUNDED" || event === "REFUND_SUCCEEDED" || event === "ORDER_REFUND_FAILED" || event === "REFUND_FAILED" || status === "REFUNDED") {
+        const refundObj = Array.isArray(orderData?.refunds) ? orderData.refunds[0] : (req.body.content?.refund || orderData);
+        const refundId = refundObj?.unique_request_id || refundObj?.id || req.body.refund_id;
+        const refundAmount = Number(refundObj?.amount || orderData?.amount_refunded || 0);
+        const isSuccess = event === "ORDER_REFUNDED" || event === "REFUND_SUCCEEDED" || status === "REFUNDED";
+
+        await syncRefundWebhookResult({
+            paymentFilter: {
+                $or: [
+                    { hdfcOrderId: orderId },
+                    { _id: mongoose.isValidObjectId(orderId) ? orderId : null },
+                    { orderId: orderId }
+                ]
+            },
+            orderFilter: {
+                $or: [
+                    { hdfcOrderId: orderId },
+                    { _id: mongoose.isValidObjectId(orderId) ? orderId : null }
+                ]
+            },
+            refundId,
+            refundAmount,
+            isSuccess
+        });
     }
 
     return res.status(200).json({ status: "HDFC Webhook processed successfully" });

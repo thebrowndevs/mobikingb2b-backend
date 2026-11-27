@@ -6,6 +6,7 @@ import { Product } from "../models/product.model.js";
 import { Cart } from "../models/cart.model.js";
 import { User } from "../models/user.model.js";
 import { Payment } from "../models/payment.model.js";
+import { PaymentLink } from "../models/payment_link.model.js";
 import { ApiError } from "../utils/ApiError.js";
 import { STOCK_TYPES } from "../constants.js";
 
@@ -605,3 +606,151 @@ export const confirmPaymentRecordPaidLogic =
 //     console.log(`Payment record ${paymentId} successfully confirmed Paid. Order ${order._id} totals recalculated.`);
 //     return { payment, order };
 // };
+
+/**
+ * Marks all active Pending Payment and PaymentLink records for an order as Cancelled.
+ */
+export const cancelPendingPaymentsForOrder = async (order, session = null) => {
+    if (!order?._id) return;
+
+    const paymentFilter = {
+        status: "Pending",
+        $or: [
+            { orderRef: order._id },
+            ...(order.orderId ? [{ orderId: String(order.orderId) }] : [])
+        ]
+    };
+    const opts = session ? { session } : {};
+
+    await Payment.updateMany(paymentFilter, { $set: { status: "Cancelled" } }, opts);
+    await PaymentLink.updateMany(
+        { orderId: order._id, status: "Pending" },
+        { $set: { status: "Cancelled" } },
+        opts
+    );
+};
+
+/**
+ * Recalculates aggregate refundAmount and refundStatus on an Order from its Paid Payment records.
+ */
+export const recalculateOrderRefundTotals = async (order, latestRefundId = null, session = null) => {
+    if (!order?._id) return order;
+    const opts = session ? { session } : {};
+
+    const allPaidPayments = await Payment.find({
+        status: "Paid",
+        $or: [
+            { orderRef: order._id },
+            ...(order.orderId ? [{ orderId: String(order.orderId) }] : [])
+        ]
+    }, null, opts).lean();
+
+    const totalRefunded = parseFloat(
+        allPaidPayments
+            .filter(p => p.refundStatus !== "Failed")
+            .reduce((sum, p) => sum + Number(p.refundAmount || 0), 0)
+            .toFixed(2)
+    );
+    const totalPaid = Number(order.amountPaid || 0) ||
+        parseFloat(allPaidPayments.reduce((sum, p) => sum + Number(p.amount || 0), 0).toFixed(2));
+
+    const anyPending = allPaidPayments.some(p => p.refundStatus === "Pending");
+    const anyFailed = allPaidPayments.some(p => p.refundStatus === "Failed");
+
+    order.refundAmount = totalRefunded;
+    if (latestRefundId) {
+        order.refundId = latestRefundId;
+    }
+
+    if (anyPending) {
+        order.refundStatus = "Pending";
+    } else if (totalRefunded <= 0 && anyFailed) {
+        order.refundStatus = "Failed";
+    } else if (totalRefunded >= totalPaid && totalPaid > 0) {
+        order.refundStatus = "Success";
+    } else if (totalRefunded > 0) {
+        order.refundStatus = "Partial";
+    }
+
+    await order.save(opts);
+    return order;
+};
+
+/**
+ * Syncs a gateway refund webhook (Success or Failed) onto the matching Payment record and Order.
+ */
+export const syncRefundWebhookResult = async ({
+    paymentFilter,
+    orderFilter,
+    refundId,
+    refundAmount = 0,
+    isSuccess
+}) => {
+    let payment = null;
+    if (refundId) {
+        payment = await Payment.findOne({ refundId });
+    }
+    if (!payment && paymentFilter) {
+        payment = await Payment.findOne({ ...paymentFilter, status: "Paid" });
+    }
+
+    let order = null;
+    if (payment?.orderRef) {
+        order = await Order.findById(payment.orderRef);
+    }
+    if (!order && orderFilter) {
+        order = await Order.findOne(orderFilter);
+    }
+
+    if (payment) {
+        if (isSuccess) {
+            // If already initiated as Pending with this refundId, don't double-add refundAmount
+            if (payment.refundStatus === "Pending" && payment.refundId === refundId) {
+                payment.refundStatus = "Success";
+                payment.refundedAt = new Date();
+            } else if (payment.refundId !== refundId) {
+                const addAmt = Number(refundAmount || 0);
+                payment.refundAmount = parseFloat((Number(payment.refundAmount || 0) + addAmt).toFixed(2));
+                payment.refundId = refundId || payment.refundId;
+                payment.refundStatus = "Success";
+                payment.refundedAt = new Date();
+            } else {
+                payment.refundStatus = "Success";
+            }
+        } else {
+            const failAmt = Number(refundAmount || 0);
+            if (payment.refundStatus === "Pending" && failAmt > 0) {
+                payment.refundAmount = Math.max(0, parseFloat((Number(payment.refundAmount || 0) - failAmt).toFixed(2)));
+            }
+            if (refundId) payment.refundId = refundId;
+            payment.refundStatus = "Failed";
+        }
+        await payment.save();
+    }
+
+    if (order) {
+        if (payment) {
+            await recalculateOrderRefundTotals(order, refundId);
+        } else {
+            if (isSuccess) {
+                if (order.refundStatus === "Pending" && order.refundId === refundId) {
+                    order.refundStatus = Number(order.refundAmount || 0) >= Number(order.amountPaid || order.orderAmount || 0) ? "Success" : "Partial";
+                } else if (order.refundId !== refundId) {
+                    order.refundAmount = parseFloat((Number(order.refundAmount || 0) + Number(refundAmount || 0)).toFixed(2));
+                    order.refundId = refundId || order.refundId;
+                    order.refundStatus = order.refundAmount >= (order.amountPaid || order.orderAmount) ? "Success" : "Partial";
+                }
+                order.refundedAt = new Date();
+            } else {
+                if (order.refundStatus === "Pending" && Number(refundAmount || 0) > 0) {
+                    order.refundAmount = Math.max(0, parseFloat((Number(order.refundAmount || 0) - Number(refundAmount || 0)).toFixed(2)));
+                }
+                if (refundId) order.refundId = refundId;
+                order.refundStatus = "Failed";
+            }
+            await order.save();
+        }
+    }
+
+    return { payment, order };
+};

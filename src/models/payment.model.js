@@ -49,7 +49,7 @@ const paymentSchema = new mongoose.Schema(
         },
         status: {
             type: String,
-            enum: ["Pending", "Paid"],
+            enum: ["Pending", "Paid", "Cancelled"],
             default: "Pending"
         },
         paymentId: {
@@ -93,6 +93,28 @@ const paymentSchema = new mongoose.Schema(
         },
         paidAt: {
             type: Date
+        },
+        refundId: {
+            type: String
+        },
+        refundAmount: {
+            type: Number,
+            default: 0
+        },
+        refundStatus: {
+            type: String,
+            enum: ["None", "Pending", "Success", "Failed"],
+            default: "None"
+        },
+        refundedAt: {
+            type: Date
+        },
+        refundedBy: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: "User"
+        },
+        refundNotes: {
+            type: String
         }
     },
     { timestamps: true }

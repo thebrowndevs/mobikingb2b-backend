@@ -2,6 +2,7 @@ import { Notification } from "../models/notification.model.js";
 import { ApiError } from "../utils/ApiError.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
+import { sendPushNotificationToTopic } from "../services/firebase.service.js";
 
 /* Create Notification */
 export const createNotification = asyncHandler(async (req, res) => {
@@ -18,6 +19,21 @@ export const createNotification = asyncHandler(async (req, res) => {
     redirect: redirect || null,
     sentBy: req?.user?._id || null, // Optional, if auth is used
   });
+
+  try {
+    await sendPushNotificationToTopic({
+      topic: "b2bUsers",
+      title,
+      body: message,
+      image: image || null,
+      data: {
+        notificationId: newNotification._id,
+        ...(redirect ? { redirect } : {}),
+      },
+    });
+  } catch (error) {
+    console.error("[Notification] Failed to send FCM push notification:", error);
+  }
 
   return res
     .status(201)
@@ -65,4 +81,29 @@ export const subscribeToFCMTopic = asyncHandler(async (req, res) => {
   return res
     .status(200)
     .json(new ApiResponse(200, null, `Device subscribed to ${topic} topic successfully`));
+});
+
+/* Resend Existing Notification */
+export const resendNotification = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const notification = await Notification.findById(id);
+
+  if (!notification) {
+    throw new ApiError(404, "Notification not found");
+  }
+
+  await sendPushNotificationToTopic({
+    topic: "b2bUsers",
+    title: notification.title,
+    body: notification.message,
+    image: notification.image || null,
+    data: {
+      notificationId: notification._id,
+      ...(notification.redirect ? { redirect: notification.redirect } : {}),
+    },
+  });
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, notification, "Notification resent successfully"));
 });

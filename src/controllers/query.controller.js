@@ -162,14 +162,12 @@ export const assignQueriesInBulk = asyncHandler(async (req, res) => {
 });
 
 export const closeQuery = asyncHandler(async (req, res) => {
-    const { queryId
-        // , closingMessage 
-    } = req.body;
+    const { queryId, closingMessage } = req.body;
     const requester = req.user; // injected by auth middleware
 
     /* 1️⃣  Basic checks */
     if (!queryId) {
-        throw new ApiError(400, "queryId and closingMessage are required");
+        throw new ApiError(400, "queryId is required");
     }
 
     if (["user"].includes(requester.role)) {
@@ -185,19 +183,17 @@ export const closeQuery = asyncHandler(async (req, res) => {
         throw new ApiError(409, "Query is already resolved");
     }
 
-    // if (!query?.assignedTo) {
-    //     throw new ApiError(409, "Cannot resolve an unassigned query");
-    // }
-
     /* 3️⃣  Build resolution reply */
-    // const resolutionReply = {
-    //     message: closingMessage,
-    //     messagedBy: requester._id,
-    //     messagedAt: new Date()
-    // };
+    const trimmedClosing = typeof closingMessage === "string" ? closingMessage.trim() : "";
+    if (trimmedClosing || query.replies.length === 0) {
+        query.replies.push({
+            message: trimmedClosing || "Query marked as resolved.",
+            messagedBy: requester._id,
+            messagedAt: new Date()
+        });
+    }
 
     /* 4️⃣  Update query */
-    // query.replies.push(resolutionReply);
     query.isResolved = true;
     query.resolvedAt = new Date();
 
@@ -226,8 +222,8 @@ export const addRatingToQuery = asyncHandler(async (req, res) => {
     const user = req.user;
 
     // 1️⃣ Validate input
-    if (!queryId || !rating || !review) {
-        throw new ApiError(400, "Query ID, rating and review are required");
+    if (!queryId || !rating) {
+        throw new ApiError(400, "Query ID and rating are required");
     }
 
     // 2️⃣ Ensure only users can rate
@@ -259,7 +255,7 @@ export const addRatingToQuery = asyncHandler(async (req, res) => {
 
     // 7️⃣ Update rating and review
     query.rating = rating;
-    if (review) query.review = review;
+    query.review = typeof review === "string" ? review.trim() : "";
 
     const updatedQuery = await query.save();
 

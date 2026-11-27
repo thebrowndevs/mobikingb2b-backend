@@ -16,7 +16,9 @@ import { Inventory } from "../../models/inventory.model.js";
 import { CompanyDetails } from "../../models/company_details.model.js";
 import { initiatePhonepePayment, checkPhonepeOrderStatus, refundPhonepePayment } from "../../services/phonepe.service.js";
 import { initiateRazorpayPayment, refundRazorpayPayment } from "../../services/razorpay.service.js";
-import { confirmOrderPaymentLogic } from "../../services/payment.service.js";
+import { refundHdfcPayment } from "../../services/hdfc.service.js";
+import { Payment } from "../../models/payment.model.js";
+import { confirmOrderPaymentLogic, cancelPendingPaymentsForOrder, recalculateOrderRefundTotals } from "../../services/payment.service.js";
 import { PartialRequests } from "../../models/partialOrderRequests.model.js";
 import { getShiprocketOrderDetails, createShiprocketReturnOrder } from "../../services/shiprocket.service.js";
 
@@ -544,6 +546,7 @@ const cancelPosOrder = asyncHandler(async (req, res) => {
             await order.save({ session });
 
             await adjustStock(order, { type: STOCK_TYPES.CANCEL, session });
+            await cancelPendingPaymentsForOrder(order, session);
         });
     } finally {
         session.endSession();
@@ -1016,8 +1019,8 @@ export const raisePartialReturnRequest = asyncHandler(async (req, res) => {
         throw new ApiError(404, "Order not found");
     }
 
-    if (order.status !== "Delivered" && order.status !== "New") {
-        throw new ApiError(403, "Only delivered or new orders can be returned");
+    if (order.status !== "Delivered") {
+        throw new ApiError(403, "Only delivered orders can be returned");
     }
 
     let validatedItems = [];
@@ -1746,10 +1749,10 @@ export const getPartialReturnRequestsByOrderId = asyncHandler(async (req, res) =
 
 /* ─────────────────────────────────────────────────────────────────────
    initiateOrderRefund (v2)
-   Triggers payment gateway refund for online orders (Razorpay/PhonePe)
+   Triggers payment-record-level refund (Razorpay / PhonePe / HDFC / Manual)
 ───────────────────────────────────────────────────────────────────── */
 export const initiateOrderRefund = asyncHandler(async (req, res) => {
-    const { orderId, refundAmount } = req.body;
+    const { orderId, paymentId, refundAmount, refundNotes } = req.body;
 
     if (!orderId || !mongoose.Types.ObjectId.isValid(orderId)) {
         throw new ApiError(400, "Valid Order ID is required");
@@ -1765,38 +1768,133 @@ export const initiateOrderRefund = asyncHandler(async (req, res) => {
         throw new ApiError(404, "Order not found");
     }
 
-    if (parsedRefundAmount > order.orderAmount) {
-        throw new ApiError(400, `Refund amount cannot exceed total order amount (₹${order.orderAmount.toFixed(2)})`);
-    }
-
-    // Determine the gateway
     let refundResult = null;
     let gatewayUsed = null;
+    let updatedPayment = null;
 
-    if (order.razorpayPaymentId) {
-        gatewayUsed = "razorpay";
-        refundResult = await refundRazorpayPayment(order.razorpayPaymentId, parsedRefundAmount);
-    } else if (order.phonepeOrderId) {
-        gatewayUsed = "phonepe";
-        refundResult = await refundPhonepePayment(order.phonepeOrderId, parsedRefundAmount);
+    if (paymentId) {
+        if (!mongoose.Types.ObjectId.isValid(paymentId)) {
+            throw new ApiError(400, "Valid Payment ID is required");
+        }
+
+        const payment = await Payment.findById(paymentId);
+        if (!payment) {
+            throw new ApiError(404, "Payment record not found");
+        }
+
+        const belongsToOrder =
+            String(payment.orderRef || "") === String(order._id) ||
+            (order.orderId && String(payment.orderId || "") === String(order.orderId));
+
+        if (!belongsToOrder) {
+            throw new ApiError(400, "Payment record does not belong to this order");
+        }
+
+        if (payment.status !== "Paid") {
+            throw new ApiError(400, `Cannot refund a payment with status "${payment.status}". Only Paid payments can be refunded.`);
+        }
+
+        const alreadyRefunded = Number(payment.refundAmount || 0);
+        const remainingRefundable = parseFloat((Number(payment.amount || 0) - alreadyRefunded).toFixed(2));
+
+        if (remainingRefundable <= 0) {
+            throw new ApiError(400, "This payment record has already been fully refunded.");
+        }
+
+        if (parsedRefundAmount > remainingRefundable) {
+            throw new ApiError(400, `Refund amount cannot exceed remaining refundable amount of ₹${remainingRefundable.toFixed(2)} for this payment.`);
+        }
+
+        const effectiveGateway = payment.gateway || null;
+
+        if (payment.method === "Online" && effectiveGateway === "razorpay") {
+            const rzpPayId = payment.razorpayPaymentId || payment.paymentId || order.razorpayPaymentId;
+            if (!rzpPayId) {
+                throw new ApiError(400, "Razorpay payment ID not found on this payment record.");
+            }
+            gatewayUsed = "razorpay";
+            refundResult = await refundRazorpayPayment(rzpPayId, parsedRefundAmount);
+        } else if (payment.method === "Online" && effectiveGateway === "phonepe") {
+            const ppOrderId = payment.phonepeOrderId || order.phonepeOrderId;
+            if (!ppOrderId) {
+                throw new ApiError(400, "PhonePe order ID not found on this payment record.");
+            }
+            gatewayUsed = "phonepe";
+            refundResult = await refundPhonepePayment(ppOrderId, parsedRefundAmount);
+        } else if (payment.method === "Online" && effectiveGateway === "hdfc") {
+            const hdfcOrdId = payment.hdfcOrderId || order.hdfcOrderId || String(payment._id);
+            gatewayUsed = "hdfc";
+            refundResult = await refundHdfcPayment(hdfcOrdId, parsedRefundAmount);
+        } else {
+            // Manual / Offline Paid payments (Cash, UPI, Bank Transfer, Cheque, etc.)
+            gatewayUsed = "manual";
+            refundResult = {
+                success: true,
+                isConfirmed: true,
+                refundId: `MANUAL_${Date.now()}`
+            };
+        }
+
+        if (!refundResult?.success) {
+            const errMsg = typeof refundResult?.error === 'object'
+                ? refundResult.error.description || JSON.stringify(refundResult.error)
+                : refundResult?.error || "Unknown gateway error";
+            throw new ApiError(502, `Gateway refund failed: ${errMsg}`);
+        }
+
+        const refundStatus = refundResult.isConfirmed ? "Success" : "Pending";
+
+        payment.refundAmount = parseFloat((alreadyRefunded + parsedRefundAmount).toFixed(2));
+        payment.refundId = refundResult.refundId;
+        payment.refundStatus = refundStatus;
+        payment.refundedAt = new Date();
+        payment.refundedBy = req.user?._id;
+        if (refundNotes) {
+            payment.refundNotes = String(refundNotes).trim();
+        }
+        updatedPayment = await payment.save();
+
+        order.refundedAt = new Date();
+        order.refundedBy = req.user?._id;
+        await recalculateOrderRefundTotals(order, refundResult.refundId);
     } else {
-        throw new ApiError(400, "No active online payment gateway details found for this order.");
-    }
+        // Legacy fallback when no Payment record ID is provided
+        const maxRefundable = parseFloat((Number(order.amountPaid || order.orderAmount || 0) - Number(order.refundAmount || 0)).toFixed(2));
+        if (parsedRefundAmount > maxRefundable) {
+            throw new ApiError(400, `Refund amount cannot exceed remaining refundable amount (₹${maxRefundable.toFixed(2)})`);
+        }
 
-    if (!refundResult.success) {
-        const errMsg = typeof refundResult.error === 'object'
-            ? refundResult.error.description || JSON.stringify(refundResult.error)
-            : refundResult.error;
-        throw new ApiError(502, `Gateway refund failed: ${errMsg}`);
-    }
+        if (order.razorpayPaymentId) {
+            gatewayUsed = "razorpay";
+            refundResult = await refundRazorpayPayment(order.razorpayPaymentId, parsedRefundAmount);
+        } else if (order.phonepeOrderId) {
+            gatewayUsed = "phonepe";
+            refundResult = await refundPhonepePayment(order.phonepeOrderId, parsedRefundAmount);
+        } else if (order.hdfcOrderId) {
+            gatewayUsed = "hdfc";
+            refundResult = await refundHdfcPayment(order.hdfcOrderId, parsedRefundAmount);
+        } else {
+            throw new ApiError(400, "Please select a payment record to refund.");
+        }
 
-    // Save refund details to database
-    order.refundId = refundResult.refundId;
-    order.refundAmount = parsedRefundAmount;
-    order.refundStatus = "Success";
-    order.refundedAt = new Date();
-    order.refundedBy = req.user?._id;
-    await order.save();
+        if (!refundResult?.success) {
+            const errMsg = typeof refundResult?.error === 'object'
+                ? refundResult.error.description || JSON.stringify(refundResult.error)
+                : refundResult?.error || "Unknown gateway error";
+            throw new ApiError(502, `Gateway refund failed: ${errMsg}`);
+        }
+
+        order.refundId = refundResult.refundId;
+        order.refundAmount = parseFloat((Number(order.refundAmount || 0) + parsedRefundAmount).toFixed(2));
+        if (!refundResult.isConfirmed) {
+            order.refundStatus = "Pending";
+        } else {
+            order.refundStatus = order.refundAmount >= (order.amountPaid || order.orderAmount) ? "Success" : "Partial";
+        }
+        order.refundedAt = new Date();
+        order.refundedBy = req.user?._id;
+        await order.save();
+    }
 
     return res.status(200).json(
         new ApiResponse(
@@ -1804,10 +1902,14 @@ export const initiateOrderRefund = asyncHandler(async (req, res) => {
             {
                 refundId: refundResult.refundId,
                 refundAmount: parsedRefundAmount,
-                refundStatus: "Success",
-                gateway: gatewayUsed
+                totalOrderRefunded: order.refundAmount,
+                refundStatus: order.refundStatus,
+                gateway: gatewayUsed,
+                payment: updatedPayment
             },
-            "Refund initiated successfully via gateway"
+            refundResult.isConfirmed
+                ? "Refund processed successfully"
+                : "Refund initiated and awaiting gateway confirmation"
         )
     );
 });

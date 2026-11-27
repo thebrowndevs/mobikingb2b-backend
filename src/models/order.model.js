@@ -197,7 +197,7 @@ const orderSchema = new mongoose.Schema(
         refundAmount: Number,
         refundStatus: {
             type: String,
-            enum: ["Pending", "Success", "Failed"]
+            enum: ["Pending", "Partial", "Success", "Failed"]
         },
         refundReason: String,
         refundedAt: Date,

@@ -157,3 +157,50 @@ export const sendPendingPaymentNotification = (userId, orderId, paymentId, amoun
         }
     });
 };
+
+/**
+ * Sends a visible push notification to a Firebase Cloud Messaging topic.
+ *
+ * @param {object} params
+ * @param {string} [params.topic="b2bUsers"] - Target FCM topic
+ * @param {string} params.title - Notification title
+ * @param {string} params.body - Notification body/message
+ * @param {string|null} [params.image] - Optional image URL
+ * @param {object} [params.data={}] - Optional key-value data payload
+ * @returns {Promise<string>} FCM message ID
+ */
+export const sendPushNotificationToTopic = async ({
+    topic = "b2bUsers",
+    title,
+    body,
+    image = null,
+    data = {},
+}) => {
+    initFirebase();
+
+    const sanitizedData = Object.fromEntries(
+        Object.entries(data || {})
+            .filter(([, value]) => value !== undefined && value !== null)
+            .map(([key, value]) => [key, String(value)])
+    );
+
+    const payload = {
+        topic,
+        notification: {
+            title,
+            body,
+            ...(image ? { image } : {}),
+        },
+        data: sanitizedData,
+    };
+
+    try {
+        console.log(`[FCM] Sending push notification to topic: ${topic}`);
+        const response = await messagingInstance.send(payload);
+        console.log(`[FCM] Push notification sent to topic ${topic}. Message ID: ${response}`);
+        return response;
+    } catch (error) {
+        console.error(`[FCM] Failed to send push notification to topic: ${topic}`, error);
+        throw error;
+    }
+};

@@ -7,6 +7,7 @@ const couponSchema = new mongoose.Schema({
     },
     code: {
         type: String,
+        trim: true,
         unique: true
     },
     minCartValue: {

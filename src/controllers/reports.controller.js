@@ -14,6 +14,7 @@ import { Group } from "../models/group.model.js";
 import { Brand } from "../models/brand.model.js";
 import { Payment } from "../models/payment.model.js";
 import { Quotation } from "../models/quotation.model.js";
+import { Inventory } from "../models/inventory.model.js";
 
 // Selective fields for reporting to prevent server crashes on large data
 const REPORT_POPULATE_CONFIG = {
@@ -26,7 +27,7 @@ const REPORT_POPULATE_CONFIG = {
   Order: "orderId",
   Coupon: "couponCode discount",
   Address: "city state address pincode",
-  Variant: "name totalStock availableStock",
+  Variant: "name totalStock availableStock purchaseSets",
   Query: "isResolved",
 };
 
@@ -542,20 +543,6 @@ export const fetchModelColumns = asyncHandler(async (req, res) => {
     // console.log(filter)
     if (paymentStatus && paymentStatus.length) filter.paymentStatus = { $in: paymentStatus };
     if (method && method.length) filter.method = { $in: method };
-    // console.log("columns:",columns)
-    if (columns.includes("gst")) {
-      console.log("gst:", columns)
-      filter.gst = { $exists: true, $ne: null, $ne: "" }
-    }
-    if (columns.includes("discount") && !columns.includes("coupon") && !columns.includes("couponCode") && !columns.includes("couponType")) {
-      filter.discount = { $gt: 0 };
-    }
-    if (columns.includes("coupon") || columns.includes("couponCode") || columns.includes("couponType")) {
-      filter.couponCode = { $exists: true, $ne: "" }
-      if (!columns.includes("discount")) {
-        columns.push("discount")
-      }
-    }
     if (type && type !== "all") {
       switch (type) {
         case "pos":
@@ -809,6 +796,27 @@ export const fetchModelColumns = asyncHandler(async (req, res) => {
     activeColumns = activeColumns.filter(c => c !== "payments");
   }
 
+  let loadUserOrderStats = false;
+  if (
+    model === "User" &&
+    (columns.includes("totalOrders") || columns.includes("successfulOrders") || columns.includes("cancelledOrders"))
+  ) {
+    loadUserOrderStats = true;
+    activeColumns = activeColumns.filter(
+      c => !["totalOrders", "successfulOrders", "cancelledOrders"].includes(c)
+    );
+  }
+
+  let loadProductPurchasePrice = false;
+  if (model === "Product" && columns.includes("purchasePrice")) {
+    loadProductPurchasePrice = true;
+    activeColumns = activeColumns.filter(c => c !== "purchasePrice");
+    if (!activeColumns.includes("variants")) {
+      activeColumns.push("variants");
+      populateFields.push({ path: "variants", ref: "Variant" });
+    }
+  }
+
   // Map virtual fields to actual schema fields for query projection
   activeColumns = activeColumns.map(col => {
     if (model === "User" && ["businessActive", "businessVerified", "businessApproved", "gstVerified", "businessName", "businessEmail", "businessPhone", "gstNumber", "businessAddress", "businessStatus", "rejectionReason", "approvedAt", "rejectedAt", "approvedBy", "rejectedBy"].includes(col)) {
@@ -871,6 +879,95 @@ export const fetchModelColumns = asyncHandler(async (req, res) => {
     data = data.map(order => {
       order.payments = payments.filter(p => String(p.orderRef) === String(order._id));
       return order;
+    });
+  }
+
+  if (loadUserOrderStats && data.length > 0) {
+    const userIds = data.map(u => u._id);
+    const orderStats = await Order.aggregate([
+      {
+        $match: {
+          userId: { $in: userIds },
+          abondonedOrder: { $ne: true },
+        },
+      },
+      {
+        $group: {
+          _id: "$userId",
+          totalOrders: { $sum: 1 },
+          successfulOrders: {
+            $sum: {
+              $cond: [
+                { $not: [{ $in: ["$status", ["Rejected", "Cancelled", "Returned", "Replaced", "Hold"]] }] },
+                1,
+                0,
+              ],
+            },
+          },
+          cancelledOrders: {
+            $sum: {
+              $cond: [{ $eq: ["$status", "Cancelled"] }, 1, 0],
+            },
+          },
+        },
+      },
+    ]);
+
+    const statsMap = new Map(orderStats.map(s => [String(s._id), s]));
+    data = data.map(user => {
+      const stats = statsMap.get(String(user._id));
+      return {
+        ...user,
+        totalOrders: stats?.totalOrders ?? 0,
+        successfulOrders: stats?.successfulOrders ?? 0,
+        cancelledOrders: stats?.cancelledOrders ?? 0,
+      };
+    });
+  }
+
+  if (model === "Product" && data.length > 0) {
+    const needStockSync = columns.includes("totalStock") || columns.includes("availableStock");
+    let invMap = new Map();
+    if (needStockSync) {
+      const productIds = data.map(p => p._id);
+      const inventories = await Inventory.find({ product: { $in: productIds } }).lean();
+      invMap = new Map(inventories.map(inv => [String(inv.product), inv]));
+    }
+
+    data = data.map(product => {
+      const updated = { ...product };
+      if (needStockSync) {
+        const inv = invMap.get(String(product._id));
+        if (inv) {
+          if (columns.includes("totalStock")) {
+            updated.totalStock = inv.physicalStock ?? product.totalStock ?? 0;
+          }
+          if (columns.includes("availableStock")) {
+            updated.availableStock = Math.max(0, (inv.physicalStock ?? 0) - (inv.reservedStock ?? 0));
+          }
+        }
+      }
+
+      if (loadProductPurchasePrice) {
+        const variantPrices = (product.variants || [])
+          .map(v => {
+            const sets = Array.isArray(v?.purchaseSets) ? v.purchaseSets : [];
+            const activeSet = sets.find(s => (s.availableStock ?? 0) > 0) || sets[sets.length - 1];
+            return activeSet?.price;
+          })
+          .filter(p => typeof p === "number" && !Number.isNaN(p));
+
+        if (variantPrices.length === 0) {
+          updated.purchasePrice = "";
+        } else {
+          const uniquePrices = [...new Set(variantPrices)];
+          updated.purchasePrice = uniquePrices.length === 1
+            ? uniquePrices[0]
+            : `${Math.min(...uniquePrices)} - ${Math.max(...uniquePrices)}`;
+        }
+      }
+
+      return updated;
     });
   }
 

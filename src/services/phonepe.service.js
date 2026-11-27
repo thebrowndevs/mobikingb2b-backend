@@ -137,7 +137,8 @@ export const refundPhonepePayment = async (originalMerchantOrderId, refundAmount
             .originalMerchantOrderId(originalMerchantOrderId)
             .build();
         const response = await client.refund(request);
-        return { success: true, refundId: response.refundId || refundId, rawResponse: response };
+        const isConfirmed = String(response?.state || "").toUpperCase() === "COMPLETED";
+        return { success: true, isConfirmed, refundId: response.refundId || refundId, rawResponse: response };
     } catch (error) {
         console.error("PhonePe Refund execution failure:", error);
         return { success: false, error: error.message || error };

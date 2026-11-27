@@ -13,15 +13,21 @@ import {
     removeCouponFromOrder
 } from "../utils/coupon.utils.js";
 
+const escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 // CREATE COUPON
 export const createCoupon = asyncHandler(async (req, res) => {
     let { code, type, value, percent, startDate, endDate, active, phoneNumber, userId, isAdminOnly, minCartValue } = req.body;
+
+    code = typeof code === "string" ? code.trim() : "";
 
     if (!code || (!value && !percent)) {
         throw new ApiError(400, "Code and either value or percent are required");
     }
 
-    const couponExists = await Coupon.findOne({ code });
+    const couponExists = await Coupon.findOne({
+        code: { $regex: new RegExp(`^${escapeRegex(code)}$`, "i") }
+    });
     if (couponExists) {
         throw new ApiError(409, "Coupon code already exists");
     }
@@ -53,7 +59,20 @@ export const updateCoupon = asyncHandler(async (req, res) => {
     const coupon = await Coupon.findById(id);
     if (!coupon) throw new ApiError(404, "Coupon not found");
 
-    coupon.code = code || coupon.code;
+    if (code !== undefined) {
+        const trimmedCode = typeof code === "string" ? code.trim() : "";
+        if (!trimmedCode) {
+            throw new ApiError(400, "Coupon code cannot be empty");
+        }
+        const duplicateCoupon = await Coupon.findOne({
+            _id: { $ne: id },
+            code: { $regex: new RegExp(`^${escapeRegex(trimmedCode)}$`, "i") }
+        });
+        if (duplicateCoupon) {
+            throw new ApiError(409, "Coupon code already exists");
+        }
+        coupon.code = trimmedCode;
+    }
     coupon.active = (active != undefined && (active == true || active == false)) ? active : coupon.active;
     coupon.type = type || coupon.type;
     coupon.value = value || coupon.value;
@@ -97,7 +116,7 @@ export const deleteCoupon = asyncHandler(async (req, res) => {
 
 // GET COUPON BY CODE
 export const getCouponByCode = asyncHandler(async (req, res) => {
-    const { code } = req.params;
+    const code = typeof req.params.code === "string" ? req.params.code.trim() : "";
 
     if (!code) throw new ApiError(400, "Coupon code is required");
 
@@ -111,7 +130,8 @@ export const getCouponByCode = asyncHandler(async (req, res) => {
 
 // GET COUPON BY CODE
 export const checkCouponValid = asyncHandler(async (req, res) => {
-    const { code, paymentMethod } = req.params;
+    const { paymentMethod } = req.params;
+    const code = typeof req.params.code === "string" ? req.params.code.trim() : "";
     const userId = req?.user?._id;
 
     console.log("params", paymentMethod, code)
@@ -239,7 +259,8 @@ export const getAdminCoupons = asyncHandler(async (req, res) => {
 
 // APPLY COUPON BY ADMIN
 export const applyCouponAdmin = asyncHandler(async (req, res) => {
-    const { orderId, code } = req.body;
+    const { orderId } = req.body;
+    const code = typeof req.body.code === "string" ? req.body.code.trim() : "";
 
     if (!orderId) throw new ApiError(400, "Order ID is required");
     if (!code) throw new ApiError(400, "Coupon code is required");

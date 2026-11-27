@@ -220,6 +220,11 @@ export const getPaginatedOrders = asyncHandler(async (req, res) => {
       model: "User",
       select: "name email role"
     })
+    .populate({
+      path: "refundedBy",
+      model: "User",
+      select: "name email role"
+    })
     .lean();
 
   return res.status(200).json(

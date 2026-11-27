@@ -32,7 +32,7 @@ const paymentLinkSchema = new mongoose.Schema({
     },
     gateway: {
         type: String,
-        enum: ["razorpay", "phonepe"],
+        enum: ["razorpay", "phonepe", "hdfc"],
         required: false
     }
 }, { timestamps: true });

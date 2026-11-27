@@ -146,3 +146,55 @@ export const checkHdfcOrderStatus = async (orderId) => {
         };
     }
 };
+
+/**
+ * Initiates an HDFC SmartGateway refund for a charged order.
+ *
+ * @param {string} hdfcOrderId - Merchant order identifier sent to HDFC
+ * @param {number} refundAmount - Refund amount in INR
+ * @returns {Promise<Object>} Refund result
+ */
+export const refundHdfcPayment = async (hdfcOrderId, refundAmount) => {
+    const { baseUrl, apiKey } = getHdfcConfig();
+
+    if (!apiKey) {
+        return { success: false, error: "HDFC_API_KEY is not configured in environment variables." };
+    }
+
+    const uniqueRequestId = `ref_${hdfcOrderId}_${Date.now()}`;
+    try {
+        const response = await axios.post(
+            `${baseUrl}/orders/${encodeURIComponent(hdfcOrderId)}/refunds`,
+            {
+                unique_request_id: uniqueRequestId,
+                amount: Number(refundAmount).toFixed(2)
+            },
+            {
+                headers: getHdfcHeaders(),
+                timeout: 15000
+            }
+        );
+
+        const data = response.data;
+        const refundEntry = Array.isArray(data?.refunds) ? data.refunds[0] : data;
+        const hdfcStatus = String(refundEntry?.status || data?.status || "").toUpperCase();
+        const isConfirmed = ["SUCCESS", "CHARGED", "PROCESSED"].includes(hdfcStatus);
+        return {
+            success: true,
+            isConfirmed,
+            refundId: refundEntry?.unique_request_id || refundEntry?.id || uniqueRequestId,
+            rawResponse: data
+        };
+    } catch (error) {
+        console.error("HDFC Refund execution failure:", error.response?.data || error.message);
+        return {
+            success: false,
+            error:
+                error.response?.data?.error_info?.developer_message ||
+                error.response?.data?.error_info?.user_message ||
+                error.response?.data?.message ||
+                error.response?.data?.error_message ||
+                error.message
+        };
+    }
+};

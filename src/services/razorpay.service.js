@@ -86,7 +86,8 @@ export const refundRazorpayPayment = async (razorpayPaymentId, refundAmount) => 
             amount: String(Math.round(refundAmount * 100)), // in paise as string
             speed: "optimum"
         });
-        return { success: true, refundId: response.id, rawResponse: response };
+        const isConfirmed = String(response?.status || "").toLowerCase() === "processed";
+        return { success: true, isConfirmed, refundId: response.id, rawResponse: response };
     } catch (error) {
         console.error("Razorpay Refund execution failure:", error);
         return { success: false, error: error.message || error };

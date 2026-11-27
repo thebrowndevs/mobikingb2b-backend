@@ -29,7 +29,7 @@ import { initiateRazorpayPaymentLink } from '../services/razorpay.service.js';
 import { initiatePhonepePaymentLink, initiatePhonepePayment, checkPhonepeOrderStatus } from '../services/phonepe.service.js';
 import { initiateHdfcSession, checkHdfcOrderStatus } from '../services/hdfc.service.js';
 import { CompanyDetails } from '../models/company_details.model.js';
-import { confirmPaymentRecordPaidLogic } from '../services/payment.service.js';
+import { confirmPaymentRecordPaidLogic, cancelPendingPaymentsForOrder } from '../services/payment.service.js';
 import { recalculateOrderTotals, syncItemDiscount, determineSlabForQuantity } from '../utils/pricing.js';
 import { logActivity } from "../utils/activityLogger.js";
 
@@ -60,6 +60,7 @@ import {
     reserveOrderVariantStock,
     allocateOrderPurchaseSets
 } from "../utils/order/orderStock.utils.js";
+import { restoreOrderPurchaseSets } from "../utils/order/orderPurchaseSet.utils.js";
 
 
 const razorpayConfig = () => {
@@ -1300,7 +1301,7 @@ const createOnlineOrder =
                 }
 
                 const addressDetails = {
-                    address: `${foundAddress.street || ""}, ${foundAddress.street2 || ""}, ${foundAddress.city || ""}, ${foundAddress.state || ""}, ${foundAddress.pinCode || ""}`,
+                    address: foundAddress.street || "",
                     address2:
                         foundAddress.street2 ||
                         "",
@@ -4742,6 +4743,12 @@ const updateOrder = asyncHandler(async (req, res) => {
                             throw new ApiError(400, `Failed to update parent stock for product ${product.fullName}`);
                         }
 
+                        await Inventory.findOneAndUpdate(
+                            { product: productId },
+                            { $inc: { physicalStock: -diff } },
+                            { session }
+                        );
+
                         const updatedStock = variantResult.totalStock;
                         const previousStock = updatedStock + diff;
 
@@ -4789,6 +4796,12 @@ const updateOrder = asyncHandler(async (req, res) => {
                         if (!productResult) {
                             throw new ApiError(400, `Failed to restore parent product stock for ${product.fullName}`);
                         }
+
+                        await Inventory.findOneAndUpdate(
+                            { product: productId },
+                            { $inc: { physicalStock: restoreQty } },
+                            { session }
+                        );
 
                         const updatedStock = variantResult.totalStock;
                         const previousStock = updatedStock - restoreQty;
@@ -9735,6 +9748,11 @@ const systemCreatedCancel =
                                 }
                             );
 
+                        await cancelPendingPaymentsForOrder(
+                            updatedOrder,
+                            session
+                        );
+
                         await logActivity({
                             orderId:
                                 restoredOrder._id,
@@ -9862,6 +9880,11 @@ const systemCreatedReject =
                                     session
                                 }
                             );
+
+                        await cancelPendingPaymentsForOrder(
+                            updatedOrder,
+                            session
+                        );
 
                         await logActivity({
                             orderId:

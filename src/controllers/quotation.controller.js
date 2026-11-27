@@ -191,7 +191,7 @@ export const createQuotation = asyncHandler(async (req, res) => {
         }
 
         const addressDetails = {
-            address: `${foundAddress.street || ""}, ${foundAddress.street2 || ""}, ${foundAddress.city || ""}, ${foundAddress.state || ""}, ${foundAddress.pinCode || ""}`,
+            address: foundAddress.street || "",
             address2: foundAddress.street2 || "",
             city: foundAddress.city || "",
             state: foundAddress.state || "",
