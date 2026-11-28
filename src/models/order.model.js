@@ -374,6 +374,7 @@ const orderSchema = new mongoose.Schema(
 );
 
 orderSchema.index({ createdAt: -1 });
+orderSchema.index({ createdAt: 1, abondonedOrder: 1, status: 1 });
 // orderSchema.pre("save", async function (next) {
 //     if (this.isNew && !this.orderId && !this.abondonedOrder && this.type != ORDER_TYPES.PARTIAL_RETURN) { // only for new orders that are not abandoned
 //         const counter = await Counter.findOneAndUpdate(

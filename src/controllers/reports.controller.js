@@ -1198,21 +1198,165 @@ export const getProductSalesReport = asyncHandler(async (req, res) => {
     }
   ]);
 
-  // 2. Fetch Aggregated Sales Sets directly from Stock Logs (handling additions, removals, cancels, and returns)
-  const salesSets = await Stock.aggregate([
+  // 2. Fetch Aggregated Sales Sets from valid Orders joined with their Stock Logs (preserving batch purchasePrice with Order item fallback)
+  const salesSets = await Order.aggregate([
     {
       $match: {
         createdAt: { $gte: start, $lte: end },
-        type: { $in: ["purchase", "add-item", "remove-item", "return", "cancel", "reject", "cancelled", "rejected"] },
-        productId: { $ne: null }
+        abondonedOrder: { $ne: true },
+        status: { $nin: ["Rejected", "Cancelled", "Returned", "Replaced", "Hold"] }
       }
     },
+    { $project: { _id: 1, items: 1 } },
+    {
+      $lookup: {
+        from: "stocks",
+        let: { oid: "$_id", orderItems: "$items" },
+        pipeline: [
+          {
+            $match: {
+              $expr: {
+                $and: [
+                  { $eq: ["$orderRef", "$$oid"] },
+                  { $ne: ["$productId", null] },
+                  {
+                    $or: [
+                      { $in: ["$type", ["purchase", "remove-item"]] },
+                      {
+                        $and: [
+                          { $eq: ["$type", "add-item"] },
+                          { $gt: ["$previousStock", "$updatedStock"] }
+                        ]
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+          {
+            $addFields: {
+              matchedOrderItem: {
+                $first: {
+                  $filter: {
+                    input: { $ifNull: ["$$orderItems", []] },
+                    as: "oi",
+                    cond: { $eq: ["$$oi.productId", "$productId"] }
+                  }
+                }
+              }
+            }
+          },
+          {
+            $addFields: {
+              basePurchasePrice: {
+                $cond: {
+                  if: { $gt: [{ $ifNull: ["$purchasePrice", 0] }, 0] },
+                  then: "$purchasePrice",
+                  else: {
+                    $ifNull: [
+                      { $first: "$matchedOrderItem.purchaseSets.price" },
+                      { $ifNull: ["$matchedOrderItem.purchasePrice", 0] }
+                    ]
+                  }
+                }
+              },
+              fallbackSetId: {
+                $cond: {
+                  if: { $ne: [{ $ifNull: ["$matchedOrderItem.purchaseSetId", ""] }, ""] },
+                  then: "$matchedOrderItem.purchaseSetId",
+                  else: { $ifNull: [{ $first: "$matchedOrderItem.purchaseSets.purchaseSetId" }, ""] }
+                }
+              }
+            }
+          },
+          {
+            $lookup: {
+              from: "variants",
+              let: {
+                vid: "$variantId",
+                needLookup: {
+                  $and: [
+                    { $eq: ["$basePurchasePrice", 0] },
+                    { $ne: ["$variantId", null] }
+                  ]
+                }
+              },
+              pipeline: [
+                {
+                  $match: {
+                    $expr: {
+                      $and: [
+                        { $eq: ["$$needLookup", true] },
+                        { $eq: ["$_id", "$$vid"] }
+                      ]
+                    }
+                  }
+                },
+                { $project: { purchaseSets: 1 } }
+              ],
+              as: "variantDoc"
+            }
+          },
+          {
+            $addFields: {
+              resolvedVariantSet: {
+                $let: {
+                  vars: {
+                    sets: { $ifNull: [{ $first: "$variantDoc.purchaseSets" }, []] }
+                  },
+                  in: {
+                    $let: {
+                      vars: {
+                        matched: {
+                          $first: {
+                            $filter: {
+                              input: "$$sets",
+                              as: "vs",
+                              cond: { $eq: [{ $toString: "$$vs._id" }, "$fallbackSetId"] }
+                            }
+                          }
+                        }
+                      },
+                      in: { $ifNull: ["$$matched", { $last: "$$sets" }] }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          {
+            $project: {
+              productId: 1,
+              type: 1,
+              sellingPrice: {
+                $cond: {
+                  if: { $gt: [{ $ifNull: ["$sellingPrice", 0] }, 0] },
+                  then: "$sellingPrice",
+                  else: { $ifNull: ["$matchedOrderItem.price", 0] }
+                }
+              },
+              purchasePrice: {
+                $cond: {
+                  if: { $gt: ["$basePurchasePrice", 0] },
+                  then: "$basePurchasePrice",
+                  else: { $ifNull: ["$resolvedVariantSet.price", 0] }
+                }
+              },
+              quantity: 1
+            }
+          }
+        ],
+        as: "stockLogs"
+      }
+    },
+    { $unwind: "$stockLogs" },
+    { $replaceRoot: { newRoot: "$stockLogs" } },
     {
       $project: {
         productId: 1,
-        sellingPrice: { $ifNull: ["$sellingPrice", 0] },
-        purchasePrice: { $ifNull: ["$purchasePrice", 0] },
-        quantity: 1,
+        sellingPrice: 1,
+        purchasePrice: 1,
         netQty: {
           $cond: {
             if: { $in: ["$type", ["purchase", "add-item"]] },
@@ -1222,7 +1366,7 @@ export const getProductSalesReport = asyncHandler(async (req, res) => {
         },
         netVal: {
           $multiply: [
-            { $ifNull: ["$sellingPrice", 0] },
+            "$sellingPrice",
             {
               $cond: {
                 if: { $in: ["$type", ["purchase", "add-item"]] },
@@ -1234,7 +1378,7 @@ export const getProductSalesReport = asyncHandler(async (req, res) => {
         },
         netCost: {
           $multiply: [
-            { $ifNull: ["$purchasePrice", 0] },
+            "$purchasePrice",
             {
               $cond: {
                 if: { $in: ["$type", ["purchase", "add-item"]] },
@@ -1258,6 +1402,7 @@ export const getProductSalesReport = asyncHandler(async (req, res) => {
         totalCostVal: { $sum: "$netCost" }
       }
     },
+    { $match: { totalQty: { $gt: 0 } } },
     {
       $project: {
         productId: "$_id.productId",

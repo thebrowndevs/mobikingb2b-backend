@@ -90,4 +90,6 @@ const stockSchema = new mongoose.Schema({
     }
 }, { timestamps: true });
 
+stockSchema.index({ orderRef: 1, type: 1 });
+
 export const Stock = mongoose.model('Stock', stockSchema);
